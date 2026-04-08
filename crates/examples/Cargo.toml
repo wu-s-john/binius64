@@ -83,6 +83,10 @@ name = "sha256"
 harness = false
 
 [[bench]]
+name = "sha256sign"
+harness = false
+
+[[bench]]
 name = "sha512"
 harness = false
 

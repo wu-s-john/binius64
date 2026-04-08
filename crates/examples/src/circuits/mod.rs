@@ -16,6 +16,7 @@ pub mod keccak;
 pub mod sha256;
 pub mod sha3;
 pub mod sha3_512;
+pub mod sha256sign;
 pub mod sha512;
 pub mod subset_sum;
 pub mod utils;
