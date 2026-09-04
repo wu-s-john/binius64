@@ -3,7 +3,6 @@
 
 use binius_field::{Field, PackedField};
 use binius_math::FieldBuffer;
-use tracing::instrument;
 
 use crate::merkle_channel::MerkleIPProverChannel;
 
@@ -212,11 +211,23 @@ where
 	/// ## Arguments
 	///
 	/// * `indices` - the sampled query indices into the original codeword domain
-	#[instrument(skip_all, name = "fri::FRIQueryProver::prove_queries", level = "debug")]
 	pub fn prove_queries<Channel>(&self, indices: &[usize], channel: &mut Channel)
 	where
 		Channel: MerkleIPProverChannel<F, Commitment = C>,
 	{
+		let _scope = tracing::debug_span!(
+			"fri::FRIQueryProver::prove_queries",
+			component = "fri_query_proofs",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_opening_proof = true,
+			tag_fri = true,
+			tag_repeated = true,
+			query_count = indices.len() as u64,
+		)
+		.entered();
+
 		self.codeword_oracle.open_queries(indices, channel);
 
 		// Each subsequent oracle indexes the previous virtual oracle, so shift the query indices

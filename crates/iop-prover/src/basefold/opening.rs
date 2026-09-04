@@ -58,9 +58,21 @@ pub fn prove_mlecheck_basefold<A, F, P, NTT, Channel>(
 	NTT: AdditiveNTT<Field = F> + Sync,
 	Channel: MerkleIPProverChannel<F>,
 {
-	let _scope = tracing::debug_span!("Basefold MLE-check ZK (batched)").entered();
-
 	let n_vars = witness.log_len();
+	let _scope = tracing::debug_span!(
+		"Basefold MLE-check ZK (batched)",
+		component = "basefold_mle_check",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_opening_proof = true,
+		tag_sumcheck = true,
+		tag_fri = true,
+		tag_repeated = true,
+		round_count = n_vars as u64,
+	)
+	.entered();
+
 	assert_eq!(eval_point.len(), n_vars);
 	// The FRI folder has `n_inner` inner (unbatch) rounds — one for the shared mask challenge γ
 	// when any ZK oracle is present, none otherwise — `log_n_oracles` outer (oracle-combine)

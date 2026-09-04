@@ -92,7 +92,18 @@ where
 	let ProveSingleOutput {
 		multilinear_evals: _,
 		challenges: mut eval_point,
-	} = prove_single_mlecheck(prover, channel);
+	} = tracing::debug_span!(
+		"BinMul MLE-check",
+		component = "binmul_mle_sumcheck",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_constraint_proof = true,
+		tag_sumcheck = true,
+		tag_repeated = true,
+		round_count = n_vars as u64,
+	)
+	.in_scope(|| prove_single_mlecheck(prover, channel));
 	// `prove_single_mlecheck` folds high-to-low, so reverse to obtain the shared output point r_x.
 	eval_point.reverse();
 

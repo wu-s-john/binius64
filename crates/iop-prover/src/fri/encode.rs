@@ -62,6 +62,11 @@ where
 
 	let _scope = tracing::debug_span!(
 		"Reed–Solomon Encode",
+		component = "reed_solomon_encode",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_commit = true,
 		log_batch_size,
 		log_dim = rs_code.log_dim(),
 		log_inv_rate = rs_code.log_inv_rate(),

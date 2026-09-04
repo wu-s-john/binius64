@@ -357,7 +357,17 @@ where
 			b_recomb,
 		));
 
-		let batch_guard = tracing::debug_span!("Final batched sumcheck").entered();
+		let batch_guard = tracing::debug_span!(
+			"Final batched sumcheck",
+			component = "intmul_final_batched_sumcheck",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+		)
+		.entered();
 		let BatchSumcheckOutput {
 			mut challenges,
 			multilinear_evals: _,
@@ -430,8 +440,17 @@ where
 		let MultilinearEvalClaim {
 			eval: _,
 			point: reduced_point,
-		} = tracing::debug_span!("Variable-base product check")
-			.in_scope(|| b_prover.prove(claim, self.channel));
+		} = tracing::debug_span!(
+			"Variable-base product check",
+			component = "intmul_variable_base_product_check",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+		)
+		.in_scope(|| b_prover.prove(claim, self.channel));
 
 		// Split output point: first n are x-point, last k are z-challenges
 		let (x_point, _z_suffix) = reduced_point.split_at(n_vars);
@@ -508,7 +527,17 @@ where
 		let c_root_prover = MleToSumCheckDecorator::new(c_root_sumcheck_prover);
 
 		let provers = vec![Either::Left(selector_prover), Either::Right(c_root_prover)];
-		let sumcheck_guard = tracing::debug_span!("Batched selector + C-root sumcheck").entered();
+		let sumcheck_guard = tracing::debug_span!(
+			"Batched selector + C-root sumcheck",
+			component = "intmul_selector_c_root_sumcheck",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+		)
+		.entered();
 		let BatchSumcheckOutput {
 			mut challenges,
 			multilinear_evals,
@@ -572,7 +601,17 @@ where
 		// Run the batched prodcheck over all LOG_N_LIMBS layers: content point is the Phase-3
 		// evaluation point at which the three roots are claimed. The output pairs each tree with
 		// its reduced leaf evaluation at the shared reduced point.
-		let prodcheck_guard = tracing::debug_span!("Batched constant-base prodcheck").entered();
+		let prodcheck_guard = tracing::debug_span!(
+			"Batched constant-base prodcheck",
+			component = "intmul_constant_base_product_check",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+		)
+		.entered();
 		let prodcheck::BatchProveOutput {
 			eval_point: reduced_point,
 			evals: _tree_evals,

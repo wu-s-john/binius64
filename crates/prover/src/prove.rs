@@ -102,7 +102,15 @@ impl IOPProver {
 		//
 		// Only the non-public words are committed as the trace oracle; the public segment is a
 		// verifier-known polynomial.
-		let setup_guard = tracing::debug_span!("Prepare witness").entered();
+		let setup_guard = tracing::debug_span!(
+			"Prepare witness",
+			component = "prepare_witness",
+			scope_kind = "phase",
+			perfetto_category = "component",
+			tag_preparation = true,
+			tag_proving = true,
+		)
+		.entered();
 		let witness_packed =
 			pack_witness::<P, _>(alloc, self.log_witness_elems, witness.non_public())?;
 		drop(setup_guard);
@@ -110,6 +118,15 @@ impl IOPProver {
 		// Observe the public input as B128 elements (includes it in Fiat-Shamir). The packed buffer
 		// is a temporary of this statement, so its pool block is returned immediately rather than
 		// held for the rest of the proof.
+		let public_guard = tracing::debug_span!(
+			"Observe public input",
+			component = "observe_public_input",
+			scope_kind = "phase",
+			perfetto_category = "component",
+			tag_preparation = true,
+			tag_proving = true,
+		)
+		.entered();
 		let public_elems = pack_witness::<P, _>(
 			alloc,
 			self.log_public_words - LOG_WORDS_PER_ELEM,
@@ -118,9 +135,18 @@ impl IOPProver {
 		.iter_scalars()
 		.collect::<Vec<_>>();
 		channel.observe_many(&public_elems);
+		drop(public_guard);
 
 		// [phase] Witness Commit - witness generation and commitment
-		let witness_commit_guard = tracing::info_span!("Commit witness").entered();
+		let witness_commit_guard = tracing::info_span!(
+			"Commit witness",
+			component = "commit_witness",
+			scope_kind = "phase",
+			perfetto_category = "phase",
+			tag_proving = true,
+			tag_commit = true,
+		)
+		.entered();
 
 		// Commit witness via channel
 		let trace_oracle = channel.send_oracle(witness_packed.to_ref());
@@ -136,7 +162,14 @@ impl IOPProver {
 		let intmul_output = if cs.n_imul_constraints() > 0 {
 			let intmul_guard = tracing::info_span!(
 				"[phase] IntMul check",
-				n_constraints = cs.imul_constraints.len()
+				component = "intmul_check",
+				scope_kind = "phase",
+				perfetto_category = "phase",
+				tag_proving = true,
+				tag_constraint_proof = true,
+				tag_sumcheck = true,
+				tag_repeated = true,
+				n_constraints = cs.imul_constraints.len(),
 			)
 			.entered();
 			let mul_columns = tracing::debug_span!("Assemble columns")
@@ -159,7 +192,14 @@ impl IOPProver {
 		let binmul_output = if cs.n_bmul_constraints() > 0 {
 			let binmul_guard = tracing::info_span!(
 				"[phase] BinMul check",
-				n_constraints = cs.bmul_constraints.len()
+				component = "binmul_check",
+				scope_kind = "phase",
+				perfetto_category = "phase",
+				tag_proving = true,
+				tag_constraint_proof = true,
+				tag_sumcheck = true,
+				tag_repeated = true,
+				n_constraints = cs.bmul_constraints.len(),
 			)
 			.entered();
 			let binmul_columns = tracing::debug_span!("Assemble columns")
@@ -178,9 +218,18 @@ impl IOPProver {
 		};
 
 		// [phase] BitAnd Reduction - AND constraint reduction
-		let bitand_guard =
-			tracing::info_span!("[phase] BitAnd check", n_constraints = cs.and_constraints.len())
-				.entered();
+		let bitand_guard = tracing::info_span!(
+			"[phase] BitAnd check",
+			component = "bitand_check",
+			scope_kind = "phase",
+			perfetto_category = "phase",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+			n_constraints = cs.and_constraints.len(),
+		)
+		.entered();
 		let bitand_claim = {
 			// Only the `A` and `B` columns are built; the reduction derives `C = A & B`.
 			let bitand_columns = tracing::debug_span!("Assemble columns")
@@ -282,6 +331,15 @@ impl IOPProver {
 		//
 		// The reduction's claim, at the point the BitAnd sumcheck just output. See
 		// `IOPVerifier::verify` for why it carries no message.
+		let zero_guard = tracing::info_span!(
+			"[phase] Zero claim preparation",
+			component = "zero_claim_preparation",
+			scope_kind = "phase",
+			perfetto_category = "phase",
+			tag_proving = true,
+			tag_constraint_proof = true,
+		)
+		.entered();
 		let log_n_zero = cs.log_zero_constraints().unwrap_or(0);
 		let zero_claim = OperatorData {
 			evals: vec![B128::ZERO],
@@ -290,12 +348,19 @@ impl IOPProver {
 				channel.sample()
 			}),
 		};
+		drop(zero_guard);
 
 		// [phase] Shift Reduction - shift operations
 		let shift_guard = tracing::info_span!(
 			"[phase] Shift Reduction",
 			phase = "shift_reduction",
-			perfetto_category = "phase"
+			component = "shift_reduction",
+			scope_kind = "phase",
+			perfetto_category = "phase",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
 		)
 		.entered();
 		let SumcheckOutput {
@@ -314,11 +379,16 @@ impl IOPProver {
 		);
 		drop(shift_guard);
 
-		// [phase] Ring-Switching + PCS Opening
+		// [phase] Ring-Switching and queueing the resulting PCS relation. The BaseFold opening
+		// runs when the channel is finished after this IOP phase returns.
 		let pcs_guard = tracing::info_span!(
-			"[phase] PCS Opening",
-			phase = "pcs_opening",
-			perfetto_category = "phase"
+			"[phase] Ring switching",
+			phase = "ring_switching",
+			component = "ring_switching",
+			scope_kind = "phase",
+			perfetto_category = "phase",
+			tag_proving = true,
+			tag_opening_proof = true,
 		)
 		.entered();
 
@@ -453,6 +523,11 @@ where
 
 		let _prove_guard = tracing::info_span!(
 			"Prove",
+			operation = "prove",
+			component = "prove",
+			scope_kind = "operation",
+			perfetto_category = "operation",
+			tag_proving = true,
 			n_hidden_words = cs.n_hidden_words(),
 			n_bitand = cs.and_constraints.len(),
 			n_intmul = cs.imul_constraints.len(),

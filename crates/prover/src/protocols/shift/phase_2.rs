@@ -59,7 +59,18 @@ use crate::fold_word::fold_words;
 /// Returns `SumcheckOutput` containing the combined challenges `[r_j, r_y]` and the witness
 /// evaluation, or an error if the protocol fails.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all, name = "prove_phase_2")]
+#[instrument(
+	skip_all,
+	name = "prove_phase_2",
+	fields(
+		component = "shift_phase_2",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_constraint_proof = true,
+		tag_sumcheck = true,
+	)
+)]
 pub fn prove_phase_2<F, P: PackedField<Scalar = F>, Channel, A>(
 	key_collection: &KeyCollection,
 	words: &[Word],
@@ -223,7 +234,19 @@ fn fold_segments<F: Field, P: PackedField<Scalar = F>, Data: DerefMut<Target = [
 /// Returns `SumcheckOutput` with concatenated challenges `[r_j, r_y]` and the witness
 /// evaluation.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all, name = "run_sumcheck")]
+#[instrument(
+	skip_all,
+	name = "run_sumcheck",
+	fields(
+		component = "shift_phase_2_sumcheck",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_constraint_proof = true,
+		tag_sumcheck = true,
+		tag_repeated = true,
+	)
+)]
 pub fn run_sumcheck<F, P: PackedField<Scalar = F>, Channel: IPProverChannel<F>, A: Allocator>(
 	public_folded: &FieldVec<P, A>,
 	hidden_folded: FieldVec<P, A>,

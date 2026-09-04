@@ -30,7 +30,18 @@ const LOG_LEN: usize = Word::LOG_BITS + Word::LOG_BITS;
 /// Constructs the "g" multilinear parts for the BITAND, INTMUL and BMUL operations.
 /// Proves the first phase of the shift reduction.
 /// Computes the g and h multilinears and performs the sumcheck.
-#[instrument(skip_all, name = "prover_phase_1")]
+#[instrument(
+	skip_all,
+	name = "prover_phase_1",
+	fields(
+		component = "shift_phase_1",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_constraint_proof = true,
+		tag_sumcheck = true,
+	)
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn prove_phase_1<F, P, Channel, A>(
 	key_collection: &KeyCollection,
@@ -107,7 +118,19 @@ where
 /// # Returns
 ///
 /// `SumcheckOutput` containing the challenge vector and final evaluation `gamma`
-#[instrument(skip_all, name = "run_sumcheck")]
+#[instrument(
+	skip_all,
+	name = "run_sumcheck",
+	fields(
+		component = "shift_phase_1_sumcheck",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_constraint_proof = true,
+		tag_sumcheck = true,
+		tag_repeated = true,
+	)
+)]
 pub fn run_phase_1_sumcheck<
 	F: Field,
 	P: PackedField<Scalar = F>,

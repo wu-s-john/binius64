@@ -155,7 +155,15 @@ where
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let challenger = StdChallenger::default();
-	let _scope = tracing::info_span!("Prove").entered();
+	let _scope = tracing::info_span!(
+		"Prove",
+		operation = "prove",
+		component = "prove",
+		scope_kind = "operation",
+		perfetto_category = "operation",
+		tag_proving = true,
+	)
+	.entered();
 	let mut prover_transcript = ProverTranscript::new(challenger);
 	let mut rng = rand::rng();
 	match message {

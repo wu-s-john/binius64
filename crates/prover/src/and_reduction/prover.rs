@@ -91,16 +91,24 @@ where
 		big_field_zerocheck_challenges: Vec<F>,
 		prover_message_domain: &BinarySubspace<B8>,
 	) -> Self {
-		let univariate_round_message = tracing::debug_span!("Compute univariate round message")
-			.in_scope(|| {
-				sumcheck_round_messages::univariate_round_message_extension_domain::<F>(
-					log_words,
-					&first_col,
-					&second_col,
-					&big_field_zerocheck_challenges,
-					prover_message_domain,
-				)
-			});
+		let univariate_round_message = tracing::debug_span!(
+			"Compute univariate round message",
+			component = "bitand_univariate_round",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+		)
+		.in_scope(|| {
+			sumcheck_round_messages::univariate_round_message_extension_domain::<F>(
+				log_words,
+				&first_col,
+				&second_col,
+				&big_field_zerocheck_challenges,
+				prover_message_domain,
+			)
+		});
 
 		Self {
 			log_words,
@@ -237,7 +245,16 @@ where
 
 		let univariate_sumcheck_challenge = channel.sample();
 		let univariate_round_message_domain = self.univariate_round_message_domain.clone();
-		let sumcheck_prover = tracing::debug_span!("Fold univariate round").in_scope(|| {
+		let sumcheck_prover = tracing::debug_span!(
+			"Fold univariate round",
+			component = "bitand_fold_univariate_round",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+		)
+		.in_scope(|| {
 			self.fold_and_send_reduced_prover(
 				&univariate_round_message_domain,
 				univariate_sumcheck_challenge,
@@ -248,8 +265,17 @@ where
 		let ProveSingleOutput {
 			multilinear_evals: mle_claims,
 			challenges: mut eval_point,
-		} = tracing::debug_span!("MLE-check remaining rounds")
-			.in_scope(|| prove_single_mlecheck(sumcheck_prover, channel));
+		} = tracing::debug_span!(
+			"MLE-check remaining rounds",
+			component = "bitand_mle_sumcheck",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_constraint_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+		)
+		.in_scope(|| prove_single_mlecheck(sumcheck_prover, channel));
 
 		eval_point.reverse();
 

@@ -205,6 +205,14 @@ where
 			FRIFolderState::FirstFold(folder) => {
 				let _scope = tracing::debug_span!(
 					"FRI Initial Fold",
+					component = "fri_initial_fold",
+					scope_kind = "round",
+					perfetto_category = "component",
+					tag_proving = true,
+					tag_opening_proof = true,
+					tag_fri = true,
+					round_index = self.curr_round as u64,
+					round_count = self.n_rounds() as u64,
 					log_len = folder.log_len(),
 					arity = self.unprocessed_challenges.len()
 				)
@@ -234,6 +242,15 @@ where
 			} => {
 				let _fri_round_scope = tracing::debug_span!(
 					"FRI Round Fold",
+					component = "fri_round_fold",
+					scope_kind = "round",
+					perfetto_category = "component",
+					tag_proving = true,
+					tag_opening_proof = true,
+					tag_fri = true,
+					tag_repeated = true,
+					round_index = self.curr_round as u64,
+					round_count = self.n_rounds() as u64,
 					log_len = last_codeword.log_len(),
 					arity = self.unprocessed_challenges.len()
 				)
@@ -242,7 +259,17 @@ where
 				// Fold a full codeword committed in the previous FRI round into a codeword with
 				// reduced dimension and rate.
 				let challenges = mem::take(&mut self.unprocessed_challenges);
-				let fri_fold_span = tracing::debug_span!("FRI Fold").entered();
+				let fri_fold_span = tracing::debug_span!(
+					"FRI Fold",
+					component = "fri_fold",
+					scope_kind = "procedure",
+					perfetto_category = "component",
+					tag_proving = true,
+					tag_opening_proof = true,
+					tag_fri = true,
+					tag_repeated = true,
+				)
+				.entered();
 				let folded_codeword = fold_codeword(self.ntt, last_codeword.to_ref(), &challenges);
 				drop(fri_fold_span);
 				// The fold consuming `last_codeword` has arity `challenges.len()`, which is the
@@ -287,7 +314,18 @@ where
 	{
 		let log_coset_size = next_arity.unwrap_or_else(|| self.params.n_final_challenges());
 
-		let _merkle_tree_span = tracing::debug_span!("Merkle Tree").entered();
+		let _merkle_tree_span = tracing::debug_span!(
+			"Merkle Tree",
+			component = "fri_merkle_tree",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_commit = true,
+			tag_opening_proof = true,
+			tag_fri = true,
+			tag_repeated = true,
+		)
+		.entered();
 		let commitment =
 			channel.send_merkle_commitment(folded_codeword.to_ref(), 1 << log_coset_size);
 
@@ -310,7 +348,19 @@ where
 	/// ## Preconditions
 	///
 	/// * All fold rounds must have been executed (`curr_round == n_rounds()`).
-	#[instrument(skip_all, name = "fri::FRIFolder::finalize", level = "debug")]
+	#[instrument(
+		skip_all,
+		name = "fri::FRIFolder::finalize",
+		level = "debug",
+		fields(
+			component = "fri_finalize",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_opening_proof = true,
+			tag_fri = true,
+		)
+	)]
 	#[allow(clippy::type_complexity)]
 	pub fn finalize(mut self) -> (TerminateCodeword<F>, C, FRIQueryProver<F, P, C>) {
 		assert_eq!(
@@ -387,7 +437,19 @@ where
 /// See [DP24], Def. 3.6 and Lemma 3.9 for more details.
 ///
 /// [DP24]: <https://eprint.iacr.org/2024/504>
-#[instrument(skip_all, level = "debug")]
+#[instrument(
+	skip_all,
+	level = "debug",
+	fields(
+		component = "fri_fold_codeword",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_proving = true,
+		tag_opening_proof = true,
+		tag_fri = true,
+		tag_repeated = true,
+	)
+)]
 fn fold_codeword<F, NTT>(ntt: &NTT, codeword: FieldSlice<F>, challenges: &[F]) -> FieldBuffer<F>
 where
 	F: BinaryField,

@@ -275,6 +275,49 @@ RUST_LOG=info cargo run --release --example my_circuit
 cargo run --release --example my_circuit --features perfetto
 ```
 
+### Perfetto prover tags
+
+Tagged prover spans expose a stable `component` identifier, a `scope_kind`
+(`operation`, `phase`, `procedure`, or `round`), and sparse boolean tags. Tags are
+non-exclusive: one span can belong to several views of the proof.
+
+| Tag | Meaning |
+| --- | --- |
+| `tag_witness_generation` | Populate inputs or evaluate the circuit witness |
+| `tag_preparation` | Witness generation, packing, or public-input observation |
+| `tag_proving` | Work performed on the prover path |
+| `tag_commit` | Reed–Solomon encoding or Merkle commitment work |
+| `tag_constraint_proof` | IntMul, BinMul, BitAnd, zero-claim, or shift-constraint work |
+| `tag_opening_proof` | Ring switching or BaseFold opening work |
+| `tag_sumcheck` | A phase or procedure that executes a sumcheck |
+| `tag_fri` | BaseFold MLE/FRI folding, finalization, or query work |
+| `tag_repeated` | A span that repeats or aggregates protocol rounds or queries |
+
+The main Sumcheck-tagged components are `intmul_check`, `binmul_check`,
+`bitand_check`, `shift_reduction`, `shift_phase_1_sumcheck`,
+`shift_phase_2_sumcheck`, `basefold_relation_sumcheck`, and
+`basefold_mle_check`. The BaseFold MLE-check intentionally has both
+`tag_sumcheck` and `tag_fri`; FRI Merkle-tree spans have `tag_commit`,
+`tag_opening_proof`, and `tag_fri`. Ring switching and zero-claim preparation
+do not execute a sumcheck and therefore do not carry `tag_sumcheck`.
+
+Perfetto records these fields as debug annotations. For example, this query
+shows the high-level Sumcheck phases without double-counting nested procedures:
+
+```sql
+SELECT
+  slice.name,
+  slice.dur / 1e6 AS duration_ms,
+  EXTRACT_ARG(slice.arg_set_id, 'debug.component') AS component
+FROM slice
+WHERE COALESCE(EXTRACT_ARG(slice.arg_set_id, 'debug.tag_sumcheck'), 0) = 1
+  AND EXTRACT_ARG(slice.arg_set_id, 'debug.scope_kind') = 'phase'
+ORDER BY slice.ts;
+```
+
+Tagged durations are hierarchical and are not automatically additive. Filter
+by `scope_kind` when producing totals.
+
 ## CLI subcommands
 
 All example binaries share a common CLI with these subcommands:

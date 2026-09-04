@@ -173,6 +173,17 @@ where
 			return;
 		}
 
+		let _scope = tracing::info_span!(
+			"[phase] BaseFold opening",
+			component = "basefold_opening",
+			scope_kind = "phase",
+			perfetto_category = "phase",
+			tag_proving = true,
+			tag_opening_proof = true,
+			relation_count = queue.len() as u64,
+			oracle_count = committed_oracles.len() as u64,
+		)
+		.entered();
 		prove_batch_zk_basefold(
 			&mut channel,
 			ntt,
@@ -353,8 +364,18 @@ fn prove_batch_zk_basefold<A, F, P, NTT, Channel>(
 		challenges,
 		multilinear_evals,
 	} = {
-		let _scope =
-			tracing::debug_span!("Reduce linear relations to committed openings").entered();
+		let _scope = tracing::debug_span!(
+			"Reduce linear relations to committed openings",
+			component = "basefold_relation_sumcheck",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_opening_proof = true,
+			tag_sumcheck = true,
+			tag_repeated = true,
+			round_count = max_n as u64,
+		)
+		.entered();
 		sumcheck::batch_prove(provers, channel)
 	};
 
@@ -382,7 +403,15 @@ fn prove_batch_zk_basefold<A, F, P, NTT, Channel>(
 	let outer_challenges = channel.sample_many(log_n_oracles);
 
 	let (combined, s_prime) = {
-		let _scope = tracing::debug_span!("Compute batched witness").entered();
+		let _scope = tracing::debug_span!(
+			"Compute batched witness",
+			component = "basefold_batched_witness",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_opening_proof = true,
+		)
+		.entered();
 
 		let eq_tensor = eq_ind_partial_eval_scalars(&outer_challenges);
 
@@ -543,7 +572,15 @@ where
 		};
 
 		// Commit the codeword over the Merkle channel, with one interleaved coset per leaf.
-		let merkle_scope = tracing::debug_span!("Merkle commit").entered();
+		let merkle_scope = tracing::debug_span!(
+			"Merkle commit",
+			component = "witness_merkle_commit",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_proving = true,
+			tag_commit = true,
+		)
+		.entered();
 		let leaf_size = 1 << self.fri_params.input_oracles()[index].log_batch_size();
 		let commitment = self
 			.channel

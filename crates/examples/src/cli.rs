@@ -666,14 +666,32 @@ where
 		let witness_population = tracing::info_span!(
 			"Generating witness",
 			operation = "witness_generation",
-			perfetto_category = "operation"
+			component = "witness_generation",
+			scope_kind = "operation",
+			perfetto_category = "operation",
+			tag_witness_generation = true,
+			tag_preparation = true,
 		)
 		.entered();
 		let mut filler = circuit.new_witness_filler();
-		tracing::info_span!("Input population")
-			.in_scope(|| example.populate_witness(instance, &mut filler))?;
-		tracing::info_span!("Circuit evaluation")
-			.in_scope(|| circuit.populate_wire_witness(&mut filler))?;
+		tracing::info_span!(
+			"Input population",
+			component = "input_population",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_witness_generation = true,
+			tag_preparation = true,
+		)
+		.in_scope(|| example.populate_witness(instance, &mut filler))?;
+		tracing::info_span!(
+			"Circuit evaluation",
+			component = "circuit_evaluation",
+			scope_kind = "procedure",
+			perfetto_category = "component",
+			tag_witness_generation = true,
+			tag_preparation = true,
+		)
+		.in_scope(|| circuit.populate_wire_witness(&mut filler))?;
 		let witness = filler.into_value_vec();
 		drop(witness_population);
 
