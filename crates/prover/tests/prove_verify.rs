@@ -182,6 +182,38 @@ fn test_prove_verify_binmul_seventh_power() {
 	prove_verify_zk(cs, &witness);
 }
 
+#[test]
+fn test_prove_verify_with_security_bits() {
+	const LOG_INV_RATE: usize = 1;
+	let (cs, witness) = binmul_seventh_power_circuit();
+
+	for (security_bits, expected_queries) in [(64, 155), (96, 232), (128, 309)] {
+		let verifier = Verifier::<StdHashSuite>::setup_with_security_bits(
+			cs.clone(),
+			LOG_INV_RATE,
+			security_bits,
+		)
+		.unwrap();
+		assert_eq!(verifier.fri_params().n_test_queries(), expected_queries);
+
+		let prover = Prover::<OptimalPackedB128, StdHashSuite>::setup(verifier.clone()).unwrap();
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		prover.prove(&witness, &mut prover_transcript).unwrap();
+
+		// The default verifier accepts proofs made with the explicit 96-bit target.
+		let verifier = if security_bits == 96 {
+			Verifier::<StdHashSuite>::setup(cs.clone(), LOG_INV_RATE).unwrap()
+		} else {
+			verifier
+		};
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		verifier
+			.verify(witness.public(), &mut verifier_transcript)
+			.unwrap();
+		verifier_transcript.finalize().unwrap();
+	}
+}
+
 /// Builds a circuit whose AND, IMUL and BMUL constraint counts are all non-powers of two, so every
 /// reduction runs over operand columns whose tail rows are zero padding.
 ///

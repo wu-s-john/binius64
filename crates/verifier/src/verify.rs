@@ -388,6 +388,19 @@ where
 	///
 	/// See [`Verifier`] struct documentation for details.
 	pub fn setup(constraint_system: ConstraintSystem, log_inv_rate: usize) -> Result<Self, Error> {
+		Self::setup_with_security_bits(constraint_system, log_inv_rate, SECURITY_BITS)
+	}
+
+	/// Constructs a verifier with an explicit FRI query-phase security target.
+	///
+	/// This parameter sets the number of FRI test queries, which also influences automatic
+	/// FRI parameter selection. The target covers only the query phase, not the combined
+	/// soundness error of the complete protocol. [`Self::setup`] uses [`SECURITY_BITS`].
+	pub fn setup_with_security_bits(
+		constraint_system: ConstraintSystem,
+		log_inv_rate: usize,
+		security_bits: usize,
+	) -> Result<Self, Error> {
 		constraint_system.validate()?;
 
 		// The validated layout guarantees a power-of-two public segment of at least one full
@@ -408,7 +421,7 @@ where
 			ConstantArityStrategy::with_optimal_arity::<B128, _>(&merkle_scheme, log_code_len)
 				.arity;
 
-		let n_test_queries = calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
+		let n_test_queries = calculate_n_test_queries(security_bits, log_inv_rate);
 
 		let iop_compiler = BaseFoldVerifierCompiler::new(
 			&merkle_scheme,
