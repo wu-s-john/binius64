@@ -1,4 +1,5 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 use binius_core::ConstraintSystemError;
 use binius_iop::channel::Error as IOPChannelError;
@@ -12,6 +13,8 @@ use crate::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+	#[error("require 1..=128 FRI query security bits and positive log inverse rate")]
+	InvalidSecurityParameters,
 	#[error("transcript error: {0}")]
 	Transcript(#[from] binius_transcript::Error),
 	#[error("channel error: {0}")]

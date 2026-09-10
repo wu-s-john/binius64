@@ -263,6 +263,19 @@ where
 	///
 	/// Returns an error when the constraint system is invalid.
 	pub fn setup(constraint_system: ConstraintSystem, log_inv_rate: usize) -> Result<Self, Error> {
+		Self::setup_with_security_bits(constraint_system, log_inv_rate, SECURITY_BITS)
+	}
+
+	/// Sets the FRI query soundness target explicitly. This does not change or
+	/// certify the soundness of the other protocol reductions.
+	pub fn setup_with_security_bits(
+		constraint_system: ConstraintSystem,
+		log_inv_rate: usize,
+		security_bits: usize,
+	) -> Result<Self, Error> {
+		if security_bits == 0 || security_bits > 128 || log_inv_rate == 0 {
+			return Err(Error::InvalidSecurityParameters);
+		}
 		constraint_system.validate()?;
 
 		let log_public_words = constraint_system.log_public_words(InoutSegment::Public);
@@ -282,7 +295,7 @@ where
 				.arity;
 
 		// The query count is fixed by the rate and the soundness target.
-		let n_test_queries = calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
+		let n_test_queries = calculate_n_test_queries(security_bits, log_inv_rate);
 
 		let iop_compiler = BaseFoldVerifierCompiler::new(
 			&merkle_scheme,

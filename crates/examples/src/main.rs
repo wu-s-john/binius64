@@ -48,6 +48,10 @@ fn main() -> Result<()> {
 			"Keccak-256 hash function circuit example",
 		)
 		.circuit::<circuits::sha256::Sha256Example>("sha256", "SHA256 compression function example")
+		.circuit::<circuits::sha256sign::Sha256SignExample>(
+			"sha256sign",
+			"secp256k1 recovery with SHA-256",
+		)
 		.circuit::<circuits::sha3::Sha3Example>("sha3", "SHA3-256 hash function circuit example")
 		.circuit::<circuits::sha3_512::Sha3_512Example>(
 			"sha3_512",

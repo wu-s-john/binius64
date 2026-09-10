@@ -100,7 +100,8 @@ impl IOPProver {
 		//
 		// Only the non-public words are committed as the trace oracle; the public segment is a
 		// verifier-known polynomial.
-		let setup_guard = tracing::debug_span!("Prepare witness").entered();
+		let setup_guard =
+			tracing::info_span!("Prepare witness", phase = "prepare_witness").entered();
 		let witness_packed =
 			pack_witness::<P, _>(alloc, self.log_witness_elems, witness.non_public())?;
 		drop(setup_guard);
@@ -110,7 +111,8 @@ impl IOPProver {
 		channel.observe_words(witness.inout());
 
 		// [phase] Witness Commit - witness generation and commitment
-		let witness_commit_guard = tracing::info_span!("Commit witness").entered();
+		let witness_commit_guard =
+			tracing::info_span!("Commit witness", phase = "commit_witness").entered();
 
 		// Commit witness via channel
 		let trace_oracle = channel.send_oracle(witness_packed.as_view());
@@ -477,7 +479,8 @@ where
 			.create_channel_without_zk_from_transcript::<H, Challenger_, _, _>(transcript, alloc);
 		self.iop_prover
 			.prove::<_, P, _>(witness, &mut channel, &alloc)?;
-		channel.finish();
+		tracing::info_span!("[phase] Finish PCS", phase = "finish_pcs")
+			.in_scope(|| channel.finish());
 		Ok(())
 	}
 }

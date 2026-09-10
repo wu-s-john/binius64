@@ -1,15 +1,17 @@
+// Copyright 2026 The Binius Developers
 // Copyright 2025 Irreducible Inc.
 use std::{array, iter};
 
 use anyhow::Result;
 use binius_circuits::{
-	bignum::BigUint, ecdsa::ecrecover, fixed_byte_vec::ByteVec, sha256::Sha256,
+	bignum::BigUint, bytes::swap_bytes, ecdsa::ecrecover, fixed_byte_vec::ByteVec,
+	sha256::sha256_varlen,
 };
 use binius_core::word::Word;
-use binius_frontend::{CircuitBuilder, Wire, WitnessFiller, util::pack_bytes_into_wires_le};
+use binius_frontend::{CircuitBuilder, Wire, WitnessFiller};
 use clap::Args;
 use ethsign::SecretKey;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256 as NativeSha256};
 
 use crate::ExampleCircuit;
@@ -19,8 +21,7 @@ struct Signature {
 	s: [Wire; 4],
 	recid_odd: Wire,
 	address: [Wire; 3],
-	msg_sha256: Sha256,
-	address_sha256: Sha256,
+	message: ByteVec,
 }
 
 /// Example circuit that proves validity of ECDSA signatures using SHA-256.
@@ -35,8 +36,8 @@ pub struct Params {
 	#[arg(short = 'n', long, default_value_t = 1)]
 	pub n_signatures: usize,
 	/// Maximum message length
-	#[arg(short = 'm', long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..))]
-	pub max_msg_len_bytes: u16,
+	#[arg(short = 'm', long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..))]
+	pub max_msg_len_bytes: u32,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -59,8 +60,8 @@ impl ExampleCircuit for Sha256SignExample {
 				let recid_odd = builder.add_inout();
 				let address = array::from_fn(|_| builder.add_inout());
 
-				let msg_final_state = array::from_fn(|_| builder.add_witness());
-				let msg_sha256 = Sha256::new(builder, msg_len, msg_final_state, message.clone());
+				let message = ByteVec::new(message, msg_len);
+				let msg_final_state = sha256_varlen(builder, &message);
 
 				// The SHA-256 digest is big-endian encoded into 4 words. Reversing gives
 				// little-endian limb order for BigUint (no byteswap needed).
@@ -86,24 +87,14 @@ impl ExampleCircuit for Sha256SignExample {
 				public_key_limbs.extend(&public_key.x.limbs);
 				public_key_limbs.reverse();
 
-				// Convert LE-packed BigUint limbs to SHA-256's two-BE-word message wire format
-				// by rotating each 64-bit word by 32 bits.
 				let public_key_message = public_key_limbs
 					.into_iter()
-					.map(|word| builder.rotl(word, 32))
-					.collect::<Vec<_>>();
-
-				let address_final_state = array::from_fn(|_| builder.add_witness());
-				let address_sha256 = Sha256::new(
-					builder,
-					builder.add_constant_64(64),
-					address_final_state,
-					public_key_message,
-				);
-
-				// Assert that the provided address equals digest bytes 12..32
-				// SHA-256 digest is BE-packed, convert to LE for ByteVec
-				let address_digest_le = address_sha256.digest_to_le_wires(builder);
+					.map(|word| swap_bytes(builder, word))
+					.collect();
+				let public_key_message =
+					ByteVec::new(public_key_message, builder.add_constant_64(64));
+				let address_digest = sha256_varlen(builder, &public_key_message);
+				let address_digest_le = address_digest.map(|word| swap_bytes(builder, word));
 				assert_address_eq(builder, &address_digest_le, &address);
 
 				Signature {
@@ -112,8 +103,7 @@ impl ExampleCircuit for Sha256SignExample {
 					recid_odd,
 					address,
 
-					msg_sha256,
-					address_sha256,
+					message,
 				}
 			})
 			.collect();
@@ -124,7 +114,7 @@ impl ExampleCircuit for Sha256SignExample {
 		})
 	}
 
-	fn populate_witness(&self, _instance: Instance, w: &mut WitnessFiller) -> Result<()> {
+	fn populate_witness(&self, _instance: Instance, w: &mut WitnessFiller<'_>) -> Result<()> {
 		// Generate random initial state with fixed seed for reproducibility
 		let mut rng = StdRng::seed_from_u64(42);
 
@@ -133,8 +123,7 @@ impl ExampleCircuit for Sha256SignExample {
 			s,
 			recid_odd,
 			address,
-			msg_sha256,
-			address_sha256,
+			message,
 		} in &self.signatures
 		{
 			// Random private key
@@ -151,9 +140,8 @@ impl ExampleCircuit for Sha256SignExample {
 			let public = secret_key.public();
 
 			// Hash the message with SHA-256
-			msg_sha256.populate_len_bytes(w, msg_len);
-			msg_sha256.populate_message(w, &msg_bytes);
-			msg_sha256.populate_digest(w, msg_hash);
+			message.populate_len_bytes(w, msg_len);
+			message.populate_data(w, &msg_bytes);
 
 			// ethsign crate returns 0/1 recid, convert to `recid_odd` boolean
 			w[*recid_odd] = if signature.v != 0 {
@@ -164,22 +152,18 @@ impl ExampleCircuit for Sha256SignExample {
 
 			// ethsign crate returns r & s big endian, byteswap
 			signature.r.reverse();
-			pack_bytes_into_wires_le(w, r, &signature.r);
+			w.pack_bytes_le(r, &signature.r);
 
 			signature.s.reverse();
-			pack_bytes_into_wires_le(w, s, &signature.s);
+			w.pack_bytes_le(s, &signature.s);
 
 			// Hash the (big endian) public key
 			let pk_bytes = public.bytes();
 			let pk_hash = sha256_hash(pk_bytes);
 
-			address_sha256.populate_len_bytes(w, 64);
-			address_sha256.populate_message(w, pk_bytes);
-			address_sha256.populate_digest(w, pk_hash);
-
 			// Derive address from SHA-256 hash of public key (bytes 12..32)
 			let address_bytes: &[u8] = &pk_hash[12..32];
-			pack_bytes_into_wires_le(w, address, address_bytes);
+			w.pack_bytes_le(address, address_bytes);
 		}
 
 		Ok(())
