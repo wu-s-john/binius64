@@ -2,8 +2,8 @@
 
 use binius_compute::BufferPool;
 use binius_field::{FieldOps, arch::OptimalPackedB128};
-use binius_ip::prodcheck::MultilinearEvalClaim;
-use binius_ip_prover::fracaddcheck::FracAddCheckProver;
+use binius_ip::fracaddcheck::FracAddEvalClaim;
+use binius_ip_prover::fracaddcheck::{FracAddCircuit, fraction::Fraction};
 use binius_math::{
 	FieldBuffer,
 	multilinear::evaluate::evaluate,
@@ -16,8 +16,8 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 type P = OptimalPackedB128;
 type F = <P as FieldOps>::Scalar;
 
-fn bench_fracaddcheck_new(c: &mut Criterion) {
-	let mut group = c.benchmark_group("fracaddcheck/new");
+fn bench_fracaddcheck_build(c: &mut Criterion) {
+	let mut group = c.benchmark_group("fracaddcheck/build");
 
 	for n_vars in [12, 16, 20] {
 		// Full reduction: k = n_vars, so sums layer has log_len = 0.
@@ -36,12 +36,16 @@ fn bench_fracaddcheck_new(c: &mut Criterion) {
 			b.iter_batched(
 				|| {
 					(
-						FieldBuffer::clone_from_slice(&alloc, num_buffer.to_ref()),
-						FieldBuffer::clone_from_slice(&alloc, den_buffer.to_ref()),
+						FieldBuffer::from_view_in(&alloc, num_buffer.as_view()),
+						FieldBuffer::from_view_in(&alloc, den_buffer.as_view()),
 					)
 				},
 				|(witness_num, witness_den)| {
-					FracAddCheckProver::<_, P>::new(k, &alloc, (witness_num, witness_den))
+					FracAddCircuit::<_, P>::build(
+						k,
+						&alloc,
+						Fraction::new(witness_num, witness_den),
+					)
 				},
 				BatchSize::SmallInput,
 			);
@@ -68,26 +72,21 @@ fn bench_fracaddcheck_prove(c: &mut Criterion) {
 			let alloc = &pool;
 
 			// Build the prover once, then clone it per iteration (untimed setup).
-			let (prover, sums) = FracAddCheckProver::new(
+			let (prover, sums) = FracAddCircuit::build(
 				k,
 				&alloc,
-				(
+				Fraction::new(
 					FieldBuffer::<P, _>::from_values_in(&alloc, &num_scalars),
 					FieldBuffer::<P, _>::from_values_in(&alloc, &den_scalars),
 				),
 			);
-			let sum_num_eval = evaluate(&sums.0, &[]);
-			let sum_den_eval = evaluate(&sums.1, &[]);
-			let claim = (
-				MultilinearEvalClaim {
-					eval: sum_num_eval,
-					point: vec![],
-				},
-				MultilinearEvalClaim {
-					eval: sum_den_eval,
-					point: vec![],
-				},
-			);
+			let sum_num_eval = evaluate(&sums.num, &[]);
+			let sum_den_eval = evaluate(&sums.den, &[]);
+			let claim = FracAddEvalClaim {
+				num_eval: sum_num_eval,
+				den_eval: sum_den_eval,
+				point: vec![],
+			};
 
 			let mut transcript = ProverTranscript::new(StdChallenger::default());
 
@@ -102,5 +101,5 @@ fn bench_fracaddcheck_prove(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(fracaddcheck, bench_fracaddcheck_new, bench_fracaddcheck_prove);
+criterion_group!(fracaddcheck, bench_fracaddcheck_build, bench_fracaddcheck_prove);
 criterion_main!(fracaddcheck);

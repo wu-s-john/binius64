@@ -1,11 +1,11 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use binius_field::{BinaryField128bGhash as B128, PackedField, arch::OptimalPackedB128};
-use binius_hash::{
-	binary_merkle_tree::HashSuite, blake3::Blake3HashSuite, sha256::Sha256HashSuite,
-};
-use binius_iop_prover::merkle_tree::{commit_field_buffer, prover::BinaryMerkleTreeProver};
+use binius_compute::BufferPool;
+use binius_field::{Ghash128b as B128, PackedField, arch::OptimalPackedB128};
+use binius_hash::{blake3::Blake3HashSuite, sha256::Sha256HashSuite};
+use binius_hash_prover::ParallelHashSuite;
+use binius_iop_prover::merkle_tree::{MerkleTreeProver, prover::BinaryMerkleTreeProver};
 use binius_math::test_utils::random_field_buffer;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -14,19 +14,26 @@ const LOG_ELEMS_IN_LEAF: usize = 4;
 
 /// Benchmarks committing a [`FieldBuffer<P>`] of `2^(LOG_LEAVES + LOG_ELEMS_IN_LEAF)` B128 scalars.
 ///
-/// The committed scalar sequence is identical for every `P`. What changes with the packing width
-/// is (a) the source buffer's allocation and alignment, and (b) which branch of
-/// [`commit_field_buffer`] runs and at what granularity it parallelizes — for a leaf of
-/// `1 << LOG_ELEMS_IN_LEAF` scalars, packings narrower than the leaf take the "big chunks" path
-/// while wider packings take the "small chunks" path. That is the surface we want to measure.
+/// The committed scalar sequence is identical for every `P`.
+/// Only two things change with the packing width:
 ///
-/// Note: `OptimalPackedB128` only widens past `1x128b` when built with
-/// `RUSTFLAGS="-C target-cpu=native"` (or an explicit SIMD `target-feature`); on a baseline target
-/// it collapses to `1x128b` and the two cases become identical.
+/// * the source buffer's allocation and alignment;
+/// * how a leaf of `2^LOG_ELEMS_IN_LEAF` scalars maps onto packed words.
+///
+/// The second point is the surface under measurement:
+///
+/// ```text
+/// P narrower than a leaf  ->  a leaf spans several whole words
+/// P wider than a leaf     ->  a word splits into several leaves
+/// ```
+///
+/// `OptimalPackedB128` widens past `1x128b` only under `RUSTFLAGS="-C target-cpu=native"`.
+/// On a baseline target it collapses to `1x128b`.
+/// Both cases then measure the same path.
 fn bench_binary_merkle_tree<P, H>(c: &mut Criterion, hash_name: &str, packing_name: impl AsRef<str>)
 where
 	P: PackedField<Scalar = B128>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 {
 	let merkle_prover = BinaryMerkleTreeProver::<B128, H>::new();
 	let mut rng = rand::rng();
@@ -37,17 +44,24 @@ where
 		((1 << (LOG_LEAVES + LOG_ELEMS_IN_LEAF)) * std::mem::size_of::<B128>()) as u64,
 	));
 	group.sample_size(10);
-	group.bench_function(
-		format!(
-			"{LOG_LEAVES} log leaves size {}xB128 leaf {}",
-			1 << LOG_ELEMS_IN_LEAF,
-			packing_name.as_ref()
-		),
-		|b| {
-			b.iter(|| commit_field_buffer(&merkle_prover, buffer.to_ref(), LOG_ELEMS_IN_LEAF));
-		},
+	let case = format!(
+		"{LOG_LEAVES} log leaves size {}xB128 leaf {}",
+		1 << LOG_ELEMS_IN_LEAF,
+		packing_name.as_ref()
 	);
-	group.finish()
+	group.bench_function(&case, |b| {
+		b.iter(|| merkle_prover.commit_field_buffer(buffer.as_view(), LOG_ELEMS_IN_LEAF));
+	});
+
+	// The same commitment out of a pool the prover holds across iterations, which is how a real
+	// prover uses one. Benching both here rather than against a baseline build keeps the
+	// comparison inside a single binary, where the two arms meet identical machine conditions.
+	let pool = BufferPool::new();
+	let pooled_prover = BinaryMerkleTreeProver::<B128, H, _>::with_allocator(&pool);
+	group.bench_function(format!("{case} pooled"), |b| {
+		b.iter(|| pooled_prover.commit_field_buffer(buffer.as_view(), LOG_ELEMS_IN_LEAF));
+	});
+	group.finish();
 }
 
 fn bench_sha256_merkle_tree(c: &mut Criterion) {

@@ -3,110 +3,35 @@
 
 use std::iter;
 
-use binius_core::{constraint_system::Operand, word::Word};
-use binius_field::{
-	BinaryField, FieldOps, WideMul,
-	util::{FieldFn, powers},
-};
-use binius_math::{
-	inner_product::inner_product_scalars, multilinear::eq::eq_ind_partial_eval_scalars,
-};
-use binius_utils::{checked_arithmetics::log2_ceil_usize, rayon::prelude::*};
-
-use super::{
-	SHIFT_VARIANT_COUNT,
-	shift_ind::{partial_eval_phi, partial_eval_sigmas, partial_eval_sigmas_transpose},
+use binius_core::constraint_system::{Operand, ValueIndex};
+use binius_field::{BinaryField, FieldOps, WideMul};
+use binius_utils::rayon::{
+	prelude::*,
+	task_size::{IndexedParallelIteratorExt, WorkPerItem},
 };
 
-/// Evaluates the three h multilinear polynomials (corresponding to SLL, SRL, SRA) at challenge
-/// points.
+use super::LOG_MAX_ARITY;
+
+/// The evaluation of one operation's monster multilinear polynomial.
 ///
-/// This is the verifier's version of the h-parts evaluation - instead of building
-/// full multilinear polynomials, it directly computes their evaluations.
-pub fn evaluate_h_op<E: FieldOps>(l_tilde: &[E], r_j: &[E], r_s: &[E]) -> [E; SHIFT_VARIANT_COUNT] {
-	assert_eq!(l_tilde.len(), Word::BITS);
-	assert_eq!(r_j.len(), Word::LOG_BITS);
-	assert_eq!(r_s.len(), Word::LOG_BITS);
-
-	// Use helper functions to compute shift indicator helpers for 64-bit shifts
-	let (sigma, sigma_prime) = partial_eval_sigmas(r_j, r_s);
-	let sigma_transpose = partial_eval_sigmas_transpose(r_j, r_s);
-	let phi = partial_eval_phi(r_s);
-	let j_product: E = r_j.iter().cloned().product();
-
-	// Use helper functions to compute shift indicator helpers for 32-bit shifts
-	let (sigma32, sigma32_prime) = partial_eval_sigmas(&r_j[..5], &r_s[..5]);
-	let sigma32_transpose = partial_eval_sigmas_transpose(&r_j[..5], &r_s[..5]);
-	let phi32 = partial_eval_phi(&r_s[..5]);
-	let j_product32: E = r_j[..5].iter().cloned().product();
-
-	// Compute final results
-	let sll = inner_product_scalars(l_tilde.iter().cloned(), sigma_transpose);
-	let srl = inner_product_scalars(l_tilde.iter().cloned(), sigma.iter().cloned());
-	// sra == ∑ᵢ L̃(i) ⋅ (srlᵢ + ∏ₖ rⱼ[k] ⋅ φᵢ)
-	//     == ∑ᵢ L̃(i) ⋅ srlᵢ + ∏ₖ rⱼ[k] ⋅ [ ∑ᵢ L̃(i) ⋅ φᵢ ]
-	//     == srl + ∏ₖ rⱼ[k] ⋅ [ ∑ᵢ L̃(i) ⋅ φᵢ ]
-	let sra = srl.clone() + j_product * inner_product_scalars(l_tilde.iter().cloned(), phi);
-	let rotr = inner_product_scalars(
-		l_tilde.iter().cloned(),
-		iter::zip(&sigma, &sigma_prime).map(|(s_i, s_prime_i)| s_i.clone() + s_prime_i),
-	);
-
-	let r_j_rest_tensor = eq_ind_partial_eval_scalars(&r_j[5..]);
-	let chunk_size = 1 << 5; // 32
-
-	let sll32 = inner_product_scalars(
-		l_tilde.chunks(chunk_size).map(|chunk| {
-			inner_product_scalars(chunk.iter().cloned(), sigma32_transpose.iter().cloned())
-		}),
-		r_j_rest_tensor.iter().cloned(),
-	);
-	let srl32 = inner_product_scalars(
-		l_tilde
-			.chunks(chunk_size)
-			.map(|chunk| inner_product_scalars(chunk.iter().cloned(), sigma32.iter().cloned())),
-		r_j_rest_tensor.iter().cloned(),
-	);
-	let sra32 = srl32.clone()
-		+ inner_product_scalars(
-			l_tilde.chunks(chunk_size).map(|chunk| {
-				j_product32.clone()
-					* inner_product_scalars(chunk.iter().cloned(), phi32.iter().cloned())
-			}),
-			r_j_rest_tensor.iter().cloned(),
-		);
-	let rotr32 = inner_product_scalars(
-		l_tilde.chunks(chunk_size).map(|chunk| {
-			inner_product_scalars(
-				chunk.iter().cloned(),
-				iter::zip(&sigma32, &sigma32_prime).map(|(s_i, s_prime_i)| s_i.clone() + s_prime_i),
-			)
-		}),
-		r_j_rest_tensor,
-	);
-
-	[sll, srl, sra, rotr, sll32, srl32, sra32, rotr32]
-}
-
-/// A [`FieldFn`] evaluating one operation's monster multilinear polynomial.
-///
-/// The monster multilinear encodes all `ARITY`-operand constraints of a single operation (BitAnd,
-/// IntMul or BinMul) into one polynomial:
+/// The monster multilinear encodes all `ARITY`-operand constraints of a single operation (Zero,
+/// BitAnd, IntMul or BinMul) into one polynomial:
 ///
 /// $$
 /// \sum_{\text{m_idx} \in \text{enumerate(operands)}}
-///     \lambda^{\text{m_idx}+1}
+///     \text{eq}(r_m, \text{m_idx})
 ///     \sum_{\text{op}} h_{\text{op}}(r_j, r_s) \cdot M_{\text{m}, \text{op}}(r_x', r_y, r_s)
 /// $$
 ///
 /// where `m_idx` indexes the operand position (0 to `ARITY - 1`), `op` ranges over the shift
 /// variants, `h_op` is the shift selector polynomial, and `M_{m,op}` is the multilinear extension
-/// of the operand values.
+/// of the operand values. The operand batching weight is the equality indicator of the operand
+/// axis, which the four operations share.
 ///
-/// The `FieldFn` input is the flat slice built by [`encode_operation_input`]: the constraint
-/// challenge `r_x'`, then the batching coefficient `lambda`, then the shared shift scalars, then
-/// the word-index tensor `r_y`. [`FieldFn::call`] evaluates generically over any `E`;
-/// [`FieldFn::call_native`] takes the `WideMul`-accelerated base-field path.
+/// Both evaluations read one borrowed weight table per axis, bundled as [`WiringWeights`]. The
+/// tables the four operations share are then built once by the caller and lent to all four, rather
+/// than copied into a per-operation buffer. [`Self::call`] evaluates generically over any `E`;
+/// [`Self::call_native`] takes the `WideMul`-accelerated base-field path.
 pub struct OperationEvalFn<'a, C, const ARITY: usize> {
 	/// The operation's constraints, each exposing its `ARITY` operands as an array in storage
 	/// order.
@@ -118,56 +43,145 @@ impl<'a, C, const ARITY: usize> OperationEvalFn<'a, C, ARITY> {
 	pub const fn new(constraints: &'a [C]) -> Self {
 		Self { constraints }
 	}
+}
 
-	/// Splits the flat [`FieldFn`] input into `(r_x_prime, lambda, shift_scalars, r_y_tensor)`.
+/// One nonzero of the wiring tensor.
+///
+/// The tensor has five axes.
+///
+/// ```text
+///     constraint index  x  operand position  x  inner slot  x  outer slot  x  value address
+/// ```
+///
+/// A constraint names a handful of positions and nothing else, which is what makes it sparse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WiringEntry {
+	/// Which constraint of the operation holds the entry.
+	pub constraint: usize,
+	/// Which of that constraint's operands names it.
+	pub operand: usize,
+	/// The inner shift slot's spelling, as a variant-and-amount index.
+	pub inner_shift: usize,
+	/// The outer shift slot's spelling, as a variant-and-amount index.
+	pub outer_shift: usize,
+	/// The value the entry reads.
+	pub value: ValueIndex,
+}
+
+/// One weight table per axis of the wiring tensor.
+///
+/// Each table is indexed the way its axis is, so contracting is one lookup per axis and a product.
+pub struct WiringWeights<'a, E> {
+	/// One entry per constraint index, covering the padded constraint count.
+	pub constraint: &'a [E],
+	/// One entry per inner slot spelling paired with an operand position, the operand innermost:
+	/// `(inner_shift << LOG_MAX_ARITY) | operand`.
 	///
-	/// The `r_x'` section has `ceil(log2(constraints.len()))` entries — the reductions run over the
-	/// constraint count rounded up to a power of two — so the split needs no state beyond the
-	/// constraints.
-	fn split_input<'i, E>(
-		&self,
-		input: &'i [E],
-	) -> (&'i [E], &'i E, &'i [E; SHIFT_VARIANT_COUNT * Word::BITS], &'i [E]) {
-		let n_vars = log2_ceil_usize(self.constraints.len());
-		let (r_x_prime, rest) = input.split_at(n_vars);
-		let (lambda, rest) = rest.split_first().expect("input encodes lambda");
-		let (shift_scalars, r_y_tensor) = rest.split_at(SHIFT_VARIANT_COUNT * Word::BITS);
-		let shift_scalars = shift_scalars
-			.try_into()
-			.expect("input encodes the shift scalars");
-		(r_x_prime, lambda, shift_scalars, r_y_tensor)
+	/// The operand axis is padded to a cube so that the table is a plain tensor expansion, which
+	/// is why its stride is `1 << LOG_MAX_ARITY` rather than the operation's own arity.
+	pub inner_operand: &'a [E],
+	/// One entry per outer slot spelling, `SHIFT_COUNT` of them.
+	pub outer: &'a [E],
+	/// One entry per value address, in three runs: constants, then inout, then private.
+	pub value: [&'a [E]; 3],
+}
+
+// Shared slices copy freely whatever `E` is. Deriving these would demand `E: Copy`, which the
+// generic evaluation path does not have.
+impl<E> Clone for WiringWeights<'_, E> {
+	fn clone(&self) -> Self {
+		*self
 	}
 }
 
-impl<F, C, const ARITY: usize> FieldFn<F> for OperationEvalFn<'_, C, ARITY>
-where
-	F: BinaryField,
-	C: AsRef<[Operand; ARITY]> + Sync,
-{
-	fn call<E: FieldOps<Scalar = F> + From<F>>(&self, input: &[E]) -> E {
-		let (r_x_prime, lambda, shift_scalars, r_y_tensor) = self.split_input(input);
+impl<E> Copy for WiringWeights<'_, E> {}
 
-		let r_x_prime_tensor = eq_ind_partial_eval_scalars(r_x_prime);
-		let operand_shift_scalars =
-			operand_shift_scalar_table(shift_scalars, lambda.clone(), ARITY);
+impl<C: AsRef<[Operand; ARITY]>, const ARITY: usize> OperationEvalFn<'_, C, ARITY> {
+	/// Every nonzero of the wiring tensor, in constraint order.
+	///
+	/// The tensor is what a deferred wiring claim is about.
+	///
+	/// Enumerating it is what lets that claim be folded.
+	/// It is also what lets the extension be evaluated away from the run that raised the claim.
+	pub fn entries(&self) -> impl Iterator<Item = WiringEntry> + '_ {
+		self.constraints
+			.iter()
+			.enumerate()
+			.flat_map(|(constraint, terms)| {
+				terms
+					.as_ref()
+					.iter()
+					.enumerate()
+					.flat_map(move |(operand, operand_terms)| {
+						operand_terms.iter().map(move |svi| WiringEntry {
+							constraint,
+							operand,
+							inner_shift: svi.inner().index(),
+							outer_shift: svi.outer().index(),
+							value: svi.value_index,
+						})
+					})
+			})
+	}
 
-		// Accumulate one contribution per constraint. Within a constraint, each shifted-value term
-		// over all operands is weighted by its operand shift scalar and the word-index tensor
-		// entry; the running sum is then scaled by the constraint-index tensor entry. The tensor
-		// covers the padded constraint count, so the zip stops at the last real constraint; the
-		// padding rows have no operand terms and contribute nothing.
+	/// Contracts the wiring tensor against one weight table per axis.
+	///
+	/// This is the tensor's defining sum, one nonzero at a time.
+	///
+	/// ```text
+	///     sum over nonzeros of
+	///         constraint[i] * inner_operand[(inner << LOG_MAX_ARITY) | a] * outer[o]
+	///             * value[seg][idx]
+	/// ```
+	///
+	/// Contract with equality indicators and the result is the tensor's multilinear extension.
+	/// The point is the one those indicators were built from.
+	///
+	/// That extension is what an accumulated claim is about.
+	/// Evaluating it is what settling such a claim comes down to.
+	///
+	/// The batched evaluation computes the same sum.
+	/// It groups terms by constraint, so a constraint's weight multiplies in once per constraint.
+	/// That grouping is why it is the path a circuit runs.
+	///
+	/// This one trades those saved multiplies for a flat walk, which is what a fold needs.
+	pub fn contract<E: FieldOps>(&self, weights: WiringWeights<'_, E>) -> E {
+		let mut acc = E::zero();
+		for entry in self.entries() {
+			// Two axes share one table: the inner slot's spelling with the operand innermost.
+			let inner_operand = (entry.inner_shift << LOG_MAX_ARITY) | entry.operand;
+			acc += weights.constraint[entry.constraint].clone()
+				* &weights.inner_operand[inner_operand]
+				* &weights.outer[entry.outer_shift]
+				* &weights.value[entry.value.segment() as usize][entry.value.index() as usize];
+		}
+		acc
+	}
+
+	/// Evaluates the monster multilinear against one weight table per axis.
+	///
+	/// This is [`contract`](Self::contract)'s sum, grouped by constraint: a constraint's weight
+	/// multiplies in once for the whole constraint rather than once per term. Grouping is exact,
+	/// so the two agree; it is the cheaper path, and the one a circuit runs.
+	///
+	/// The constraint table covers the padded constraint count, so the walk stops at the last real
+	/// constraint; padding rows carry no operand terms and contribute nothing.
+	pub fn call<E: FieldOps>(&self, weights: WiringWeights<'_, E>) -> E {
 		let mut eval = E::zero();
-		for (constraint, r_x_prime_entry) in iter::zip(self.constraints, &r_x_prime_tensor) {
+		for (constraint, constraint_weight) in iter::zip(self.constraints, weights.constraint) {
 			let mut constraint_eval = E::zero();
 			for (operand_id, operand) in constraint.as_ref().iter().enumerate() {
 				for svi in operand {
-					let variant = svi.shift_variant as usize;
-					let index = (variant * Word::BITS + svi.amount as usize) * ARITY + operand_id;
-					constraint_eval += operand_shift_scalars[index].clone()
-						* &r_y_tensor[svi.value_index.0 as usize];
+					// Two axes share one table: the inner slot's spelling with the operand
+					// innermost.
+					let inner_operand = (svi.inner().index() << LOG_MAX_ARITY) | operand_id;
+					constraint_eval += weights.inner_operand[inner_operand].clone()
+						* &weights.outer[svi.outer().index()]
+						* &weights.value[svi.value_index.segment() as usize]
+							[svi.value_index.index() as usize];
 				}
 			}
-			eval += constraint_eval * r_x_prime_entry;
+			eval += constraint_eval * constraint_weight;
 		}
 
 		eval
@@ -178,98 +192,69 @@ where
 	/// Produces the identical result, but defers the `GF(2^128)` reductions: the per-constraint
 	/// contributions accumulate into a single *unreduced* wide element, reduced exactly once at the
 	/// end (reduction is `F`-linear, so this equals reducing each per-constraint product and
-	/// summing). The generic [`call`](FieldFn::call) can't do this because `E: FieldOps` does not
+	/// summing). The generic [`call`](Self::call) can't do this because `E: FieldOps` does not
 	/// imply `WideMul`.
-	fn call_native(&self, input: &[F]) -> F {
-		let (r_x_prime, lambda, shift_scalars, r_y_tensor) = self.split_input(input);
-
-		let r_x_prime_tensor = eq_ind_partial_eval_scalars(r_x_prime);
-		let operand_shift_scalars = operand_shift_scalar_table(shift_scalars, *lambda, ARITY);
-
+	pub fn call_native<F: BinaryField>(&self, weights: WiringWeights<'_, F>) -> F
+	where
+		C: Sync,
+	{
 		// One unreduced wide product per constraint. The constraints partition cleanly across
 		// rayon: each produces a single wide element and they are summed, so there is no large
-		// per-task accumulator. The single final reduction is `F`-linear. The tensor covers the
-		// padded constraint count, so the zip stops at the last real constraint; the padding rows
-		// have no operand terms and contribute nothing.
+		// per-task accumulator. The single final reduction is `F`-linear. The constraint table
+		// covers the padded constraint count, so the zip stops at the last real constraint; the
+		// padding rows have no operand terms and contribute nothing.
+		//
+		// A constraint names only a handful of terms.
+		// So a minimum task size keeps each task above rayon's own handoff cost.
 		let eval = self
 			.constraints
 			.par_iter()
-			.zip(r_x_prime_tensor.par_iter())
-			.map(|(constraint, &r_x_prime_entry)| {
+			.zip(weights.constraint.par_iter())
+			.with_min_task(WorkPerItem::FieldMuls)
+			.map(|(constraint, &constraint_weight)| {
 				let mut constraint_eval = F::ZERO;
 				for (operand_id, operand) in constraint.as_ref().iter().enumerate() {
 					for svi in operand {
-						let variant = svi.shift_variant as usize;
-						let index =
-							(variant * Word::BITS + svi.amount as usize) * ARITY + operand_id;
-						constraint_eval +=
-							operand_shift_scalars[index] * r_y_tensor[svi.value_index.0 as usize];
+						let inner_operand = (svi.inner().index() << LOG_MAX_ARITY) | operand_id;
+						constraint_eval += weights.inner_operand[inner_operand]
+							* weights.outer[svi.outer().index()]
+							* weights.value[svi.value_index.segment() as usize]
+								[svi.value_index.index() as usize];
 					}
 				}
-				F::wide_mul(constraint_eval, r_x_prime_entry)
+				F::wide_mul(constraint_eval, constraint_weight)
 			})
 			.sum::<<F as WideMul>::Output>();
 		F::reduce(eval)
 	}
 }
 
-/// Builds the flat [`FieldFn`] input consumed by [`OperationEvalFn`].
-///
-/// Concatenates `r_x_prime ++ [lambda] ++ shift_scalars ++ r_y_tensor`.
-/// `OperationEvalFn::split_input` is the inverse; it recovers the `r_x'` length from the constraint
-/// count, so only `lambda` and the fixed-length shift scalars need a known position.
-pub fn encode_operation_input<E: Clone>(
-	r_x_prime: &[E],
-	lambda: E,
-	shift_scalars: &[E; SHIFT_VARIANT_COUNT * Word::BITS],
-	r_y_tensor: &[E],
-) -> Vec<E> {
-	let mut input =
-		Vec::with_capacity(r_x_prime.len() + 1 + shift_scalars.len() + r_y_tensor.len());
-	input.extend_from_slice(r_x_prime);
-	input.push(lambda);
-	input.extend_from_slice(shift_scalars);
-	input.extend_from_slice(r_y_tensor);
-	input
-}
-
-/// Folds the operand batching coefficients (λ powers) into the shared shift scalars, producing a
-/// table indexed by `(variant, amount, operand_id)` whose entry is
-/// `shift_scalars[variant * Word::BITS + amount] · λ^{operand_id + 1}` — the scalar that
-/// multiplies each shifted-value term.
-fn operand_shift_scalar_table<E: FieldOps>(
-	shift_scalars: &[E; SHIFT_VARIANT_COUNT * Word::BITS],
-	lambda: E,
-	arity: usize,
-) -> Vec<E> {
-	let lambda_powers = powers(lambda).skip(1).take(arity).collect::<Vec<_>>();
-	let mut table = Vec::with_capacity(shift_scalars.len() * arity);
-	for shift_scalar in shift_scalars {
-		for lambda_power in &lambda_powers {
-			table.push(shift_scalar.clone() * lambda_power);
-		}
-	}
-	table
-}
-
 #[cfg(test)]
 mod tests {
 	use binius_core::{
 		ShiftVariant,
-		constraint_system::{AndConstraint, ShiftedValueIndex, ValueIndex},
+		constraint_system::{AndConstraint, Shift, ShiftedValueIndex, ValueIndex},
+		word::Word,
 	};
-	use binius_field::{BinaryField128bGhash, Field, Random};
-	use binius_math::{
-		BinarySubspace,
-		test_utils::{index_to_hypercube_point, random_scalars},
-		univariate::lagrange_evals_scalars,
-	};
+	use binius_field::{Field, Ghash128b, Random};
+	use binius_math::{multilinear::eq::eq_ind_partial_eval_scalars, test_utils::random_scalars};
+	use binius_utils::checked_arithmetics::log2_ceil_usize;
 	use rand::prelude::*;
 
-	use super::*;
+	use super::{
+		super::{SHIFT_COUNT, SHIFT_VARIANT_COUNT},
+		*,
+	};
 
 	/// Builds `n_constraints` random arity-3 constraints (like `AndConstraint`), constraint-major:
 	/// one array of operands per constraint.
+	///
+	/// Every term names a private word, so the constant and inout runs of the word-index tensor
+	/// stay empty. Terms are drawn across all three classes — unshifted, singly shifted and doubly
+	/// shifted — so both slots' tables are read at more than one index.
+	///
+	/// The evaluation is a sum over whatever terms it is handed, so the sequences here need not be
+	/// canonical or non-collapsible the way a real constraint system's do.
 	fn random_and_constraints(
 		rng: &mut StdRng,
 		n_constraints: usize,
@@ -285,14 +270,25 @@ mod tests {
 			ShiftVariant::Sra32,
 			ShiftVariant::Rotr32,
 		];
+		let random_shift = |rng: &mut StdRng| Shift {
+			variant: shift_variants[rng.random_range(0..SHIFT_VARIANT_COUNT)],
+			amount: rng.random_range(0..Word::BITS) as u8,
+		};
 		(0..n_constraints)
 			.map(|_| {
 				AndConstraint(std::array::from_fn(|_| {
 					(0..rng.random_range(0..=3))
-						.map(|_| ShiftedValueIndex {
-							value_index: ValueIndex(rng.random_range(0..n_words) as u32),
-							shift_variant: shift_variants[rng.random_range(0..SHIFT_VARIANT_COUNT)],
-							amount: rng.random_range(0..Word::BITS) as u8,
+						.map(|_| {
+							let value_index =
+								ValueIndex::private(rng.random_range(0..n_words) as u32);
+							let inner = random_shift(rng);
+							// A third of the terms carry a second shift, so the outer table is read
+							// away from the identity as well as at it.
+							if rng.random_range(0..3) == 0 {
+								ShiftedValueIndex::new(value_index, [inner, random_shift(rng)])
+							} else {
+								ShiftedValueIndex::single(value_index, inner)
+							}
 						})
 						.collect()
 				}))
@@ -300,12 +296,242 @@ mod tests {
 			.collect()
 	}
 
+	/// The width of the inner table, which spans the operand axis as well as the shift axis.
+	const OPERAND_SHIFT_COUNT: usize = SHIFT_COUNT << LOG_MAX_ARITY;
+
+	/// The weight tables a run's own reduction reads, one per axis of the wiring tensor.
+	fn run_weights<'a, F: BinaryField>(
+		r_x_prime_tensor: &'a [F],
+		inner_operand: &'a [F],
+		outer: &'a [F; SHIFT_COUNT],
+		value: [&'a [F]; 3],
+	) -> WiringWeights<'a, F> {
+		WiringWeights {
+			constraint: r_x_prime_tensor,
+			inner_operand,
+			outer,
+			value,
+		}
+	}
+
+	#[test]
+	fn evaluate_monster_scales_by_the_outer_slot_weight() {
+		// Invariant: the outer slot's weight reaches every term, and reaches it as a factor.
+		//
+		// The evaluation is linear in the outer table, and each term reads exactly one of its
+		// entries, so scaling the whole table scales the evaluation by the same factor. That holds
+		// however the fixture's terms are spread across the table, which is what lets the fixture
+		// carry doubly shifted terms rather than reading index 0 alone.
+		type F = Ghash128b;
+		let mut rng = StdRng::seed_from_u64(7);
+
+		let n_words = 40usize;
+		let constraints = random_and_constraints(&mut rng, 32, n_words);
+		let r_x_prime = random_scalars::<F>(&mut rng, 5);
+		let hidden_tensor = random_scalars::<F>(&mut rng, n_words);
+		let r_y_tensor = [&[][..], &[][..], &hidden_tensor[..]];
+
+		let r_x_prime_tensor = eq_ind_partial_eval_scalars(&r_x_prime);
+		let inner_operand = random_scalars::<F>(&mut rng, OPERAND_SHIFT_COUNT);
+
+		let eval_fn = OperationEvalFn::new(&constraints);
+		let eval_with_outer = |outer: &[F; SHIFT_COUNT]| {
+			eval_fn.call_native(run_weights(&r_x_prime_tensor, &inner_operand, outer, r_y_tensor))
+		};
+
+		let outer: [F; SHIFT_COUNT] = std::array::from_fn(|_| F::random(&mut rng));
+		let baseline = eval_with_outer(&outer);
+		// A non-degenerate fixture, or the scaling below proves nothing.
+		assert_ne!(baseline, F::ZERO);
+
+		// Scaling every entry scales the evaluation by the same factor.
+		let scale = F::random(&mut rng);
+		assert_eq!(eval_with_outer(&outer.map(|weight| weight * scale)), baseline * scale);
+
+		// Zeroing the table kills the evaluation, so no term slipped past the outer factor.
+		assert_eq!(eval_with_outer(&[F::ZERO; SHIFT_COUNT]), F::ZERO);
+
+		// The identity-selecting table is what a term with no outer shift is weighed by, and it
+		// reproduces what a reduction over one shift slot would give the same terms.
+		let mut identity_selecting = [F::ZERO; SHIFT_COUNT];
+		identity_selecting[0] = F::ONE;
+		let singly_shifted_only = constraints
+			.iter()
+			.map(|constraint| {
+				AndConstraint(std::array::from_fn(|operand| {
+					constraint.0[operand]
+						.iter()
+						.filter(|svi| !svi.is_doubly_shifted())
+						.copied()
+						.collect()
+				}))
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			eval_with_outer(&identity_selecting),
+			OperationEvalFn::new(&singly_shifted_only).call_native(run_weights(
+				&r_x_prime_tensor,
+				&inner_operand,
+				&identity_selecting,
+				r_y_tensor
+			))
+		);
+	}
+
+	#[test]
+	fn contracting_the_tensor_matches_the_batched_evaluation() {
+		// Invariant: the flat walk and the constraint-grouped evaluation are one sum, reassociated.
+		//
+		// The grouped path multiplies a constraint's weight in once for the whole constraint.
+		// The flat path multiplies it in per term.
+		// Reassociating is exact, so a disagreement means the two read different nonzeros.
+		//
+		// This pins the enumeration's index conventions against the path already in use.
+		type F = Ghash128b;
+		let mut rng = StdRng::seed_from_u64(11);
+
+		let n_words = 40usize;
+		// A power-of-two count, and one whose weight tensor runs past the last constraint.
+		for n_constraints in [64usize, 37] {
+			let constraints = random_and_constraints(&mut rng, n_constraints, n_words);
+
+			let r_x_prime = random_scalars::<F>(&mut rng, log2_ceil_usize(n_constraints));
+			let outer: [F; SHIFT_COUNT] = std::array::from_fn(|_| F::random(&mut rng));
+			let hidden = random_scalars::<F>(&mut rng, n_words);
+			let value = [&[][..], &[][..], &hidden[..]];
+
+			let eval_fn = OperationEvalFn::new(&constraints);
+
+			// Both paths read the same weights, one table per axis.
+			let r_x_prime_tensor = eq_ind_partial_eval_scalars(&r_x_prime);
+			let inner_operand = random_scalars::<F>(&mut rng, OPERAND_SHIFT_COUNT);
+			let weights = run_weights(&r_x_prime_tensor, &inner_operand, &outer, value);
+
+			let batched = eval_fn.call::<F>(weights);
+			let contracted = eval_fn.contract(weights);
+
+			// A vacuous agreement on zero would prove nothing about which nonzeros were read.
+			assert_ne!(batched, F::ZERO, "the fixture must evaluate to something");
+			assert_eq!(contracted, batched, "n_constraints = {n_constraints}");
+		}
+	}
+
+	#[test]
+	fn the_extension_at_a_boolean_point_counts_the_nonzeros_there() {
+		// Invariant: indicators selecting one index per axis return the entry at that position.
+		//
+		// That is the defining property of a multilinear extension.
+		// It is also what the accumulated claim at the root of a tree is about.
+		//
+		// Entries live in characteristic two, so an entry is the nonzero count there, mod two.
+		//
+		//     indicators pick (c, a, inner, outer, v)  ->  contract == count(c,a,inner,outer,v) % 2
+		type F = Ghash128b;
+		let mut rng = StdRng::seed_from_u64(13);
+
+		let n_words = 12usize;
+		let n_constraints = 16usize;
+		let constraints = random_and_constraints(&mut rng, n_constraints, n_words);
+		let arity = constraints[0].as_ref().len();
+		let eval_fn = OperationEvalFn::new(&constraints);
+
+		// Every occupied position, plus one deliberately empty one to show the test can fail.
+		let occupied = eval_fn.entries().collect::<Vec<_>>();
+		assert!(!occupied.is_empty(), "the fixture must produce nonzeros");
+		let empty = WiringEntry {
+			constraint: n_constraints - 1,
+			operand: arity - 1,
+			inner_shift: SHIFT_COUNT - 1,
+			outer_shift: SHIFT_COUNT - 1,
+			value: ValueIndex::private(n_words as u32 - 1),
+		};
+
+		for target in occupied.iter().copied().take(8).chain([empty]) {
+			// One indicator per axis: one at the target's index, zero everywhere else.
+			let mut constraint = vec![F::ZERO; n_constraints];
+			constraint[target.constraint] = F::ONE;
+			let mut inner_operand = vec![F::ZERO; OPERAND_SHIFT_COUNT];
+			inner_operand[(target.inner_shift << LOG_MAX_ARITY) | target.operand] = F::ONE;
+			let mut outer = [F::ZERO; SHIFT_COUNT];
+			outer[target.outer_shift] = F::ONE;
+			let mut hidden = vec![F::ZERO; n_words];
+			hidden[target.value.index() as usize] = F::ONE;
+
+			let got = eval_fn.contract(run_weights(
+				&constraint,
+				&inner_operand,
+				&outer,
+				[&[][..], &[][..], &hidden[..]],
+			));
+
+			// Count the nonzeros sitting exactly at the target position.
+			let count = eval_fn.entries().filter(|e| *e == target).count();
+			let want = if count % 2 == 1 { F::ONE } else { F::ZERO };
+			assert_eq!(got, want, "at {target:?}, {count} nonzeros");
+		}
+	}
+
+	#[test]
+	fn a_repeated_term_cancels_and_the_slots_keep_their_order() {
+		// Invariant: entries are characteristic-two multiplicities.
+		// And the inner slot is the sequence's first, the outer its second.
+		//
+		// Fixture state: one constraint, whose first operand names one shifted value twice.
+		// Its second operand names a single term with two distinct slots.
+		//
+		//     operand 0:  [ (v0, [s_a, s_b]) , (v0, [s_a, s_b]) ]  -> two entries at one position
+		//     operand 1:  [ (v1, [s_a, s_b]) ]                     -> one entry
+		//
+		// The pair must contribute nothing, since a position's weight is added to itself.
+		type F = Ghash128b;
+
+		let s_a = Shift {
+			variant: ShiftVariant::Slr,
+			amount: 7,
+		};
+		let s_b = Shift {
+			variant: ShiftVariant::Rotr,
+			amount: 3,
+		};
+		let v0 = ValueIndex::private(0);
+		let v1 = ValueIndex::private(1);
+		let repeated = ShiftedValueIndex::new(v0, [s_a, s_b]);
+		let constraints = vec![AndConstraint([
+			vec![repeated, repeated],
+			vec![ShiftedValueIndex::new(v1, [s_a, s_b])],
+			vec![],
+		])];
+		let eval_fn = OperationEvalFn::new(&constraints);
+
+		// The enumeration reports the repeat as two entries: cancellation is the field's doing.
+		let entries = eval_fn.entries().collect::<Vec<_>>();
+		assert_eq!(entries.len(), 3);
+		// The first slot of the sequence is the inner one, the second the outer.
+		assert_eq!(entries[0].inner_shift, s_a.index());
+		assert_eq!(entries[0].outer_shift, s_b.index());
+		assert_eq!(entries[0].operand, 0);
+		assert_eq!(entries[2].operand, 1);
+		assert_eq!(entries[0], entries[1], "the repeat sits at one position");
+
+		// Weights of one everywhere: the sum is then the nonzero count mod two, which is one.
+		let ones_inner = vec![F::ONE; OPERAND_SHIFT_COUNT];
+		let ones_outer = [F::ONE; SHIFT_COUNT];
+		let ones_value = [F::ONE; 2];
+		let got = eval_fn.contract(run_weights(
+			&[F::ONE],
+			&ones_inner,
+			&ones_outer,
+			[&[][..], &[][..], &ones_value[..]],
+		));
+		assert_eq!(got, F::ONE, "two entries cancel and the third survives");
+	}
+
 	/// The native `WideMul` variant must produce exactly the same result as the generic
 	/// evaluation (deferred reduction is `F`-linear). Covers a power-of-two constraint count and a
 	/// non-power-of-two one, whose `r_x'` tensor runs past the last constraint.
 	#[test]
 	fn evaluate_monster_native_matches_generic() {
-		type F = BinaryField128bGhash;
+		type F = Ghash128b;
 		let mut rng = StdRng::seed_from_u64(3);
 
 		let n_words = 40usize;
@@ -313,15 +539,19 @@ mod tests {
 			let constraints = random_and_constraints(&mut rng, n_constraints, n_words);
 
 			let r_x_prime = random_scalars::<F>(&mut rng, log2_ceil_usize(n_constraints));
-			let lambda = F::random(&mut rng);
-			let shift_scalars: [F; SHIFT_VARIANT_COUNT * Word::BITS] =
-				std::array::from_fn(|_| F::random(&mut rng));
-			let r_y_tensor = random_scalars::<F>(&mut rng, n_words);
+			// Both slots draw random weights, so a path that dropped the outer factor, or read
+			// it from the inner table, would disagree with the other.
+			let outer: [F; SHIFT_COUNT] = std::array::from_fn(|_| F::random(&mut rng));
+			let hidden_tensor = random_scalars::<F>(&mut rng, n_words);
+			let r_y_tensor = [&[][..], &[][..], &hidden_tensor[..]];
+
+			let r_x_prime_tensor = eq_ind_partial_eval_scalars(&r_x_prime);
+			let inner_operand = random_scalars::<F>(&mut rng, OPERAND_SHIFT_COUNT);
+			let weights = run_weights(&r_x_prime_tensor, &inner_operand, &outer, r_y_tensor);
 
 			let eval_fn = OperationEvalFn::new(&constraints);
-			let input = encode_operation_input(&r_x_prime, lambda, &shift_scalars, &r_y_tensor);
-			let generic = eval_fn.call::<F>(&input);
-			let native = eval_fn.call_native(&input);
+			let generic = eval_fn.call::<F>(weights);
+			let native = eval_fn.call_native(weights);
 			assert_eq!(generic, native, "n_constraints = {n_constraints}");
 		}
 	}
@@ -330,11 +560,11 @@ mod tests {
 	/// has no operand terms, so it contributes nothing. This is what lets the constraint system
 	/// keep its true count while the reductions run over the padded one.
 	///
-	/// [`FieldFn::call`] and [`FieldFn::call_native`] walk the constraints over independent zips,
-	/// so both are checked.
+	/// [`OperationEvalFn::call`] and [`OperationEvalFn::call_native`] walk the constraints over
+	/// independent zips, so both are checked.
 	#[test]
 	fn evaluate_monster_ignores_zero_padding_constraints() {
-		type F = BinaryField128bGhash;
+		type F = Ghash128b;
 		let mut rng = StdRng::seed_from_u64(5);
 
 		let n_words = 40usize;
@@ -350,123 +580,21 @@ mod tests {
 			.collect::<Vec<_>>();
 
 		let r_x_prime = random_scalars::<F>(&mut rng, log2_ceil_usize(n_constraints));
-		let lambda = F::random(&mut rng);
-		let shift_scalars: [F; SHIFT_VARIANT_COUNT * Word::BITS] =
-			std::array::from_fn(|_| F::random(&mut rng));
-		let r_y_tensor = random_scalars::<F>(&mut rng, n_words);
+		let outer: [F; SHIFT_COUNT] = std::array::from_fn(|_| F::random(&mut rng));
+		let hidden_tensor = random_scalars::<F>(&mut rng, n_words);
+		let r_y_tensor = [&[][..], &[][..], &hidden_tensor[..]];
 
-		let input = encode_operation_input(&r_x_prime, lambda, &shift_scalars, &r_y_tensor);
+		let r_x_prime_tensor = eq_ind_partial_eval_scalars(&r_x_prime);
+		let inner_operand = random_scalars::<F>(&mut rng, OPERAND_SHIFT_COUNT);
+		let weights = run_weights(&r_x_prime_tensor, &inner_operand, &outer, r_y_tensor);
+
 		assert_eq!(
-			OperationEvalFn::new(&constraints).call::<F>(&input),
-			OperationEvalFn::new(&padded).call::<F>(&input)
+			OperationEvalFn::new(&constraints).call::<F>(weights),
+			OperationEvalFn::new(&padded).call::<F>(weights)
 		);
 		assert_eq!(
-			OperationEvalFn::new(&constraints).call_native(&input),
-			OperationEvalFn::new(&padded).call_native(&input)
+			OperationEvalFn::new(&constraints).call_native(weights),
+			OperationEvalFn::new(&padded).call_native(weights)
 		);
-	}
-
-	#[test]
-	fn test_evaluate_h_op_hypercube_vertices() {
-		// Property-based test: for random i, j, s in {0..63}, with challenge being
-		// the i-th element of the subspace, the outputs must match indicator relations
-		// over integers:
-		// - sll == 1 iff j + s == i
-		// - srl == 1 iff i + s == j
-		// - sra == 1 iff i + s == j || i + s >= 64 && j == 63
-		// - rotr == 1 iff (i + s) % 64 == j
-		let mut rng = StdRng::seed_from_u64(0);
-		let subspace = BinarySubspace::<BinaryField128bGhash>::with_dim(Word::LOG_BITS);
-
-		// Run a reasonable number of random trials
-		for _trial in 0..1024 {
-			let i = rng.random_range(0..64);
-			let j = rng.random_range(0..64);
-			let s = rng.random_range(0..64);
-
-			let challenge = subspace.get(i);
-			let l_tilde = lagrange_evals_scalars(&subspace, &challenge);
-
-			let r_j = index_to_hypercube_point::<BinaryField128bGhash>(Word::LOG_BITS, j);
-			let r_s = index_to_hypercube_point::<BinaryField128bGhash>(Word::LOG_BITS, s);
-
-			let [sll, srl, sra, rotr, sll32, srl32, sra32, rotr32] =
-				evaluate_h_op(&l_tilde, &r_j, &r_s);
-
-			let expected_sll = j + s == i;
-			let expected_srl = i + s == j;
-			let expected_sra = (i + s).min(63) == j;
-			let expected_rotr = (i + s) % 64 == j;
-
-			let i_hi = i / 32;
-			let i_lo = i % 32;
-			let j_hi = j / 32;
-			let j_lo = j % 32;
-			let s_lo = s % 32;
-
-			let expected_sll32 = i_hi == j_hi && j_lo + s_lo == i_lo;
-			let expected_srl32 = i_hi == j_hi && i_lo + s_lo == j_lo;
-			let expected_sra32 = i_hi == j_hi && (i_lo + s_lo).min(31) == j_lo;
-			let expected_rotr32 = i_hi == j_hi && (i_lo + s_lo) % 32 == j_lo;
-
-			let to_field = |b: bool| {
-				if b {
-					BinaryField128bGhash::ONE
-				} else {
-					BinaryField128bGhash::ZERO
-				}
-			};
-
-			assert_eq!(sll, to_field(expected_sll), "sll failed for i={i}, j={j}, s={s}");
-			assert_eq!(srl, to_field(expected_srl), "srl failed for i={i}, j={j}, s={s}");
-			assert_eq!(sra, to_field(expected_sra), "sra failed for i={i}, j={j}, s={s}");
-			assert_eq!(rotr, to_field(expected_rotr), "rotr failed for i={i}, j={j}, s={s}");
-			assert_eq!(sll32, to_field(expected_sll32), "sll32 failed for i={i}, j={j}, s={s}");
-			assert_eq!(srl32, to_field(expected_srl32), "srl32 failed for i={i}, j={j}, s={s}");
-			assert_eq!(sra32, to_field(expected_sra32), "sra32 failed for i={i}, j={j}, s={s}");
-			assert_eq!(rotr32, to_field(expected_rotr32), "rotr32 failed for i={i}, j={j}, s={s}");
-		}
-	}
-
-	#[test]
-	fn test_evaluate_h_op_multilinearity() {
-		// Test that the function is multilinear in each variable
-		let mut rng = StdRng::seed_from_u64(0);
-
-		// Generate random evaluation points
-		let challenge = BinaryField128bGhash::random(&mut rng);
-		let subspace = BinarySubspace::<BinaryField128bGhash>::with_dim(Word::LOG_BITS);
-		let l_tilde = lagrange_evals_scalars(&subspace, &challenge);
-		let r_j = random_scalars::<BinaryField128bGhash>(&mut rng, Word::LOG_BITS);
-		let r_s = random_scalars::<BinaryField128bGhash>(&mut rng, Word::LOG_BITS);
-
-		// Check linearity in each variable
-		for i in 0..Word::LOG_BITS {
-			// Check r_j[i]
-			let mut r_j_at_0 = r_j.clone();
-			r_j_at_0[i] = BinaryField128bGhash::ZERO;
-			let mut r_j_at_1 = r_j.clone();
-			r_j_at_1[i] = BinaryField128bGhash::ONE;
-			let [result_0, result_1, result_y] = [&r_j_at_0, &r_j_at_1, &r_j]
-				.map(|r_j_variant| evaluate_h_op(&l_tilde, r_j_variant, &r_s));
-			for variant in 0..SHIFT_VARIANT_COUNT {
-				let expected = result_0[variant] * (BinaryField128bGhash::ONE - r_j[i])
-					+ result_1[variant] * r_j[i];
-				assert_eq!(result_y[variant], expected, "Not linear in r_j[{i}]");
-			}
-
-			// Check r_s[i]
-			let mut r_s_at_0 = r_s.clone();
-			r_s_at_0[i] = BinaryField128bGhash::ZERO;
-			let mut r_s_at_1 = r_s.clone();
-			r_s_at_1[i] = BinaryField128bGhash::ONE;
-			let [result_0, result_1, result_y] = [&r_s_at_0, &r_s_at_1, &r_s]
-				.map(|r_s_variant| evaluate_h_op(&l_tilde, &r_j, r_s_variant));
-			for variant in 0..SHIFT_VARIANT_COUNT {
-				let expected = result_0[variant] * (BinaryField128bGhash::ONE - r_s[i])
-					+ result_1[variant] * r_s[i];
-				assert_eq!(result_y[variant], expected, "Not linear in r_s[{i}]");
-			}
-		}
 	}
 }

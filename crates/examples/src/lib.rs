@@ -1,6 +1,12 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
+//! Example circuits and the harness that runs them.
+//!
+//! Each module under [`circuits`] builds one circuit and knows how to fill its witness; [`cli`]
+//! turns that into a runnable binary and [`snapshot`] records the circuit's statistics so a change
+//! in size shows up as a diff.
+
 pub mod circuits;
 pub mod cli;
 pub mod snapshot;
@@ -8,7 +14,8 @@ pub mod snapshot;
 use anyhow::Result;
 use binius_core::constraint_system::{ConstraintSystem, ValueVec};
 use binius_frontend::{CircuitBuilder, WitnessFiller};
-use binius_hash::{binary_merkle_tree::HashSuite, sha256::Sha256HashSuite};
+use binius_hash::sha256::Sha256HashSuite;
+use binius_hash_prover::ParallelHashSuite;
 use binius_prover::{KeyCollection, OptimalPackedB128, Prover, zk_config::ZKProver};
 use binius_utils::{DeserializeBytes, SerializeBytes};
 use binius_verifier::{
@@ -36,9 +43,12 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// Calling this when a global subscriber is already installed is a no-op, so it is safe to
 /// invoke from every example entry point.
 pub fn init_tracing() {
+	// `ureq` logs every HTTP request at DEBUG, which would bury the trace tree of any circuit
+	// that fetches its instance data over the network.
 	let env_filter = EnvFilter::builder()
 		.with_default_directive(LevelFilter::DEBUG.into())
-		.from_env_lossy();
+		.from_env_lossy()
+		.add_directive("ureq=off".parse().expect("literal directive"));
 
 	let _ = tracing_subscriber::registry()
 		.with(env_filter)
@@ -46,14 +56,14 @@ pub fn init_tracing() {
 		.try_init();
 }
 
-/// Selects which Merkle [`HashSuite`] the prover and verifier use.
+/// Selects which Merkle hash suite the prover and verifier use.
 ///
 /// A hash suite fixes both halves of the Merkle tree at once:
 /// - the leaf hash applied to the committed values, and
 /// - the two-to-one compression that folds a pair of child nodes into their parent.
 ///
 /// It does not select a compression function alone, which is why the flag is `--hash-suite`.
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum HashSuiteType {
 	/// SHA-256 leaves with a SHA-256 two-to-one compression.
 	Sha256,
@@ -81,7 +91,7 @@ pub fn setup<H>(
 	key_collection: Option<KeyCollection>,
 ) -> Result<(Verifier<H>, Prover<OptimalPackedB128, H>)>
 where
-	H: HashSuite + Clone,
+	H: ParallelHashSuite + Clone,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let _setup_guard = tracing::info_span!("Setup", log_inv_rate).entered();
@@ -101,7 +111,7 @@ pub fn setup_zk<H>(
 	log_inv_rate: usize,
 ) -> Result<(ZKVerifier<H>, ZKProver<OptimalPackedB128, H>)>
 where
-	H: HashSuite + Clone,
+	H: ParallelHashSuite + Clone,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let _setup_guard = tracing::info_span!("ZK setup", log_inv_rate).entered();
@@ -114,7 +124,7 @@ where
 /// hash suite. Cheaper than `setup` when proving is not needed.
 pub fn setup_verifier<H>(cs: ConstraintSystem, log_inv_rate: usize) -> Result<Verifier<H>>
 where
-	H: HashSuite + Clone,
+	H: ParallelHashSuite + Clone,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let _setup_guard = tracing::info_span!("Setup", log_inv_rate).entered();
@@ -125,7 +135,7 @@ where
 /// Merkle hash suite. Cheaper than `setup_zk` when proving is not needed.
 pub fn setup_zk_verifier<H>(cs: ConstraintSystem, log_inv_rate: usize) -> Result<ZKVerifier<H>>
 where
-	H: HashSuite + Clone,
+	H: ParallelHashSuite + Clone,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let _setup_guard = tracing::info_span!("ZK setup", log_inv_rate).entered();
@@ -135,7 +145,7 @@ where
 /// Run the prover and return the raw proof transcript bytes.
 pub fn create_proof<H>(prover: &Prover<OptimalPackedB128, H>, witness: &ValueVec) -> Result<Vec<u8>>
 where
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let challenger = StdChallenger::default();
@@ -151,7 +161,7 @@ pub fn create_proof_zk<H>(
 	message: Option<&[u8]>,
 ) -> Result<Vec<u8>>
 where
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let challenger = StdChallenger::default();
@@ -180,12 +190,12 @@ pub fn check_proof<H>(
 	proof_bytes: Vec<u8>,
 ) -> Result<()>
 where
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let challenger = StdChallenger::default();
 	let mut verifier_transcript = VerifierTranscript::new(challenger, proof_bytes);
-	verifier.verify(witness.public(), &mut verifier_transcript)?;
+	verifier.verify(witness.inout(), &mut verifier_transcript)?;
 	verifier_transcript.finalize()?;
 	Ok(())
 }
@@ -198,17 +208,15 @@ pub fn check_proof_zk<H>(
 	message: Option<&[u8]>,
 ) -> Result<()>
 where
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let challenger = StdChallenger::default();
 	let _scope = tracing::info_span!("Verify").entered();
 	let mut verifier_transcript = VerifierTranscript::new(challenger, proof_bytes);
 	match message {
-		Some(message) => {
-			verifier.verify_sig(witness.public(), message, &mut verifier_transcript)?
-		}
-		None => verifier.verify(witness.public(), &mut verifier_transcript)?,
+		Some(message) => verifier.verify_sig(witness.inout(), message, &mut verifier_transcript)?,
+		None => verifier.verify(witness.inout(), &mut verifier_transcript)?,
 	}
 	verifier_transcript.finalize()?;
 	Ok(())
@@ -220,7 +228,7 @@ pub fn prove_verify<H>(
 	witness: &ValueVec,
 ) -> Result<()>
 where
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let proof_bytes = create_proof(prover, witness)?;
@@ -236,7 +244,7 @@ pub fn prove_verify_zk<H>(
 	message: Option<&[u8]>,
 ) -> Result<()>
 where
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	let proof_bytes = create_proof_zk(prover, witness, message)?;
@@ -320,7 +328,11 @@ pub trait ExampleCircuit: Sized {
 	/// - Process the instance data (e.g., parse inputs, compute hashes)
 	/// - Fill all witness values using the provided filler
 	/// - Validate that instance data is compatible with circuit parameters
-	fn populate_witness(&self, instance: Self::Instance, filler: &mut WitnessFiller) -> Result<()>;
+	fn populate_witness(
+		&self,
+		instance: Self::Instance,
+		filler: &mut WitnessFiller<'_>,
+	) -> Result<()>;
 
 	/// Generate a concise parameter summary for perfetto trace filenames.
 	///

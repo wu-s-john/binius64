@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 binius-compute = { path = "../compute" }
+binius-core = { path = "../core" }
 binius-field = { path = "../field" }
 binius-ip = { path = "../ip" }
 binius-math = { path = "../math" }
@@ -28,8 +29,15 @@ sha2.workspace = true
 
 [features]
 default = []
-rayon = ["binius-utils/rayon"]
 
 [[bench]]
 name = "bivariate_product"
+harness = false
+
+[[bench]]
+name = "quadratic_mlecheck"
+harness = false
+
+[[bench]]
+name = "logup_star_witness"
 harness = false

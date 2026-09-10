@@ -11,8 +11,8 @@ use bytemuck::TransparentWrapper;
 
 use super::m128::M128;
 use crate::{
-	aes_field::AESTowerField8b, arch::portable::packed::PackedPrimitiveType,
-	arithmetic_traits::WideMul,
+	arithmetic_traits::WideMul, fields::rijndael::Rijndael8b,
+	packed_fields::primitive::PackedPrimitiveType,
 };
 
 #[inline]
@@ -63,7 +63,7 @@ pub fn packed_aes_16x8b_square(x: M128) -> M128 {
 	}
 }
 
-/// The unreduced product of two [`PackedAESBinaryField16x8b`](PackedPrimitiveType) values: the 16
+/// The unreduced product of two [`PackedRijndael16x8b`](PackedPrimitiveType) values: the 16
 /// per-byte carryless products, split into their low bytes (`lo`, which need no reduction) and high
 /// bytes (`hi`, the overflow above `x^7` still to be folded down). Both the carryless multiply and
 /// the GF(2^8) reduction are linear, so products accumulate by XOR and reduce once at the end via
@@ -225,7 +225,7 @@ pub fn packed_aes_16x8b_reduce(wide: WideAes16x8bProduct) -> M128 {
 #[derive(TransparentWrapper)]
 pub struct VmullWideMul<T>(T);
 
-impl WideMul for VmullWideMul<PackedPrimitiveType<M128, AESTowerField8b>> {
+impl WideMul for VmullWideMul<PackedPrimitiveType<M128, Rijndael8b>> {
 	type Output = WideAes16x8bProduct;
 
 	#[inline]

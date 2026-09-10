@@ -1,56 +1,61 @@
 // Copyright 2024-2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use std::sync::Mutex;
-
+use binius_compute::{Allocator, GlobalAllocator};
 use binius_field::Field;
-use binius_hash::binary_merkle_tree::{self, BinaryMerkleTree, HashSuite};
-use binius_iop::merkle_tree::{BinaryMerkleTreeScheme, Commitment, MerkleTreeScheme};
+use binius_hash_prover::{BinaryMerkleTree, ParallelHashSuite};
+use binius_iop::merkle_tree::{BinaryMerkleTreeScheme, Commitment};
 use binius_transcript::{BufMut, TranscriptWriter};
 use binius_utils::rayon::iter::IndexedParallelIterator;
 use digest::Output;
 use getset::Getters;
-use rand::{CryptoRng, SeedableRng, rngs::StdRng};
 
-use super::MerkleTreeProver;
+use super::{MerkleTreeProver, ProverDigest};
 
+/// Builds Merkle trees over an allocator, which every tree it commits draws its nodes from.
+///
+/// The allocator is state rather than a per-call argument because [`MerkleTreeProver::Committed`]
+/// names the tree, and an associated type cannot depend on a method's generic parameter.
 #[derive(Getters)]
-pub struct BinaryMerkleTreeProver<T, H: HashSuite> {
+pub struct BinaryMerkleTreeProver<T, H: ParallelHashSuite, A: Allocator = GlobalAllocator> {
 	#[getset(get = "pub")]
 	scheme: BinaryMerkleTreeScheme<T, H>,
-	salt_rng: Mutex<StdRng>,
+	alloc: A,
 }
 
-impl<T, H: HashSuite> BinaryMerkleTreeProver<T, H> {
+impl<T, H: ParallelHashSuite> BinaryMerkleTreeProver<T, H, GlobalAllocator> {
+	/// Commits trees on the global heap.
 	pub fn new() -> Self {
+		Self::with_allocator(GlobalAllocator)
+	}
+}
+
+impl<T, H: ParallelHashSuite, A: Allocator> BinaryMerkleTreeProver<T, H, A> {
+	/// Commits trees whose nodes are drawn from `alloc`.
+	///
+	/// Pass `&BufferPool` to recycle node buffers across the proofs one prover runs.
+	pub fn with_allocator(alloc: A) -> Self {
 		Self {
 			scheme: BinaryMerkleTreeScheme::new(),
-			// We can construct a dummy Rng with a deterministic seed because it will be unused.
-			salt_rng: Mutex::new(StdRng::seed_from_u64(0)),
-		}
-	}
-
-	pub fn hiding(mut rng: impl CryptoRng, salt_len: usize) -> Self {
-		Self {
-			scheme: BinaryMerkleTreeScheme::hiding(salt_len),
-			salt_rng: Mutex::new(StdRng::from_rng(&mut rng)),
+			alloc,
 		}
 	}
 }
 
-impl<T, H: HashSuite> Default for BinaryMerkleTreeProver<T, H> {
+impl<T, H: ParallelHashSuite> Default for BinaryMerkleTreeProver<T, H, GlobalAllocator> {
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-impl<F, H> MerkleTreeProver<F> for BinaryMerkleTreeProver<F, H>
+impl<F, H, A> MerkleTreeProver<F> for BinaryMerkleTreeProver<F, H, A>
 where
 	F: Field,
-	H: HashSuite,
+	H: ParallelHashSuite,
+	A: Allocator,
 {
 	type Scheme = BinaryMerkleTreeScheme<F, H>;
-	type Committed = BinaryMerkleTree<Output<H::LeafHash>, F>;
+	type Committed = BinaryMerkleTree<Output<H::LeafHash>, A>;
 
 	fn scheme(&self) -> &Self::Scheme {
 		&self.scheme
@@ -67,48 +72,23 @@ where
 		committed: &Self::Committed,
 		layer_depth: usize,
 		index: usize,
-		proof: &mut TranscriptWriter<B>,
+		proof: &mut TranscriptWriter<'_, B>,
 	) {
-		let salt = committed.get_salt(index);
-		proof.write_slice(salt);
-
 		let branch = committed
 			.branch(index, layer_depth)
 			.expect("precondition: index and layer_depth must be within the committed tree");
 		proof.write_slice(&branch);
 	}
 
-	fn prove_vector<B: BufMut>(
-		&self,
-		committed: &Self::Committed,
-		proof: &mut TranscriptWriter<B>,
-	) {
-		for leaf_index in 0..1 << committed.log_len {
-			proof.write_slice(committed.get_salt(leaf_index));
-		}
-	}
-
-	#[allow(clippy::type_complexity)]
 	fn commit_iterated<ParIter>(
 		&self,
 		leaves: ParIter,
 		n_items_per_input: usize,
-	) -> (Commitment<<Self::Scheme as MerkleTreeScheme<F>>::Digest>, Self::Committed)
+	) -> (Commitment<ProverDigest<F, Self>>, Self::Committed)
 	where
 		ParIter: IndexedParallelIterator<Item: IntoIterator<Item = F, IntoIter: Send>>,
 	{
-		let salt_rng = {
-			// If mutex is poisoned, panic.
-			let mut root_rng = self.salt_rng.lock().unwrap();
-			StdRng::from_rng(&mut *root_rng)
-		};
-		let tree = binary_merkle_tree::build_from_iterator::<F, H, _, _>(
-			leaves,
-			n_items_per_input,
-			self.scheme.salt_len(),
-			salt_rng,
-		)
-		.expect("precondition: the number of leaves must be a power of two");
+		let tree = BinaryMerkleTree::from_leaves::<F, H, _>(leaves, n_items_per_input, &self.alloc);
 
 		let commitment = Commitment {
 			root: tree.root(),

@@ -25,7 +25,7 @@ use binius_compute::Allocator;
 use binius_field::{Field, PackedField};
 use binius_math::{
 	FieldBuffer, FieldSlice, FieldVec,
-	line::extrapolate_line_packed,
+	line::extrapolate_line,
 	multilinear::fold::{fold_highest_var, fold_highest_var_inplace},
 };
 use binius_utils::rayon;
@@ -185,14 +185,6 @@ impl<'a, A: Allocator, F: Field, P: PackedField<Scalar = F>> MleStore<'a, A, P> 
 		EqId(index)
 	}
 
-	/// Returns the equality-indicator expansion of a registered tracker.
-	///
-	/// The expansion has `n_vars() - 1` variables: the tracker keeps the indicator folded on the
-	/// variable currently being bound.
-	pub fn eq_expansion(&self, id: EqId) -> &FieldBuffer<P> {
-		self.eq_trackers[id.0].expansion()
-	}
-
 	/// Returns the equality-indicator expansion of every registered tracker, in [`EqId`] order.
 	///
 	/// The driving prover slices each expansion per chunk once per round; the returned order
@@ -256,6 +248,30 @@ impl<'a, A: Allocator, F: Field, P: PackedField<Scalar = F>> MleStore<'a, A, P> 
 		self.n_vars -= 1;
 	}
 
+	/// Returns the borrowed view of one logical column, addressed by its [`ColId`].
+	///
+	/// The slice spans the column's `2^n_vars()` live scalars, so it tracks the store's folding.
+	pub fn column(&self, id: ColId) -> FieldSlice<'_, P> {
+		// A split-half entry carries two logical columns, so walk the physical entries counting
+		// down the logical index rather than indexing `columns` directly.
+		let mut index = id.index();
+		for column in &self.columns {
+			match column {
+				Column::Borrowed(slice) if index == 0 => return slice.as_view(),
+				Column::Owned(buffer) if index == 0 => return buffer.as_view(),
+				Column::SplitHalf(buffer) if index < 2 => {
+					// The buffer holds the two columns as its low and high halves; each column is
+					// the front `2^n_vars` scalars of one half, so read it as that half's chunk 0.
+					let half_start = index << (buffer.log_len() - 1 - self.n_vars);
+					return buffer.chunk(self.n_vars, half_start);
+				}
+				Column::SplitHalf(_) => index -= 2,
+				_ => index -= 1,
+			}
+		}
+		panic!("column id {} is out of range for a store of {} columns", id.index(), self.n_cols);
+	}
+
 	/// Expands the store into one borrowed slice per logical column, in [`ColId`] order.
 	///
 	/// A split-half entry expands into the front `2^n_vars` scalars of its low and high
@@ -265,8 +281,8 @@ impl<'a, A: Allocator, F: Field, P: PackedField<Scalar = F>> MleStore<'a, A, P> 
 		let mut slices = Vec::with_capacity(self.n_cols);
 		for column in &self.columns {
 			match column {
-				Column::Borrowed(slice) => slices.push(slice.to_ref()),
-				Column::Owned(buffer) => slices.push(buffer.to_ref()),
+				Column::Borrowed(slice) => slices.push(slice.as_view()),
+				Column::Owned(buffer) => slices.push(buffer.as_view()),
 				Column::SplitHalf(buffer) => {
 					// The buffer holds the two columns as its low and high halves; each column is
 					// the front `2^n_vars` scalars of one half, so read it as that half's
@@ -325,11 +341,11 @@ impl<'a, A: Allocator, F: Field, P: PackedField<Scalar = F>> MleStore<'a, A, P> 
 		let cols = col_slices
 			.iter()
 			.map(|col| {
-				let (lo, hi) = col.split_half_ref();
+				let (lo, hi) = col.split_half();
 				ColumnChunk { lo, hi }
 			})
 			.collect();
-		let eqs = self.eq_expansions().iter().map(|eq| eq.to_ref()).collect();
+		let eqs = self.eq_expansions().iter().map(|eq| eq.as_view()).collect();
 		let chunk = EvaluationChunk {
 			n_vars: self.n_vars - 1,
 			cols,
@@ -467,7 +483,7 @@ impl<'a, A: Allocator, F: Field, P: PackedField<Scalar = F>> MleStore<'a, A, P> 
 					*column = Column::Owned(
 						dst.take()
 							.expect("borrowed columns get a destination buffer"),
-					)
+					);
 				}
 				Column::Owned(buffer) => buffer.truncate(n_vars),
 				Column::SplitHalf(_) => {}
@@ -538,45 +554,39 @@ impl<'a, P: PackedField> PreFoldColumnChunk<'a, P> {
 		}
 	}
 
-	/// Folds the segments and returns the folded output slice.
-	fn fold(self, challenge_broadcast: &P) -> &'a [P] {
+	/// Combines the two segments with `combine` and returns the output slice.
+	///
+	/// The in-place form reads its low half out of the destination it overwrites.
+	/// The out-of-place form reads both halves from the borrowed source.
+	fn fold_with(self, combine: impl Fn(P, P) -> P) -> &'a [P] {
 		match self {
 			Self::InPlace { seg_0, seg_1 } => {
 				for (out, &hi) in iter::zip(&mut *seg_0, seg_1) {
-					*out = extrapolate_line_packed(*out, hi, *challenge_broadcast);
+					*out = combine(*out, hi);
 				}
 				seg_0
 			}
 			Self::OutOfPlace { dst, seg_0, seg_1 } => {
 				for (out, &lo, &hi) in izip!(&mut *dst, seg_0, seg_1) {
-					*out = extrapolate_line_packed(lo, hi, *challenge_broadcast);
+					*out = combine(lo, hi);
 				}
 				dst
 			}
 		}
 	}
 
-	/// Contracts the eq expansion by summing its halves, and returns the folded output slice.
+	/// Folds a column half, interpolating its two segments on the round's variable.
+	fn fold(self, challenge_broadcast: &P) -> &'a [P] {
+		self.fold_with(|lo, hi| extrapolate_line(lo, hi, *challenge_broadcast))
+	}
+
+	/// Contracts an eq expansion by summing its two segments.
 	///
-	/// Eq-indicator folding sums the two halves (the [Gruen24] technique's part (3)), rather than
-	/// interpolating them as [`Self::fold`] does for columns.
+	/// Summing marginalises the bound variable out, which is part (3) of the [Gruen24] split.
 	///
 	/// [Gruen24]: <https://eprint.iacr.org/2024/108>
 	fn fold_eq(self) -> &'a [P] {
-		match self {
-			Self::InPlace { seg_0, seg_1 } => {
-				for (out, &hi) in iter::zip(&mut *seg_0, seg_1) {
-					*out += hi;
-				}
-				seg_0
-			}
-			Self::OutOfPlace { dst, seg_0, seg_1 } => {
-				for (out, &lo, &hi) in izip!(&mut *dst, seg_0, seg_1) {
-					*out = lo + hi;
-				}
-				dst
-			}
-		}
+		self.fold_with(|lo, hi| lo + hi)
 	}
 }
 
@@ -684,7 +694,7 @@ impl<F: Field, P: PackedField<Scalar = F>> RoundContext<'_, P> {
 	/// The [Gruen24] technique multiplies it into each round polynomial.
 	///
 	/// [Gruen24]: <https://eprint.iacr.org/2024/108>
-	pub fn eq_prefix(&self, id: EqId) -> F {
+	pub const fn eq_prefix(&self, id: EqId) -> F {
 		self.eq_trackers[id.index()].eq_prefix_eval()
 	}
 }
@@ -734,12 +744,12 @@ impl<'c, P: PackedField> EvaluationChunk<'c, P> {
 		let (cols_0, cols_1) = cols
 			.iter()
 			.map(|ColumnChunk { lo, hi }| {
-				let (lo_0, lo_1) = lo.split_half_ref();
-				let (hi_0, hi_1) = hi.split_half_ref();
+				let (lo_0, lo_1) = lo.split_half();
+				let (hi_0, hi_1) = hi.split_half();
 				(ColumnChunk { lo: lo_0, hi: hi_0 }, ColumnChunk { lo: lo_1, hi: hi_1 })
 			})
 			.unzip();
-		let (eqs_0, eqs_1) = eqs.iter().map(|col| col.split_half_ref()).unzip();
+		let (eqs_0, eqs_1) = eqs.iter().map(|col| col.split_half()).unzip();
 		[
 			EvaluationChunk {
 				n_vars: n_vars - 1,
@@ -828,6 +838,39 @@ mod tests {
 		acc
 	}
 
+	// `column` and `column_slices` walk the entries independently, so pin them to each other over
+	// every entry kind and over the folds that shrink a split-half column inside its parent buffer.
+	#[test]
+	fn column_matches_column_slices() {
+		type P = Packed128b;
+		type F = <P as FieldOps>::Scalar;
+
+		let n_vars = 5;
+		let mut rng = StdRng::seed_from_u64(2);
+		let alloc = GlobalAllocator;
+
+		// A split-half entry sits between single-column entries, so the walk has to skip two
+		// logical columns in one step to reach the last id.
+		let borrowed = random_field_buffer::<P>(&mut rng, n_vars);
+		let mut store = MleStore::<GlobalAllocator, P>::new(n_vars, &alloc);
+		let mut col_ids = vec![store.push(borrowed.as_view())];
+		col_ids.push(store.push_owned(random_field_buffer::<P>(&mut rng, n_vars)));
+		col_ids.extend(store.push_split_half(random_field_buffer::<P>(&mut rng, n_vars + 1)));
+		col_ids.push(store.push_owned(random_field_buffer::<P>(&mut rng, n_vars)));
+
+		let challenges = random_scalars::<F>(&mut rng, n_vars);
+		for (round, &challenge) in challenges.iter().enumerate() {
+			for (&id, expected) in iter::zip(&col_ids, store.column_slices()) {
+				let got = store.column(id);
+				assert_eq!(got.log_len(), expected.log_len(), "length mismatch in round {round}");
+				for i in 0..expected.len() {
+					assert_eq!(got.get(i), expected.get(i), "scalar {i} mismatch in round {round}");
+				}
+			}
+			store.fold(challenge);
+		}
+	}
+
 	#[test]
 	fn map_reduce_pairs_on_highest_variable() {
 		type P = Packed128b;
@@ -845,7 +888,7 @@ mod tests {
 		let mut store = MleStore::<GlobalAllocator, P>::new(n_vars, &alloc);
 		let mut col_ids = borrowed
 			.iter()
-			.map(|col| store.push(col.to_ref()))
+			.map(|col| store.push(col.as_view()))
 			.collect::<Vec<_>>();
 		col_ids.push(store.push_owned(random_field_buffer::<P>(&mut rng, n_vars)));
 		col_ids.extend(store.push_split_half(random_field_buffer::<P>(&mut rng, n_vars + 1)));
@@ -906,7 +949,7 @@ mod tests {
 			let mut store = MleStore::<GlobalAllocator, P>::new(n_vars, &alloc);
 			let mut col_ids = borrowed
 				.iter()
-				.map(|col| store.push(col.to_ref()))
+				.map(|col| store.push(col.as_view()))
 				.collect::<Vec<_>>();
 			col_ids.push(store.push_owned(owned.clone()));
 			col_ids.extend(store.push_split_half(split.clone()));
@@ -925,7 +968,7 @@ mod tests {
 			let eqs = store
 				.eq_expansions()
 				.iter()
-				.flat_map(|eq| scalars(&eq.to_ref()))
+				.flat_map(|eq| scalars(&eq.as_view()))
 				.collect_vec();
 			(store.n_vars(), cols, eqs)
 		};

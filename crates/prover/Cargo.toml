@@ -12,6 +12,7 @@ binius-compute = { path = "../compute" }
 binius-core = { path = "../core" }
 binius-field = { path = "../field" }
 binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
 binius-ip = { path = "../ip" }
 binius-iop = { path = "../iop" }
 binius-iop-prover = { path = "../iop-prover", default-features = false }
@@ -33,7 +34,6 @@ tracing.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 binius-circuits = { path = "../circuits" }
 binius-frontend = { path = "../frontend" }
 binius-math = { path = "../math", features = ["test-utils"] }
@@ -54,7 +54,7 @@ name = "batch_quadratic_mle"
 harness = false
 
 [[bench]]
-name = "and_reduction"
+name = "bitand"
 harness = false
 
 [[bench]]
@@ -91,4 +91,3 @@ harness = false
 
 [features]
 default = []
-rayon = ["binius-utils/rayon"]

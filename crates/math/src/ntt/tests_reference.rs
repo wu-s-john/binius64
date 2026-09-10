@@ -3,8 +3,7 @@
 //! implementation.
 
 use binius_field::{
-	BinaryField, PackedBinaryGhash1x128b, PackedBinaryGhash2x128b, PackedBinaryGhash4x128b,
-	PackedField,
+	BinaryField, PackedField, PackedGhash1x128b, PackedGhash2x128b, PackedGhash4x128b,
 };
 use rand::prelude::*;
 
@@ -14,17 +13,15 @@ use crate::{
 	field_buffer::FieldSliceMut,
 	ntt::{
 		NeighborsLastMultiThread, NeighborsLastReference, NeighborsLastSingleThread,
-		domain_context::{
-			GaoMateerPreExpanded, GenericOnTheFly, GenericPreExpanded, TraceOneElement,
-		},
+		domain_context::{GaoMateerPreExpanded, GenericOnTheFly, GenericPreExpanded},
 	},
 	test_utils::{B128, Packed128b, random_field_buffer},
 };
 
 fn test_transform_equivalence<P: PackedField>(
 	mut rng: impl Rng,
-	reference: impl Fn(FieldSliceMut<P>, usize, usize),
-	transform: impl Fn(FieldSliceMut<P>, usize, usize),
+	reference: impl Fn(FieldSliceMut<'_, P>, usize, usize),
+	transform: impl Fn(FieldSliceMut<'_, P>, usize, usize),
 	log_n: usize,
 ) {
 	let half_rounds = log_n / 2;
@@ -37,8 +34,8 @@ fn test_transform_equivalence<P: PackedField>(
 			let mut data_a = random_field_buffer::<P>(&mut rng, log_n);
 			let mut data_b = data_a.clone();
 
-			reference(data_a.to_mut(), skip_early, skip_late);
-			transform(data_b.to_mut(), skip_early, skip_late);
+			reference(data_a.as_mut_view(), skip_early, skip_late);
+			transform(data_b.as_mut_view(), skip_early, skip_late);
 			assert_eq!(data_a, data_b);
 		}
 	}
@@ -199,7 +196,7 @@ fn test_forward_transform_is_identity(#[case] ntt_factory: impl NTTFactory<B128>
 		let data = random_field_buffer::<P>(&mut rng, 0);
 		let mut data_clone = data.clone();
 
-		ntt.forward_transform(data_clone.to_mut(), 0, 0);
+		ntt.forward_transform(data_clone.as_mut_view(), 0, 0);
 
 		assert_eq!(data, data_clone);
 	}
@@ -209,7 +206,7 @@ fn test_forward_transform_is_identity(#[case] ntt_factory: impl NTTFactory<B128>
 
 fn test_equivalence_ntts_domain_contexts<P: PackedField>()
 where
-	P::Scalar: BinaryField + TraceOneElement,
+	P::Scalar: BinaryField,
 {
 	let dc_1 = GaoMateerPreExpanded::<P::Scalar>::generate(10);
 	test_equivalence_ntts::<P>(&dc_1);
@@ -221,9 +218,9 @@ where
 
 #[test]
 fn test_equivalence_ntts_domain_contexts_packings() {
-	test_equivalence_ntts_domain_contexts::<PackedBinaryGhash1x128b>();
-	test_equivalence_ntts_domain_contexts::<PackedBinaryGhash2x128b>();
-	test_equivalence_ntts_domain_contexts::<PackedBinaryGhash4x128b>();
+	test_equivalence_ntts_domain_contexts::<PackedGhash1x128b>();
+	test_equivalence_ntts_domain_contexts::<PackedGhash2x128b>();
+	test_equivalence_ntts_domain_contexts::<PackedGhash4x128b>();
 }
 
 fn test_composition<P: PackedField>()
@@ -244,8 +241,8 @@ where
 				continue;
 			}
 
-			ntt.forward_transform(data.to_mut(), skip_early, skip_late);
-			ntt.inverse_transform(data.to_mut(), skip_early, skip_late);
+			ntt.forward_transform(data.as_mut_view(), skip_early, skip_late);
+			ntt.inverse_transform(data.as_mut_view(), skip_early, skip_late);
 			assert_eq!(data, data_orig);
 		}
 	}

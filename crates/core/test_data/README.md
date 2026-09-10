@@ -4,8 +4,8 @@ This directory contains binary reference files used for testing serialization fo
 
 ## Files
 
-- `constraint_system_v7.bin`: Reference binary serialization of a `ConstraintSystem` using serialization version 7.
-- `public_witness_v1.bin`: Reference binary serialization of a `PublicWitness` using serialization version 1.
+- `constraint_system_v10.bin`: Reference binary serialization of a `ConstraintSystem` using serialization version 10.
+- `values_data_v1.bin`: Reference binary serialization of a `ValuesData` using serialization version 1.
 - `proof_v1.bin`: Reference binary serialization of a `Proof` using serialization version 1.
 
 ## Purpose
@@ -31,11 +31,11 @@ If you make intentional breaking changes to the serialization format:
 3. Rename the new file to include the new version number
 4. Update test paths to reference the new file
 
-### For PublicWitness
-1. Increment `PublicWitness::SERIALIZATION_VERSION`
+### For ValuesData
+1. Increment `ValuesData::SERIALIZATION_VERSION`
 2. Run the ignored test to regenerate the reference file:
    ```bash
-   cargo test -p binius-core -- --ignored create_public_witness_reference_binary
+   cargo test -p binius-core -- --ignored create_values_data_reference_binary
    ```
 3. Rename the new file to include the new version number
 4. Update test paths to reference the new file
@@ -57,14 +57,17 @@ The binary format uses little-endian encoding and follows this structure:
 1. **Version header** (4 bytes): `u32` serialization version
 2. **Constants**: Vector of `Word` values
 3. **Value vector shape**: the five section counts `n_const_pad`, `n_inout`, `n_inout_pad`, `n_private`, `n_private_pad`
+
+Each `ShiftedValueIndex` within a constraint carries a value index followed by **two** shifts, inner
+first — the sequence the reduction applies in order.
 4. **ZERO constraints**: Vector of `ZeroConstraint` structures
 5. **AND constraints**: Vector of `AndConstraint` structures
 6. **IMUL constraints**: Vector of `ImulConstraint` structures
 7. **BMUL constraints**: Vector of `BmulConstraint` structures
 
-### PublicWitness Format
+### ValuesData Format
 1. **Version header** (4 bytes): `u32` serialization version
-2. **Data**: Vector of `Word` values representing the public witness
+2. **Data**: Vector of `Word` values holding a run of value-vector words — the inout values of one instance, or the whole non-public segment
 
 ### Proof Format
 1. **Version header** (4 bytes): `u32` serialization version

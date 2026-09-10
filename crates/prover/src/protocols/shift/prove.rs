@@ -1,163 +1,229 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 use binius_compute::Allocator;
 use binius_core::word::Word;
-use binius_field::{BinaryField, Field, PackedField, util::powers};
-use binius_ip::sumcheck::SumcheckOutput;
+use binius_field::{BinaryField, Field, PackedField};
 use binius_ip_prover::channel::IPProverChannel;
 use binius_math::{
-	BinarySubspace, FieldBuffer, inner_product::inner_product, multilinear::eq::eq_ind_partial_eval,
+	BinarySubspace, FieldBuffer, inner_product::inner_product,
+	multilinear::eq::scaled_eq_ind_partial_eval, univariate::EvaluationDomain,
 };
 
-use super::{key_collection::KeyCollection, phase_1::prove_phase_1, phase_2::prove_phase_2};
+use super::{
+	SegmentWords,
+	claims::OperatorClaims,
+	key_collection::KeyCollection,
+	phase_1::prove_phase_1,
+	phase_2::{ShiftOutput, prove_phase_2},
+	shift_ind::{ShiftChallengePoint, ShiftIndSumcheck},
+};
 
-/// Holds the prover data for an operator.
+/// One operation's operand evaluation claims, with the point they are claimed at.
 ///
-/// Contains evaluation claims and challenge points for an operation.
+/// An operation constrains a fixed number of operands at once, its arity:
 ///
-/// Each operator (AND/IMUL) has multiple operand positions, each with an oblong evaluation claim.
-/// The `evals` field stores these claim evaluations. The evaluation points consist of:
-/// - `r_zhat_prime`: univariate challenge point (pre-populated)
-/// - `r_x_prime`: multilinear challenge point (pre-populated)
+/// ```text
+/// ZERO 1   AND 3   IMUL 4   BMUL 6
+/// ```
+///
+/// The arity is a type parameter, so two operations' claims cannot be passed in each other's
+/// place.
+///
+/// Every operand is claimed at the same point: an oblong pair of a univariate bit-axis
+/// coordinate and a multilinear constraint-index coordinate.
 #[derive(Debug, Clone)]
-pub struct OperatorData<F: Field> {
-	pub evals: Vec<F>,
+pub struct OperatorData<F: Field, const ARITY: usize> {
+	/// The claimed evaluation of each operand column, in the operation's operand order.
+	pub evals: [F; ARITY],
+	/// The univariate challenge folding the bit axis, shared by every operation.
 	pub r_zhat_prime: F,
+	/// The multilinear challenge over the constraint index.
 	pub r_x_prime: Vec<F>,
 }
 
-/// Prepared operator data for proving.
+impl<F: Field, const ARITY: usize> OperatorData<F, ARITY> {
+	/// The claim of an operation the constraint system does not use.
+	///
+	/// Every operand evaluates to zero, at the empty constraint point, so this claim
+	/// contributes nothing to the batch.
+	///
+	/// # Arguments
+	///
+	/// - `r_zhat_prime`: the univariate challenge, shared by every operation.
+	pub const fn zero_claim(r_zhat_prime: F) -> Self {
+		Self {
+			evals: [F::ZERO; ARITY],
+			r_zhat_prime,
+			r_x_prime: Vec::new(),
+		}
+	}
+}
+
+/// One operation's claims, with the expansion every proving phase needs precomputed.
 ///
-/// Contains evaluation claims, challenge points, and precomputed values needed during proving:
-/// - `evals`: evaluation claims for each operand position
-/// - `r_zhat_prime`: univariate challenge point
-/// - `r_x_prime_tensor`: tensor expansion of r_x_prime for efficient proving
-/// - `lambda`: sampled random value for operand weighting
+/// Every shift key of the operation reads the same constraint-point expansion, built once here.
+/// The operation's own batching weight is folded into it: that weight reaches every term of the
+/// operation, and the expansion's seed is where it costs nothing to carry.
+///
+/// The arity is erased, since every phase picks an operation at run time and all four have to
+/// share one type.
+/// Only the batched combination survives that erasure, as a single scalar.
 #[derive(Debug, Clone)]
 pub struct PreparedOperatorData<F: Field> {
-	pub evals: Vec<F>,
+	/// The operand claims collapsed into one value by the batching weights:
+	///
+	/// ```text
+	/// batched_eval = operation_weight * sum_i evals[i] * operand_weights[i]
+	/// ```
+	///
+	/// Two operations' batched values can be summed directly, with no further scaling, since
+	/// their operation weights are distinct entries of one equality tensor.
+	pub batched_eval: F,
+	/// The univariate challenge folding the bit axis, shared by every operation.
 	pub r_zhat_prime: F,
-	pub r_x_prime_tensor: FieldBuffer<F>,
-	pub lambda_powers: Vec<F>,
+	/// The equality-indicator tensor of the constraint point, one weight per constraint, scaled by
+	/// this operation's own batching weight.
+	pub weighted_r_x_prime_tensor: FieldBuffer<F>,
 }
 
 impl<F: Field> PreparedOperatorData<F> {
-	/// Creates a new prepared operator data from operator data and lambda.
-	pub fn new(operator_data: OperatorData<F>, lambda: F) -> Self {
+	/// Expands one operation's claims against the batching weights drawn for it.
+	///
+	/// # Arguments
+	///
+	/// - `operator_data`: the operand claims, and the point they are claimed at.
+	/// - `operation_weight`: this operation's entry in the operation-axis equality tensor.
+	/// - `operand_weights`: the operand-axis equality tensor, shared by the four operations. Only
+	///   its leading `ARITY` entries name a claim of this operation.
+	pub fn new<const ARITY: usize>(
+		operator_data: OperatorData<F, ARITY>,
+		operation_weight: F,
+		operand_weights: &[F],
+	) -> Self {
 		let OperatorData {
 			evals,
 			r_zhat_prime,
 			r_x_prime,
 		} = operator_data;
-		let r_x_prime_tensor = eq_ind_partial_eval::<F>(&r_x_prime);
-		let lambda_powers = powers(lambda).skip(1).take(evals.len()).collect();
+		let weighted_r_x_prime_tensor =
+			scaled_eq_ind_partial_eval::<F>(&r_x_prime, operation_weight);
 		Self {
-			evals,
+			// Only the leading `ARITY` weights name a claim; `inner_product` pairs the two
+			// sequences exactly, so the shared tail is cut here.
+			batched_eval: operation_weight
+				* inner_product(evals, operand_weights[..ARITY].iter().copied()),
 			r_zhat_prime,
-			r_x_prime_tensor,
-			lambda_powers,
+			weighted_r_x_prime_tensor,
 		}
-	}
-
-	/// Returns the batched evaluation of the oblong evaluation claims.
-	/// Since the univariate evaluation of the evals at lambda is
-	/// further multiplied by lambda, the batched evaluation claims
-	/// for different operators can soundly be added without further
-	/// random scaling.
-	pub fn batched_eval(&self) -> F {
-		inner_product(self.evals.iter().copied(), self.lambda_powers.iter().copied())
 	}
 }
 
-/// Proves the shift protocol reduction using a two-phase approach.
+/// Proves the shift protocol reduction, collapsing every operation's claims into one.
 ///
-/// This function orchestrates the complete shift protocol proof, reducing bitand and intmul
-/// evaluation claims to a single multilinear claim on the witness. The protocol consists
-/// of two sequential sumcheck phases that progressively reduce the complexity of the claims.
+/// The result is a single multilinear evaluation claim on the witness.
+/// It is reached in five prover phases.
+/// A shifted value index names two shifts applied in sequence.
+/// The reduction peels them off from the output end inward:
 ///
-/// # Protocol Overview
-/// 1. **Lambda Sampling**: Samples random coefficients for batching operator claims
-/// 2. **Phase 1**: Proves batched operator claims over shift variants and operand positions
-/// 3. **Phase 2**: Reduces to witness evaluation using monster multilinear polynomial
+/// 1. bind the outer shift slot, then the inner one, then the bit position within a word;
+/// 2. bind the bit index of the intermediate word, where the two shift indicators meet;
+/// 3. bind the output bit index the reduction's first factor attaches to;
+/// 4. reduce what is left to a witness evaluation, against the constraint-matrix multilinear.
 ///
-/// # Parameters
-/// - `key_collection`: Prover's key collection representing the constraint system
-/// - `words`: The witness words (must have power-of-2 length)
-/// - `bitand_data`: Operator data for bit multiplication (AND) constraints
-/// - `intmul_data`: Operator data for integer multiplication (IMUL) constraints
-/// - `binmul_data`: Operator data for GHASH-field multiplication (BMUL) constraints
-/// - `transcript`: The prover's transcript for interactive protocol
+/// # Arguments
+///
+/// - `key_collection`: the prover's key collection for the constraint system.
+/// - `public_words`: the constants followed by the inout values, as the circuit declares them.
+/// - `hidden_words`: the private values, as the circuit declares them.
+/// - `claims`: the operand evaluation claim of each operation.
+/// - `domain_subspace`: the univariate evaluation domain.
+/// - `channel`: the prover channel the interactive rounds run over.
+/// - `alloc`: the allocator the intermediate buffers are drawn from.
 ///
 /// # Returns
-/// Returns `SumcheckOutput` containing the final challenges and witness evaluation,
-/// or an error if the proof generation fails.
 ///
-/// # Requirements
-/// - `words` must have power-of-2 length for efficient multilinear operations
-#[allow(clippy::too_many_arguments)]
+/// The final challenges with the witness evaluation.
+/// Also the wiring multilinear's evaluation, for the caller to send.
 pub fn prove<F, P, Channel, A>(
 	key_collection: &KeyCollection,
-	words: &[Word],
-	zero_data: OperatorData<F>,
-	bitand_data: OperatorData<F>,
-	intmul_data: OperatorData<F>,
-	binmul_data: OperatorData<F>,
+	public_words: &[Word],
+	hidden_words: &[Word],
+	claims: OperatorClaims<F>,
 	domain_subspace: &BinarySubspace<F>,
 	channel: &mut Channel,
 	alloc: &A,
-) -> SumcheckOutput<F>
+) -> ShiftOutput<F>
 where
 	F: BinaryField,
 	P: PackedField<Scalar = F>,
 	Channel: IPProverChannel<F>,
 	A: Allocator,
 {
-	// Sample lambdas, one for each operator.
-	let zero_lambda = channel.sample();
-	let bitand_lambda = channel.sample();
-	let intmul_lambda = channel.sample();
-	let binmul_lambda = channel.sample();
+	// The segments are passed as the circuit declares them, at whatever length that is.
+	// Neither phase needs them padded.
+	let words = SegmentWords {
+		public: public_words,
+		hidden: hidden_words,
+	};
 
-	// Create prepared operator data with sampled lambdas
-	let expand_scope = tracing::debug_span!("Expand tensor queries").entered();
-	let prepared_zero_data = PreparedOperatorData::new(zero_data, zero_lambda);
-	let prepared_bitand_data = PreparedOperatorData::new(bitand_data, bitand_lambda);
-	let prepared_intmul_data = PreparedOperatorData::new(intmul_data, intmul_lambda);
-	let prepared_binmul_data = PreparedOperatorData::new(binmul_data, binmul_lambda);
-	drop(expand_scope);
+	// One batching coefficient per operation, expanded along with its constraint point.
+	// SOUNDNESS: this must draw in the same order the verifier draws in.
+	let prepared = {
+		let _scope = tracing::debug_span!("Expand tensor queries").entered();
+		claims.prepare(channel)
+	};
 
-	// Prove the first phase, receiving a `SumcheckOutput`
-	// with challenges made of `r_j` and `r_s`,
-	// and eval equal to `gamma` (see paper).
+	// The weights the reduction's first factor carries, one per bit position.
+	// Phase 1 and phase 3 both need them, so they are computed once here.
+	// All four operations share `r_zhat_prime`, so it is drawn from the BitAnd claim.
+	let oblong_weights = domain_subspace.lagrange_evals_buffer(prepared.bitand.r_zhat_prime);
+
+	// Phase 1: bind the shift variant, the shift amount, and the bit position.
 	let phase_1_output = prove_phase_1::<_, P, _, _>(
 		key_collection,
 		words,
-		&prepared_zero_data,
-		&prepared_bitand_data,
-		&prepared_intmul_data,
-		&prepared_binmul_data,
-		domain_subspace,
+		&prepared,
+		oblong_weights.as_ref(),
 		channel,
 		alloc,
 	);
 
-	// Prove the second phase, receiving a `SumcheckOutput`
-	// with challenges `r_y` and eval the evaluation of
-	// the witness at oblong point had by univariate
-	// variable `r_j` and multilinear variable `r_y`.
-	let SumcheckOutput { challenges, eval } = prove_phase_2::<_, P, _, _>(
+	// Phases 2 and 3 bind the two bit indices the shift indicators chain through.
+	// Phase 2 takes the intermediate word's, phase 3 the reduction's first-factor output bit.
+	//
+	// Phase 2 runs against phase 1's leftover weights, carrying its evaluation as a constant.
+	let inner = ShiftIndSumcheck::<P, _>::new(
+		alloc,
+		&phase_1_output.psi,
+		&ShiftChallengePoint::new(&phase_1_output.r_j, &phase_1_output.inner),
+		phase_1_output.g_eval,
+	);
+	debug_assert_eq!(inner.beta(), phase_1_output.gamma);
+	let inner_output = inner.prove(channel, alloc);
+
+	// Phase 3 runs against the reduction's first-factor weights, carrying what phase 2 fixed.
+	// Its own weights evaluate to a factor the verifier recomputes independently.
+	// So no division is needed between phases.
+	let outer = ShiftIndSumcheck::<P, _>::new(
+		alloc,
+		oblong_weights.as_ref(),
+		&ShiftChallengePoint::new(&inner_output.point, &phase_1_output.outer),
+		inner_output.ind_eval * phase_1_output.g_eval,
+	);
+	debug_assert_eq!(outer.beta(), inner_output.eval);
+	let outer_output = outer.prove(channel, alloc);
+
+	// Phase 4 reduces to the final challenges and witness evaluation.
+	// It runs against the constraint-matrix multilinear, scaled by the three factors above.
+	prove_phase_2::<_, P, _, _>(
 		key_collection,
 		words,
-		&prepared_zero_data,
-		&prepared_bitand_data,
-		&prepared_intmul_data,
-		&prepared_binmul_data,
-		domain_subspace,
+		&prepared,
 		phase_1_output,
+		outer_output.weights_eval * outer_output.ind_eval * inner_output.ind_eval,
+		outer_output.eval,
 		channel,
 		alloc,
-	);
-
-	// Return evaluation claim on the witness.
-	SumcheckOutput { challenges, eval }
+	)
 }

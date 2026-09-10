@@ -33,15 +33,15 @@ pub mod constraint_system;
 pub mod wiring;
 pub mod wrapper;
 
-use std::{marker::PhantomData, rc::Rc, slice};
+use std::{marker::PhantomData, rc::Rc};
 
 use binius_field::{BinaryField, Field, field::FieldOps};
-use binius_hash::binary_merkle_tree::HashSuite;
+use binius_hash::HashSuite;
 use binius_iop::{
 	basefold,
 	basefold::compiler::BaseFoldVerifierCompiler,
 	channel::{
-		IOPVerifierChannel, OracleLinearRelation, OracleSpec,
+		IOPVerifierChannel, OracleSpec,
 		oracle_setup::{DummyElem, OracleSetupChannel},
 	},
 	fri::{self, MinProofSizeStrategy},
@@ -176,10 +176,10 @@ impl<F: Field> IOPVerifier<F> {
 			});
 		}
 
-		// Receive the private and mask oracle commitments. The private witness is
-		// witness-dependent. The mask is passed `is_witness_dependent = true` to preserve its ZK
-		// masking (it is a fresh random mask rather than witness data, but is committed with
-		// hiding in the ZK protocol).
+		// Receive the private and mask oracle commitments.
+		// The private witness is witness-dependent.
+		// The mask is a fresh random draw, not witness data.
+		// It is still flagged witness-dependent so the protocol keeps treating it as secret.
 		let private_oracle = channel.recv_oracle(cs.log_private() as usize, true)?;
 		let (m_n, m_d) = cs.mask_dims();
 		let mask_oracle = channel.recv_oracle(m_n + m_d, true)?;
@@ -205,16 +205,9 @@ impl<F: Field> IOPVerifier<F> {
 		// channel never cross a thread boundary.
 		let r_x_tensor: Rc<[Channel::Elem]> = eq_ind_partial_eval_scalars(&r_x).into();
 
-		// The public-segment contribution to the operand evaluations is purely a function of
-		// public-channel inputs (the public scalars, λ, and rₓ). Trade in those Elems for plain
-		// field values, run the MLE evaluation in plaintext, and materialize the result as a
-		// single inout wire instead of building the entire sub-circuit.
-		let public_eval = {
-			let inputs = [public, slice::from_ref(&lambda), r_x_tensor.as_ref()].concat();
-
-			let eval_fn = wiring::PublicWiringEvalFn::new(cs.mul_constraints(), public.len());
-			channel.compute_public_value(&inputs, eval_fn)
-		};
+		// The public segment's contribution to the operand evaluations.
+		let public_eval =
+			wiring::evaluate_wiring_mle_public(cs.mul_constraints(), public, &lambda, &r_x_tensor);
 
 		// Prover sends the precommit segment's contribution to the operand evaluations.
 		let precommit_claim = channel.recv_one()?;
@@ -236,23 +229,9 @@ impl<F: Field> IOPVerifier<F> {
 		let mask_transparent = mask_transparent(cs, &r_x);
 
 		// Verify all oracle relations
-		channel.verify_oracle_relations([
-			OracleLinearRelation {
-				oracle: precommit_oracle,
-				transparent: precommit_transparent,
-				claim: precommit_claim,
-			},
-			OracleLinearRelation {
-				oracle: private_oracle,
-				transparent: private_transparent,
-				claim: private_claim,
-			},
-			OracleLinearRelation {
-				oracle: mask_oracle,
-				transparent: mask_transparent,
-				claim: mask_eval,
-			},
-		])?;
+		channel.verify_oracle_relation(precommit_oracle, precommit_transparent, precommit_claim)?;
+		channel.verify_oracle_relation(private_oracle, private_transparent, private_claim)?;
+		channel.verify_oracle_relation(mask_oracle, mask_transparent, mask_eval)?;
 
 		Ok(())
 	}
@@ -273,11 +252,7 @@ where
 	) -> Result<Self, Error> {
 		// Modify the constraint system for zero-knowledge.
 		let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-		let blinding_info = BlindingInfo {
-			n_dummy_wires: n_test_queries,
-			// TODO: Document why these are necessary
-			n_dummy_constraints: 2,
-		};
+		let blinding_info = BlindingInfo::for_fri_queries(n_test_queries);
 		let constraint_system = ConstraintSystemPadded::new(constraint_system, blinding_info);
 
 		let iop_verifier = IOPVerifier::new(constraint_system);
@@ -342,7 +317,8 @@ where
 			channel.recv_oracle(self.constraint_system().log_precommit() as usize, true)?;
 		self.iop_verifier
 			.verify(precommit_oracle, public, &mut channel)?;
-		Ok(channel.finish()?)
+		channel.finish()?;
+		Ok(())
 	}
 }
 

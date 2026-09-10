@@ -1,7 +1,7 @@
 // Copyright 2025-2026 The Binius Developers
 use binius_compute::BufferPool;
 use binius_core::word::Word;
-use binius_field::{BinaryField128bGhash, Field, PackedBinaryGhash1x128b};
+use binius_field::{Field, Ghash128b, PackedGhash1x128b};
 use binius_hash::StdHashSuite;
 use binius_iop::{
 	basefold::compiler::BaseFoldVerifierCompiler, channel::OracleSpec, fri::MinProofSizeStrategy,
@@ -18,7 +18,7 @@ use binius_ip_prover::{
 use binius_math::{
 	FieldBuffer,
 	multilinear::{eq::eq_ind_partial_eval_scalars, evaluate::evaluate},
-	ntt::{NeighborsLastSingleThread, domain_context::GenericPreExpanded},
+	ntt::{NeighborsLastSingleThread, domain_context::GaoMateerPreExpanded},
 	test_utils::random_scalars,
 };
 use binius_prover::protocols::intmul::{
@@ -34,8 +34,8 @@ use binius_verifier::{
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::prelude::*;
 
-type P = PackedBinaryGhash1x128b;
-type F = BinaryField128bGhash;
+type P = PackedGhash1x128b;
+type F = Ghash128b;
 
 /// Number of exponents is `2^LOG_NUM`.
 const LOG_NUM: usize = 14;
@@ -52,8 +52,8 @@ const N_TEST_QUERIES: usize = 1;
 /// encoding and Merkle tree construction) is measured; a naive channel would serialize
 /// oracles for free. The final batched opening in `finish` is not measured, since the full
 /// system amortizes it into the single opening shared with the witness trace.
-fn basefold_compiler() -> BaseFoldProverCompiler<P, NeighborsLastSingleThread<GenericPreExpanded<F>>>
-{
+fn basefold_compiler()
+-> BaseFoldProverCompiler<P, NeighborsLastSingleThread<GaoMateerPreExpanded<F>>> {
 	let verifier_compiler = BaseFoldVerifierCompiler::new(
 		&BinaryMerkleTreeScheme::<F, StdHashSuite>::new(),
 		vec![OracleSpec::new(LIMB_BITS)],
@@ -61,8 +61,7 @@ fn basefold_compiler() -> BaseFoldProverCompiler<P, NeighborsLastSingleThread<Ge
 		N_TEST_QUERIES,
 		&MinProofSizeStrategy,
 	);
-	let domain_context =
-		GenericPreExpanded::generate_from_subspace(verifier_compiler.max_subspace());
+	let domain_context = GaoMateerPreExpanded::generate(verifier_compiler.max_log_domain_size());
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 	BaseFoldProverCompiler::from_verifier_compiler(&verifier_compiler, ntt)
 }
@@ -125,6 +124,7 @@ fn bench_intmul_prove(c: &mut Criterion) {
 					let channel = compiler
 						.create_channel_without_zk_from_transcript::<StdHashSuite, StdChallenger, _, _>(
 							ProverTranscript::default(),
+							alloc,
 						);
 					(Some(witness.clone()), channel)
 				},
@@ -133,7 +133,7 @@ fn bench_intmul_prove(c: &mut Criterion) {
 					intmul_prover.prove(witness.take().expect("set in setup"));
 				},
 				BatchSize::SmallInput,
-			)
+			);
 		},
 	);
 
@@ -147,6 +147,7 @@ fn bench_intmul_prove(c: &mut Criterion) {
 					compiler
 						.create_channel_without_zk_from_transcript::<StdHashSuite, StdChallenger, _, _>(
 							ProverTranscript::default(),
+							alloc,
 						)
 				},
 				|channel| {
@@ -155,7 +156,7 @@ fn bench_intmul_prove(c: &mut Criterion) {
 					intmul_prover.prove(witness);
 				},
 				BatchSize::SmallInput,
-			)
+			);
 		},
 	);
 
@@ -186,7 +187,7 @@ fn bench_intmul_phases(c: &mut Criterion) {
 		let mut transcript = ProverTranscript::new(StdChallenger::default());
 		let mut prover = IntMulProver::<_, P, _>::new(0, &mut transcript, &alloc);
 		let w = Witness::<_, P>::new(&alloc, &a, &b, &c_lo, &c_hi).unwrap();
-		prover.phase1(&initial_eval_point, w.b_prodcheck, witness.b_leaves.to_ref(), exp_eval)
+		prover.phase1(&initial_eval_point, w.b_prodcheck, witness.b_leaves.as_view(), exp_eval)
 	};
 	let phase2 = frobenius_twist(Word::LOG_BITS, &phase1.eval_point, &phase1.b_leaves_evals);
 	let phase3 = {
@@ -228,7 +229,12 @@ fn bench_intmul_phases(c: &mut Criterion) {
 			|b_prodcheck| {
 				let mut transcript = ProverTranscript::new(StdChallenger::default());
 				let mut prover = IntMulProver::<_, P, _>::new(0, &mut transcript, &alloc);
-				prover.phase1(&initial_eval_point, b_prodcheck, witness.b_leaves.to_ref(), exp_eval)
+				prover.phase1(
+					&initial_eval_point,
+					b_prodcheck,
+					witness.b_leaves.as_view(),
+					exp_eval,
+				)
 			},
 			BatchSize::SmallInput,
 		);
@@ -296,6 +302,7 @@ fn bench_intmul_phases(c: &mut Criterion) {
 				compiler
 					.create_channel_without_zk_from_transcript::<StdHashSuite, StdChallenger, _, _>(
 						ProverTranscript::default(),
+						alloc,
 					)
 			},
 			|channel| {
@@ -309,7 +316,7 @@ fn bench_intmul_phases(c: &mut Criterion) {
 					witness.a_exponents,
 					witness.c_lo_exponents,
 					witness.c_hi_exponents,
-					&witness.tables[0],
+					witness.tables[0].as_view(),
 				)
 			},
 			BatchSize::SmallInput,
@@ -339,13 +346,15 @@ fn bench_intmul_components(c: &mut Criterion) {
 	// Computing the leaves of the variable-base exponentiation tree (`a` root as base, `b` as
 	// exponents).
 	group.bench_function("b_leaves", |bencher| {
-		bencher.iter(|| compute_b_leaves::<_, F, P>(&alloc, &witness.a_root, witness.b_exponents));
+		bencher.iter(|| {
+			compute_b_leaves::<_, F, P>(&alloc, witness.a_root.as_view(), witness.b_exponents)
+		});
 	});
 
 	// Computing a product tree over the leaves.
 	group.bench_function("product_tree", |bencher| {
 		bencher.iter_batched(
-			|| FieldBuffer::clone_from_slice(&alloc, witness.b_leaves.to_ref()),
+			|| FieldBuffer::from_view_in(&alloc, witness.b_leaves.as_view()),
 			|b_leaves| ProdcheckProver::<_, P>::new(Word::LOG_BITS, &alloc, b_leaves),
 			BatchSize::SmallInput,
 		);
@@ -363,7 +372,7 @@ fn bench_intmul_components(c: &mut Criterion) {
 		let mut transcript = ProverTranscript::new(StdChallenger::default());
 		let mut prover = IntMulProver::<_, P, _>::new(0, &mut transcript, &alloc);
 		let w = Witness::<_, P>::new(&alloc, &a, &b, &c_lo, &c_hi).unwrap();
-		prover.phase1(&initial_eval_point, w.b_prodcheck, witness.b_leaves.to_ref(), exp_eval)
+		prover.phase1(&initial_eval_point, w.b_prodcheck, witness.b_leaves.as_view(), exp_eval)
 	};
 	let phase2 = frobenius_twist(Word::LOG_BITS, &phase1.eval_point, &phase1.b_leaves_evals);
 
@@ -381,7 +390,7 @@ fn bench_intmul_components(c: &mut Criterion) {
 					})
 					.collect();
 				let gamma = random_scalars::<F>(&mut rng, Word::LOG_BITS);
-				let eq_weights = eq_ind_partial_eval_scalars::<F>(&gamma);
+				let eq_weights = eq_ind_partial_eval_scalars(&gamma);
 				(witness.a_root.clone(), claims, eq_weights)
 			},
 			|(a_root, claims, eq_weights)| {

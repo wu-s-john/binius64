@@ -8,7 +8,6 @@ use binius_math::multilinear::eq::eq_one_var;
 use crate::sumcheck::{
 	common::{MleCheckProver, SumcheckProver},
 	mle_store::{EqId, EvaluationChunk, RoundContext},
-	round_evals::round_coeffs_by_eq,
 	round_evaluator::{MleCheckRoundEvaluator, SumcheckRoundEvaluator},
 };
 
@@ -50,21 +49,6 @@ impl<F: Field, InnerProver: MleCheckProver<F>> SumcheckProver<F>
 		self.mlecheck_prover.n_vars()
 	}
 
-	fn n_claims(&self) -> usize {
-		self.mlecheck_prover.n_claims()
-	}
-
-	fn round_claim(&self) -> Vec<F> {
-		// The sumcheck round claim is the inner MLE-check claim scaled by the accumulated equality
-		// prefix: R^sc(0) + R^sc(1) = eq_prefix_eval * [(1 - α) p(0) + α p(1)] = eq_prefix_eval *
-		// m, where m is the inner MLE-check round claim and p its round polynomial.
-		self.mlecheck_prover
-			.round_claim()
-			.into_iter()
-			.map(|m| m * self.eq_prefix_eval)
-			.collect()
-	}
-
 	fn execute(&mut self) -> Vec<RoundCoeffs<F>> {
 		let round_coeffs_multi = self.mlecheck_prover.execute();
 
@@ -72,7 +56,7 @@ impl<F: Field, InnerProver: MleCheckProver<F>> SumcheckProver<F>
 		let alpha = self.mlecheck_prover.eval_point()[self.n_vars() - 1];
 		round_coeffs_multi
 			.into_iter()
-			.map(|round_coeffs| round_coeffs_by_eq(&round_coeffs, alpha) * self.eq_prefix_eval)
+			.map(|round_coeffs| round_coeffs.mul_by_eq(alpha) * self.eq_prefix_eval)
 			.collect()
 	}
 
@@ -82,7 +66,7 @@ impl<F: Field, InnerProver: MleCheckProver<F>> SumcheckProver<F>
 		let alpha = self.mlecheck_prover.eval_point()[self.n_vars() - 1];
 		self.eq_prefix_eval *= eq_one_var(challenge, alpha);
 
-		self.mlecheck_prover.fold(challenge)
+		self.mlecheck_prover.fold(challenge);
 	}
 
 	fn finish(self) -> Vec<F> {
@@ -137,7 +121,7 @@ where
 
 	fn accumulate(&self, chunk: &EvaluationChunk<'_, P>, accum: &mut [<P as WideMul>::Output]) {
 		self.inner
-			.accumulate(chunk, chunk.eq(self.eq_tracker).to_ref(), accum)
+			.accumulate(chunk, chunk.eq(self.eq_tracker).as_view(), accum);
 	}
 
 	fn interpolate(&self, ctx: &RoundContext<'_, P>, accum: &[P], claim: F) -> RoundCoeffs<F> {
@@ -155,6 +139,6 @@ where
 		let round_coeffs = self.inner.interpolate(ctx, accum, inner_claim, alpha);
 
 		// Multiply the inner MLE-check round polynomial by (X - α) and the equality prefix.
-		round_coeffs_by_eq(&round_coeffs, alpha) * eq_prefix
+		round_coeffs.mul_by_eq(alpha) * eq_prefix
 	}
 }

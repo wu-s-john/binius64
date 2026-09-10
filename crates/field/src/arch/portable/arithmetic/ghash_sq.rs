@@ -6,19 +6,19 @@
 //! the Karatsuba diagonal into a two-lane packed GHASH multiply buys nothing — that packed multiply
 //! decomposes back into two independent 128-bit multiplies, each with its own reduction. Keeping
 //! the three Karatsuba products separate instead lets the multiply-by-`X` of the irreducible
-//! polynomial be applied to an *unreduced* product ([`MulXWide`]), which folds it into a reduction
+//! polynomial be applied to an *unreduced* product, which folds it into a reduction
 //! that has to happen anyway: two GHASH reductions per GHASH² product rather than three.
 
 use bytemuck::TransparentWrapper;
 
 use crate::{
-	BinaryField128bGhash, PackedGhashSq1x256b, SlicedGhashSqWide, WideMul,
-	arithmetic_traits::MulXWide,
-	packed_ghash_sq::{ghash_sq_coords, ghash_sq_from_coords},
+	Ghash128b, PackedGhashSq1x256b, SlicedGhashSqWide, WideMul,
+	arithmetic_traits::MulX,
+	packed_fields::ghash_sq::{ghash_sq_coords, ghash_sq_from_coords},
 };
 
 /// The unreduced product of a single GHASH coordinate multiply.
-type GhashWide = <BinaryField128bGhash as WideMul>::Output;
+type GhashWide = <Ghash128b as WideMul>::Output;
 
 /// [`WideMul`] strategy for [`PackedGhashSq1x256b`] keeping the three Karatsuba products of the
 /// coordinate multiply separate, so that the multiply-by-`X` can be deferred into a reduction.
@@ -36,9 +36,9 @@ impl WideMul for GhashSqSlicedWideMul<PackedGhashSq1x256b> {
 		let [b0, b1] = ghash_sq_coords(Self::peel(b));
 
 		SlicedGhashSqWide {
-			t0: BinaryField128bGhash::wide_mul(a0, b0),
-			t2: BinaryField128bGhash::wide_mul(a1, b1),
-			t1: BinaryField128bGhash::wide_mul(a0 + a1, b0 + b1),
+			t0: Ghash128b::wide_mul(a0, b0),
+			t2: Ghash128b::wide_mul(a1, b1),
+			t1: Ghash128b::wide_mul(a0 + a1, b0 + b1),
 		}
 	}
 
@@ -49,8 +49,8 @@ impl WideMul for GhashSqSlicedWideMul<PackedGhashSq1x256b> {
 	/// accumulated wide product, so the two coordinates cost two reductions in total.
 	#[inline]
 	fn reduce(wide: Self::Output) -> Self {
-		let z0 = BinaryField128bGhash::reduce(wide.t0 + wide.t2.mul_x_wide());
-		let z1 = z0 + BinaryField128bGhash::reduce(wide.t1 + wide.t2);
+		let z0 = Ghash128b::reduce(wide.t0 + wide.t2.mul_x());
+		let z1 = z0 + Ghash128b::reduce(wide.t1 + wide.t2);
 
 		Self::wrap(ghash_sq_from_coords([z0, z1]))
 	}

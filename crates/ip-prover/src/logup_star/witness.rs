@@ -6,84 +6,105 @@
 //!
 //! - the looker numerator `eq_r`, the equality indicator at the evaluation point,
 //! - the looker denominator `c - I`, with `I` the embedded index column,
-//! - the table denominator `c - J`, with `J` the embedded table positions,
+//! - the negated table denominator `J - c`, with `J` the embedded table positions,
 //! - the pushforward `Y = I_* eq_r`, the looker numerator scattered onto table positions.
 
 use std::iter;
 
-use binius_compute::{Allocator, VecLike};
+use binius_compute::{Allocator, CollectIntoAllocVec, VecLike};
 use binius_field::{BinaryField, Divisible, Field, PackedField, util::powers};
 use binius_math::{
 	FieldBuffer, FieldSlice, FieldVec, multilinear::eq::scaled_eq_ind_partial_eval_into,
 };
 use binius_utils::rayon::{current_num_threads, prelude::*};
 
-use super::prove::Looker;
+use super::prove::TableLookup;
 
-/// Build every looker's gamma-scaled numerator and the combined pushforward `Y`.
+/// The witnesses [`combined_lookers`] builds: the numerators grouped per table, and one
+/// pushforward per table.
+type LogupWitnesses<P, A> = (Vec<Vec<FieldVec<P, A>>>, Vec<FieldVec<P, A>>);
+
+/// Build each table's gamma-scaled looker numerators and its combined pushforward `Y`.
 ///
-/// Looker `j`'s numerator is `gamma^j * eq_{r_j}`, the scaled equality indicator its
-/// fractional-addition circuit runs over, so the fractional sum of the per-looker circuits is the
-/// gamma-combination of the looker sums. The combined pushforward is the scatter of the same
+/// Within a table, looker `i`'s numerator is `gamma^i * eq_{r_i}`, the scaled equality indicator
+/// its fractional-addition circuit runs over, so the fractional sum of that table's looker circuits
+/// is the gamma-combination of their sums. The table's pushforward is the scatter of those same
 /// numerators:
 ///
 /// ```text
-///     Y = sum_j gamma^j * (I_j)_* eq_{r_j}
+///     Y = sum_i gamma^i * (I_i)_* eq_{r_i}
 /// ```
 ///
-/// Both the per-looker numerators and the combined pushforward are drawn from `alloc`: the
-/// numerators become the leaf layers of the per-looker fractional-addition circuits, and a
-/// committing caller hands the pushforward to the channel, which owns it until the opening runs.
+/// Each table uses its own `gamma`, so the tables share nothing here.
+///
+/// Both the numerators and the pushforwards are drawn from `alloc`: the numerators become the leaf
+/// layers of the per-looker fractional-addition circuits, and a committing caller hands the
+/// pushforwards to the channel, which owns them until the openings run.
 ///
 /// # Preconditions
 ///
-/// * `lookers` is non-empty, every looker has the same evaluation point length `n`, every index
-///   column has `2^n` entries, and every index entry is less than `2^table_n_vars`.
+/// * `tables` is non-empty, every table has at least one looker, every looker's index column has
+///   `2^n` entries for its own evaluation point length `n`, and every index entry is less than its
+///   table's size.
+///
+/// # Panics
+///
+/// Panics if any precondition is violated.
 #[tracing::instrument(
 	skip_all,
 	level = "debug",
 	name = "Build logup* witnesses",
-	fields(n_lookers = lookers.len(), table_n_vars)
+	fields(n_tables = tables.len())
 )]
 pub fn combined_lookers<A, F, P>(
 	alloc: &A,
-	lookers: &[Looker<'_, F>],
 	gamma: F,
-	table_n_vars: usize,
-) -> (Vec<FieldVec<P, A>>, FieldVec<P, A>)
+	tables: &[TableLookup<'_, P>],
+) -> LogupWitnesses<P, A>
 where
 	A: Allocator,
 	F: Field,
 	P: PackedField<Scalar = F>,
 {
-	assert!(!lookers.is_empty(), "at least one looker is required");
-	let n = lookers[0].eval_point.len();
+	assert!(!tables.is_empty(), "at least one table is required");
+	assert!(
+		tables.iter().all(|table| !table.lookers.is_empty()),
+		"every table must have at least one looker"
+	);
 
-	// The scale for looker j is gamma^j.
-	// The powers chain is sequential: each power depends on the last.
-	// So the scales are materialized once here, ahead of the parallel region.
-	let scales = powers(gamma).take(lookers.len()).collect::<Vec<_>>();
-
-	// Build one numerator per looker, fanned out across lookers.
+	// Build one numerator per looker, fanned out across all of them at once.
 	// Why fan out: the per-looker expansion is itself parallel.
 	//   But it under-saturates the machine at moderate n.
 	//   Spreading the lookers over the cores fills them.
 	// The 2^n backing buffers are drawn from `alloc` up front on this thread, so the parallel
-	// region only fills them — no allocator traffic inside the rayon closures.
-	// Invariant: the fill writes results back in looker order (the zip is index-aligned).
-	//   So numerator j stays gamma^j * eq_{r_j}.
-	let packed_len = 1 << n.saturating_sub(P::LOG_WIDTH);
-	let buffers = iter::repeat_with(|| alloc.alloc::<P>(packed_len))
-		.take(lookers.len())
+	// region only fills them — no allocator traffic inside the rayon closures. Lookers may differ
+	// in length, so each buffer is sized to its own looker.
+	//
+	// Within a table, looker `i` is scaled by gamma^i; the same series serves every table, since
+	// the per-table denominator challenges separate them. The powers chain is sequential, so the
+	// scales are materialized once here, ahead of the parallel region.
+	// Invariant: the fill writes results back in the flattened order (the zip is index-aligned).
+	let max_table_lookers = tables
+		.iter()
+		.map(|table| table.lookers.len())
+		.max()
+		.expect("tables is non-empty");
+	let scales = powers(gamma).take(max_table_lookers).collect::<Vec<_>>();
+	let flat = tables
+		.iter()
+		.flat_map(|table| iter::zip(&table.lookers, &scales))
 		.collect::<Vec<_>>();
-	let numerators = (buffers, scales.as_slice(), lookers)
+	let buffers = flat
+		.iter()
+		.map(|(looker, _)| {
+			let packed_len = 1 << looker.eval_point.len().saturating_sub(P::LOG_WIDTH);
+			alloc.alloc::<P>(packed_len)
+		})
+		.collect::<Vec<_>>();
+	let flat_numerators = (buffers, flat.as_slice())
 		.into_par_iter()
-		.map(|(buffer, &scale, looker)| {
-			assert_eq!(
-				looker.eval_point.len(),
-				n,
-				"every looker evaluation point must have the same length"
-			);
+		.map(|(buffer, &(looker, &scale))| {
+			let n = looker.eval_point.len();
 			assert_eq!(
 				looker.index.len(),
 				1 << n,
@@ -91,26 +112,56 @@ where
 				looker.index.len(),
 				1usize << n,
 			);
-			// Looker j's numerator is gamma^j * eq_{r_j}.
-			// Seeding the expansion with gamma^j folds the scale into the tensor product.
+			// Seeding the expansion with the scale folds it into the tensor product.
 			// That keeps it to one pass over one 2^n buffer.
 			scaled_eq_ind_partial_eval_into(looker.eval_point, scale, buffer)
 		})
 		.collect::<Vec<_>>();
 
-	// Scatter every looker's numerator onto the shared table cube, summed into one buffer. The
-	// scatter reads the numerators from rayon tasks, so it borrows them as slices: `Allocator::Vec`
-	// is declared only `Send`, so a numerator cannot be shared across tasks by reference.
-	let numerator_slices = numerators
-		.iter()
-		.map(FieldBuffer::to_ref)
+	// Scatter each table's numerators onto its own cube, summed into one buffer. The scatter reads
+	// the numerators from rayon tasks, so it borrows them as slices: `Allocator::Vec` is declared
+	// only `Send`, so a numerator cannot be shared across tasks by reference.
+	//
+	// The tables are walked one at a time rather than in parallel: each scatter is already parallel
+	// over the looker rows that dominate its cost, and drawing a buffer from `alloc` inside a rayon
+	// task is not available here.
+	//
+	// The scatter reads every index entry into a cube that spans exactly the table.
+	// So it is also where each index is checked to address a real table position.
+	let mut remaining = flat_numerators.as_slice();
+	let mut grouped_slices = Vec::with_capacity(tables.len());
+	for table in tables {
+		let (mine, rest) = remaining.split_at(table.lookers.len());
+		remaining = rest;
+		grouped_slices.push(mine.iter().map(FieldBuffer::as_view).collect::<Vec<_>>());
+	}
+	let pushforwards = iter::zip(tables, &grouped_slices)
+		.map(|(table, numerators)| {
+			let indexes = table
+				.lookers
+				.iter()
+				.map(|looker| looker.index)
+				.collect::<Vec<_>>();
+			combined_pushforward::<A, F, P>(alloc, numerators, &indexes, table.table.log_len())
+		})
 		.collect::<Vec<_>>();
-	let combined = combined_pushforward::<A, F, P>(alloc, &numerator_slices, lookers, table_n_vars);
 
-	(numerators, combined)
+	// Regroup the numerators themselves to match, now that the borrows above are done with.
+	let mut flat_iter = flat_numerators.into_iter();
+	let numerators = tables
+		.iter()
+		.map(|table| {
+			flat_iter
+				.by_ref()
+				.take(table.lookers.len())
+				.collect::<Vec<_>>()
+		})
+		.collect::<Vec<_>>();
+
+	(numerators, pushforwards)
 }
 
-/// Scatter every looker's numerator onto the shared `m`-variable table cube and sum.
+/// Scatter one table's lookers' numerators onto its `m`-variable cube and sum.
 ///
 /// ```text
 ///     Y[v] = sum_j sum_{i : index_j[i] = v} numerator_j[i]
@@ -135,13 +186,13 @@ where
 ///
 /// # Preconditions
 ///
-/// * `numerators` and `lookers` have equal length.
+/// * `numerators` and `indexes` have equal length.
 /// * Each numerator has one entry per row of its looker's index column.
 /// * Every index entry is less than `2^table_n_vars`.
 fn combined_pushforward<A, F, P>(
 	alloc: &A,
 	numerators: &[FieldSlice<'_, P>],
-	lookers: &[Looker<'_, F>],
+	indexes: &[&[usize]],
 	table_n_vars: usize,
 ) -> FieldVec<P, A>
 where
@@ -157,21 +208,23 @@ where
 	// parallel region. Each worker scatters a contiguous chunk of lookers into its own
 	// accumulator; the chunk count is capped at the number of workers (and at the looker count),
 	// so at most one accumulator is allocated per busy core.
+	// A table no looker reads takes no chunk at all; it still needs the one zero accumulator, which
+	// is its honest all-zero pushforward.
 	let n_workers = current_num_threads().clamp(1, n_lookers.max(1));
 	let chunk_size = n_lookers.div_ceil(n_workers).max(1);
 	let mut accumulators = iter::repeat_with(|| vec![F::ZERO; table_size])
-		.take(n_lookers.div_ceil(chunk_size))
+		.take(n_lookers.div_ceil(chunk_size).max(1))
 		.collect::<Vec<_>>();
 
 	(
 		accumulators.par_iter_mut(),
 		numerators.par_chunks(chunk_size),
-		lookers.par_chunks(chunk_size),
+		indexes.par_chunks(chunk_size),
 	)
 		.into_par_iter()
-		.for_each(|(acc, numerator_chunk, looker_chunk)| {
-			for (numerator, looker) in iter::zip(numerator_chunk, looker_chunk) {
-				scatter_add(acc, numerator, looker.index);
+		.for_each(|(acc, numerator_chunk, index_chunk)| {
+			for (numerator, index) in iter::zip(numerator_chunk, index_chunk) {
+				scatter_add(acc, numerator, index);
 			}
 		});
 
@@ -195,6 +248,10 @@ where
 /// ```
 ///
 /// The numerator is read sequentially, so each row is a lane read, not an indexed lookup.
+///
+/// # Panics
+///
+/// Panics if a row indexes past the last table position.
 #[inline]
 fn scatter_add<F, P>(acc: &mut [F], numerator: &FieldSlice<'_, P>, index: &[usize])
 where
@@ -202,8 +259,15 @@ where
 	P: PackedField<Scalar = F>,
 {
 	// Row i's numerator value lands in the table position that row indexes into.
+	//
+	// The accumulator spans exactly the table.
+	// So resolving the slot is the range check on the index column.
+	// That check is the one the write already pays for.
 	for (value, &target) in numerator.iter_scalars().zip(index) {
-		acc[target] += value;
+		let slot = acc
+			.get_mut(target)
+			.expect("every index entry must be less than the size of the table its looker reads");
+		*slot += value;
 	}
 }
 
@@ -246,36 +310,49 @@ where
 	// One denominator per row: c minus the row's embedded index value.
 	// Subtract a full word at a time: one packed subtraction per word, built in parallel straight
 	// into the allocator's buffer.
-	let packed_len = 1 << log_len.saturating_sub(P::LOG_WIDTH);
 	let c_packed = P::broadcast(c);
-	let mut packed = alloc.alloc::<P>(packed_len);
-	packed
-		.spare_capacity_mut()
-		.par_iter_mut()
-		.zip(index.par_chunks(P::WIDTH))
-		.for_each(|(slot, chunk)| {
-			slot.write(c_packed - P::from_scalars(chunk.iter().copied().map(embed_position::<F>)));
-		});
-	// Safety: every packed slot is written exactly once by the parallel loop above.
-	unsafe { packed.set_len(packed_len) };
+	let packed = index
+		.par_chunks(P::WIDTH)
+		.map(|chunk| c_packed - P::from_scalars(chunk.iter().copied().map(embed_position::<F>)))
+		.collect_into_alloc_vec(alloc);
 
 	FieldBuffer::new(log_len, packed)
 }
 
-/// Build the table denominator `c - J` over the `m`-variable table cube.
+/// Build the negated table denominator `J - c` over the `m`-variable table cube.
 ///
-/// Entry `j` is `c - iota(j)`, the logUp denominator for table position `j`.
+/// Entry `j` is `iota(j) - c`. The logUp denominator for table position `j` is `c - iota(j)`; the
+/// table's fraction enters the sum of every instance negated, and carrying that negation on the
+/// denominator rather than the numerator costs nothing here, where the entries are built anyway.
 pub fn table_denominator<A, F, P>(alloc: &A, c: F, table_n_vars: usize) -> FieldVec<P, A>
 where
 	A: Allocator,
 	F: BinaryField<Underlier: Divisible<u64>>,
 	P: PackedField<Scalar = F>,
 {
-	// One denominator per table position: shift the challenge by the position's embedding.
-	let values = (0..1usize << table_n_vars)
-		.map(|j| c - embed_position::<F>(j))
-		.collect::<Vec<_>>();
-	FieldBuffer::from_values_in(alloc, &values)
+	let packed_len = 1 << table_n_vars.saturating_sub(P::LOG_WIDTH);
+	// A table shorter than one packed word occupies only the low lanes of its single word.
+	let live_lanes = P::WIDTH.min(1usize << table_n_vars);
+
+	// Positions sharing a word differ only in the low bits the word index leaves clear.
+	// The embedding is `GF(2)`-linear, so a word is one lane pattern shifted by a single scalar.
+	//
+	//     word w, lane l  ->  iota(w * WIDTH) + (iota(l) - c)
+	//
+	// Invariant: the challenge rides in the lane pattern, not in the shift.
+	// So a short table's dead lanes stay zero: only the first word has them, and its shift is zero.
+	let lanes = P::from_scalars((0..live_lanes).map(|l| embed_position::<F>(l) - c));
+
+	let mut packed = alloc.alloc::<P>(packed_len);
+	// The allocator rounds its blocks up, so the fill is bounded to the words that are entries.
+	let words = &mut packed.spare_capacity_mut()[..packed_len];
+	for (word, slot) in words.iter_mut().enumerate() {
+		slot.write(P::broadcast(embed_position::<F>(word << P::LOG_WIDTH)) + lanes);
+	}
+	// Safety: the loop writes each of the first `packed_len` slots exactly once.
+	unsafe { packed.set_len(packed_len) };
+
+	FieldBuffer::new(table_n_vars, packed)
 }
 
 /// Build the pushforward `Y = I_* eq_r` over the `m`-variable table cube.
@@ -305,7 +382,7 @@ where
 	// One accumulator slot per table position, all starting empty.
 	let mut buckets = vec![F::ZERO; 1usize << table_n_vars];
 	// Add each row's numerator value into the position it indexes into.
-	scatter_add(&mut buckets, &eq_r.to_ref(), index);
+	scatter_add(&mut buckets, &eq_r.as_view(), index);
 	// Repack the scalar accumulator into the packed table buffer.
 	FieldBuffer::from_values(&buckets)
 }
@@ -314,7 +391,7 @@ where
 mod tests {
 	use binius_compute::GlobalAllocator;
 	use binius_field::{
-		Field,
+		Field, PackedField, PackedGhash4x128b,
 		arch::{OptimalB128, OptimalPackedB128},
 	};
 	use binius_math::{
@@ -324,10 +401,15 @@ mod tests {
 	use proptest::prelude::*;
 	use rand::prelude::*;
 
-	use super::{Looker, combined_pushforward, embed_position, looker_denominator, pushforward};
+	use super::{
+		combined_pushforward, embed_position, looker_denominator, pushforward, table_denominator,
+	};
 
 	type F = OptimalB128;
 	type P = OptimalPackedB128;
+	// The optimal packing is one scalar per word at baseline x86-64, where the tests build.
+	// Four scalars to a word is what makes a table shorter than a word possible at all.
+	type Wide = PackedGhash4x128b;
 
 	// An independent single-threaded scatter, the reference the dispatched result must match.
 	fn reference(eq_r: &FieldBuffer<P>, index: &[usize], m: usize) -> Vec<F> {
@@ -394,27 +476,26 @@ mod tests {
 			})
 			.collect::<Vec<_>>();
 
-		// The scatter reads only the index column.
-		// The evaluation point and claim are unused here, so leave them empty.
-		let eval_points = vec![Vec::<F>::new(); n_lookers];
-		let lookers = indices
-			.iter()
-			.zip(&eval_points)
-			.map(|(index, eval_point)| Looker {
-				index,
-				eval_point,
-				eval_claim: F::ZERO,
-			})
-			.collect::<Vec<_>>();
-
+		// The scatter reads only the index columns.
+		let index_slices = indices.iter().map(Vec::as_slice).collect::<Vec<_>>();
 		let numerator_slices = numerators
 			.iter()
-			.map(FieldBuffer::to_ref)
+			.map(FieldBuffer::as_view)
 			.collect::<Vec<_>>();
-		let got = combined_pushforward::<_, F, P>(&GlobalAllocator, &numerator_slices, &lookers, m)
+		let got =
+			combined_pushforward::<_, F, P>(&GlobalAllocator, &numerator_slices, &index_slices, m)
+				.iter_scalars()
+				.collect::<Vec<_>>();
+		assert_eq!(got, combined_reference(&numerators, &indices, m));
+	}
+
+	#[test]
+	fn combined_pushforward_of_no_lookers_is_zero() {
+		// A table no looker reads still needs a pushforward buffer; its honest value is all zeros.
+		let got = combined_pushforward::<_, F, P>(&GlobalAllocator, &[], &[], 3)
 			.iter_scalars()
 			.collect::<Vec<_>>();
-		assert_eq!(got, combined_reference(&numerators, &indices, m));
+		assert_eq!(got, vec![F::ZERO; 8]);
 	}
 
 	#[test]
@@ -482,6 +563,63 @@ mod tests {
 				.iter_scalars()
 				.collect::<Vec<_>>();
 			prop_assert_eq!(got, denominator_reference(c, &index));
+		}
+	}
+
+	// The scalar reference for the table denominator: iota(j) - c per table position.
+	fn table_reference(c: F, table_n_vars: usize) -> Vec<F> {
+		(0..1usize << table_n_vars)
+			.map(|j| embed_position::<F>(j) - c)
+			.collect()
+	}
+
+	// Pins one table shape against the scalar reference, entry by entry and then word by word.
+	fn check_table_denominator<Q>(c: F, table_n_vars: usize)
+	where
+		Q: PackedField<Scalar = F>,
+	{
+		let got = table_denominator::<_, F, Q>(&GlobalAllocator, c, table_n_vars);
+		let want = table_reference(c, table_n_vars);
+
+		assert_eq!(got.iter_scalars().collect::<Vec<_>>(), want);
+
+		// Packing the scalar reference zero-fills a final word the table does not fill.
+		// So the words must agree bit for bit, not just entry by entry.
+		let packed = FieldBuffer::<Q, _>::from_values_in(&GlobalAllocator, &want);
+		assert_eq!(got.iter_packed().collect::<Vec<_>>(), packed.iter_packed().collect::<Vec<_>>());
+
+		// Only the first word can hold lanes past the last position, and they are not entries.
+		let first = *got.iter_packed().next().expect("a buffer holds one word");
+		for lane in first.iter().skip(want.len()) {
+			assert_eq!(lane, F::ZERO);
+		}
+	}
+
+	#[test]
+	fn table_denominator_small_cases() {
+		let c = F::new(7);
+
+		// One entry in a four-lane word, so three lanes are not entries.
+		check_table_denominator::<Wide>(c, 0);
+		// Two entries, so the word is still short.
+		check_table_denominator::<Wide>(c, 1);
+		// Exactly one full word.
+		check_table_denominator::<Wide>(c, 2);
+		// Eight words, so the lane pattern repeats.
+		check_table_denominator::<Wide>(c, 5);
+	}
+
+	proptest! {
+		#![proptest_config(ProptestConfig::with_cases(16))]
+
+		// The range spans below, at, and above the four-lane packing width.
+		#[test]
+		fn table_denominator_matches_reference(seed in any::<u64>(), m in 0usize..=8) {
+			let mut rng = StdRng::seed_from_u64(seed);
+			let c = random_scalars::<F>(&mut rng, 1)[0];
+
+			check_table_denominator::<Wide>(c, m);
+			check_table_denominator::<P>(c, m);
 		}
 	}
 }

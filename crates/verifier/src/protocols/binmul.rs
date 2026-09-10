@@ -1,9 +1,9 @@
 // Copyright 2026 The Binius Developers
 
 use binius_core::word::Word;
-use binius_field::{BinaryField, BinaryField1b, ExtensionField, field::FieldOps};
+use binius_field::{BinaryField, field::FieldOps};
 use binius_ip::{channel::IPVerifierChannel, mlecheck, sumcheck::SumcheckOutput};
-use binius_math::inner_product::inner_product_scalars;
+use binius_math::inner_product::inner_product;
 
 use crate::Error;
 
@@ -15,17 +15,17 @@ use crate::Error;
 /// constraint to per-bit evaluation claims on the six word columns at a common evaluation point
 /// `eval_point` ($r_x \in K^\ell$).
 ///
-/// Each `*_evals` vector holds `Word::BITS` per-bit evaluation claims $\widetilde{z}(r_x, i)$ for
+/// Each `*_evals` array holds `Word::BITS` per-bit evaluation claims $\widetilde{z}(r_x, i)$ for
 /// $i \in \{0, \ldots, 63\}$.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BinMulOutput<F> {
 	pub eval_point: Vec<F>,
-	pub a_lo_evals: Vec<F>,
-	pub a_hi_evals: Vec<F>,
-	pub b_lo_evals: Vec<F>,
-	pub b_hi_evals: Vec<F>,
-	pub c_lo_evals: Vec<F>,
-	pub c_hi_evals: Vec<F>,
+	pub a_lo_evals: [F; Word::BITS],
+	pub a_hi_evals: [F; Word::BITS],
+	pub b_lo_evals: [F; Word::BITS],
+	pub b_hi_evals: [F; Word::BITS],
+	pub c_lo_evals: [F; Word::BITS],
+	pub c_hi_evals: [F; Word::BITS],
 }
 
 /// Verify the binary-field multiplication check (BinMul) reduction.
@@ -69,24 +69,24 @@ where
 	eval_point.reverse();
 
 	// The prover sends the six per-bit evaluation columns at r_x.
-	let a_lo_evals = channel.recv_many(Word::BITS)?;
-	let a_hi_evals = channel.recv_many(Word::BITS)?;
-	let b_lo_evals = channel.recv_many(Word::BITS)?;
-	let b_hi_evals = channel.recv_many(Word::BITS)?;
-	let c_lo_evals = channel.recv_many(Word::BITS)?;
-	let c_hi_evals = channel.recv_many(Word::BITS)?;
+	let a_lo_evals = channel.recv_array::<{ Word::BITS }>()?;
+	let a_hi_evals = channel.recv_array::<{ Word::BITS }>()?;
+	let b_lo_evals = channel.recv_array::<{ Word::BITS }>()?;
+	let b_hi_evals = channel.recv_array::<{ Word::BITS }>()?;
+	let c_lo_evals = channel.recv_array::<{ Word::BITS }>()?;
+	let c_hi_evals = channel.recv_array::<{ Word::BITS }>()?;
 
 	// Precompute the basis-element vectors used to recombine a (lo, hi) per-bit column pair into
 	// the packed field element evaluation alpha = sum_i basis(i) * lo[i] + basis(64 + i) * hi[i].
 	let basis_lo: Vec<C::Elem> = (0..Word::BITS)
-		.map(|i| C::Elem::from(<F as ExtensionField<BinaryField1b>>::basis(i)))
+		.map(|i| C::Elem::from(F::basis(i)))
 		.collect();
 	let basis_hi: Vec<C::Elem> = (0..Word::BITS)
-		.map(|i| C::Elem::from(<F as ExtensionField<BinaryField1b>>::basis(Word::BITS + i)))
+		.map(|i| C::Elem::from(F::basis(Word::BITS + i)))
 		.collect();
 	let recombine = |lo: &[C::Elem], hi: &[C::Elem]| -> C::Elem {
-		inner_product_scalars(lo.iter().cloned(), basis_lo.iter().cloned())
-			+ inner_product_scalars(hi.iter().cloned(), basis_hi.iter().cloned())
+		inner_product(lo.iter().cloned(), basis_lo.iter().cloned())
+			+ inner_product(hi.iter().cloned(), basis_hi.iter().cloned())
 	};
 	let alpha_a = recombine(&a_lo_evals, &a_hi_evals);
 	let alpha_b = recombine(&b_lo_evals, &b_hi_evals);

@@ -272,7 +272,7 @@ impl<F: Field> CircuitBuilder for ConstraintBuilder<F> {
 	type Field = F;
 
 	fn assert_zero(&mut self, wire: Self::Wire) {
-		self.ir.zero_constraints.push(wire.into())
+		self.ir.zero_constraints.push(wire.into());
 	}
 
 	fn assert_eq(&mut self, lhs: Self::Wire, rhs: Self::Wire) {
@@ -731,7 +731,7 @@ impl<F: Field, LayoutRef: Deref<Target = WitnessLayout<F>>> CircuitBuilder
 mod tests {
 	use std::iter::successors;
 
-	use binius_field::{BinaryField128bGhash as B128, Field, PackedField};
+	use binius_field::{Field, Ghash128b as B128, PackedField};
 
 	use super::*;
 

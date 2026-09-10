@@ -12,6 +12,13 @@ use super::{
 };
 use crate::fiat_shamir::{CanSample, CanSampleBits, sample_bits_reader};
 
+/// Largest proof-of-work difficulty the transcript accepts, in bits.
+///
+/// The sampler masks what it returns to 32 bits.
+/// A larger difficulty could not be expressed, and would silently weaken to this one.
+/// A 32-bit grind already costs about four billion hashes, so the cap never binds in practice.
+pub const MAX_GRINDING_BITS: usize = 32;
+
 /// Configuration options for transcript behavior
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -52,9 +59,7 @@ impl<Challenger_: Challenger> VerifierTranscript<Challenger_> {
 			options,
 		}
 	}
-}
 
-impl<Challenger_: Challenger> VerifierTranscript<Challenger_> {
 	pub fn finalize(self) -> Result<(), Error> {
 		if self.combined.buffer.has_remaining() {
 			return Err(Error::TranscriptNotEmpty {
@@ -102,6 +107,35 @@ impl<Challenger_: Challenger> VerifierTranscript<Challenger_> {
 			options: self.options,
 		}
 	}
+
+	/// Checks the proof of work that [`ProverTranscript::grind`] wrote, returning its nonce.
+	///
+	/// Reads the nonce as a message, so the challenger observes the same bytes the prover fed it.
+	/// Then samples `bits` and requires every one of them to be zero.
+	/// Both transcripts consume the same challenger state either way.
+	/// So a caller may keep going after an error without the two sides drifting apart.
+	///
+	/// ## Errors
+	///
+	/// Returns [`Error::InsufficientWork`] when the sampled bits are not all zero.
+	/// Returns a deserialization error when the tape holds no nonce.
+	///
+	/// ## Preconditions
+	///
+	/// * `bits` must be at most 32, which is the width the sampler masks to.
+	pub fn verify_grind(&mut self, bits: usize) -> Result<u64, Error> {
+		assert!(
+			bits <= MAX_GRINDING_BITS,
+			"precondition: bits must be at most {MAX_GRINDING_BITS}"
+		);
+
+		let nonce = self.message().read::<u64>()?;
+		let sampled = CanSampleBits::<u32>::sample_bits(self, bits);
+		if sampled != 0 {
+			return Err(Error::InsufficientWork { bits, sampled });
+		}
+		Ok(nonce)
+	}
 }
 
 // Useful warnings to see if we are neglecting to read any advice or transcript entirely
@@ -111,7 +145,7 @@ impl<Challenger> Drop for VerifierTranscript<Challenger> {
 			tracing::warn!(
 				"Transcript reader is not fully read out: {:?} bytes left",
 				self.combined.buffer.remaining()
-			)
+			);
 		}
 	}
 }
@@ -224,24 +258,7 @@ impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 			options,
 		}
 	}
-}
 
-impl<Challenger_: Default + Challenger> ProverTranscript<Challenger_> {
-	pub fn into_verifier(self) -> VerifierTranscript<Challenger_> {
-		let options = self.options;
-		let transcript = self.finalize();
-
-		VerifierTranscript::with_opts(Challenger_::default(), transcript, options)
-	}
-}
-
-impl<Challenger_: Default + Challenger> Default for ProverTranscript<Challenger_> {
-	fn default() -> Self {
-		Self::new(Challenger_::default())
-	}
-}
-
-impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 	pub fn finalize(self) -> Vec<u8> {
 		let transcript = self.combined.buffer.to_vec();
 
@@ -263,11 +280,8 @@ impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 				let test_name = current_thread.name().unwrap_or("unknown");
 				// Adjust "./" to "../../" to ensure files are saved in the project root rather than
 				// the package root.
-				let path = if let Some(stripped) = path.strip_prefix("./") {
-					format!("../../{stripped}",)
-				} else {
-					path
-				};
+				let rebased = path.strip_prefix("./").map(|s| format!("../../{s}"));
+				let path = rebased.unwrap_or(path);
 				std::fs::create_dir_all(&path)
 					.unwrap_or_else(|_| panic!("Failed to create directories for path: {path}",));
 				format!("{path}/{test_name}.bin")
@@ -283,7 +297,7 @@ impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 		transcript
 	}
 
-	/// Returns a writeable buffer that only observes the data written, without writing it to the
+	/// Returns a writable buffer that only observes the data written, without writing it to the
 	/// proof tape.
 	///
 	/// This method should be used to observe the input statement.
@@ -297,7 +311,7 @@ impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 		}
 	}
 
-	/// Returns a writeable buffer that only writes the data to the proof tape, without observing
+	/// Returns a writable buffer that only writes the data to the proof tape, without observing
 	/// it.
 	///
 	/// This method should only be used to write openings of commitments that were already written
@@ -312,7 +326,7 @@ impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 		}
 	}
 
-	/// Returns a writeable buffer that observes the data written and writes it to the proof tape.
+	/// Returns a writable buffer that observes the data written and writes it to the proof tape.
 	///
 	/// This method should be used by default to write prover messages in an interactive protocol.
 	pub fn message<'a, 'b>(&'a mut self) -> TranscriptWriter<'b, impl BufMut>
@@ -323,6 +337,67 @@ impl<Challenger_: Challenger> ProverTranscript<Challenger_> {
 			buffer: &mut self.combined,
 			options: self.options,
 		}
+	}
+
+	/// Grinds a proof of work into the transcript, returning the nonce it found.
+	///
+	/// Searches for a nonce whose observation drives the next `bits` sampled bits to zero.
+	/// The nonce goes out as a message, and those bits are then sampled so the challenger advances.
+	/// [`VerifierTranscript::verify_grind`] is the matching check.
+	///
+	/// A prover that wants to re-roll whatever challenge comes next must redo this search first.
+	/// Every term derived from that challenge therefore gains `bits` of soundness.
+	/// That is how a protocol buys back a term no query count can touch.
+	///
+	/// The search is the obvious one: try nonces in order until one lands.
+	/// A trial is one challenger observation plus one sample, and lands with probability `2^-bits`.
+	/// The expected cost is therefore `2^bits` trials.
+	/// The search is serial, so a caller pays that in wall clock.
+	///
+	/// ## Preconditions
+	///
+	/// * `bits` must be at most 32, which is the width the sampler masks to.
+	pub fn grind(&mut self, bits: usize) -> u64
+	where
+		Challenger_: Clone,
+	{
+		assert!(
+			bits <= MAX_GRINDING_BITS,
+			"precondition: bits must be at most {MAX_GRINDING_BITS}"
+		);
+
+		// Trial on a clone so a failed nonce leaves the real challenger untouched. Observing the
+		// nonce's little-endian bytes is what `write::<u64>` feeds the challenger, so the two
+		// agree.
+		let mut nonce = 0u64;
+		loop {
+			let mut trial = self.combined.challenger.clone();
+			trial.observer().put_slice(&nonce.to_le_bytes());
+			if sample_bits_reader(trial.sampler(), bits) == 0 {
+				break;
+			}
+			nonce += 1;
+		}
+
+		self.message().write(&nonce);
+		let sampled = CanSampleBits::<u32>::sample_bits(self, bits);
+		debug_assert_eq!(sampled, 0, "the nonce search only exits on a landing nonce");
+		nonce
+	}
+}
+
+impl<Challenger_: Default + Challenger> ProverTranscript<Challenger_> {
+	pub fn into_verifier(self) -> VerifierTranscript<Challenger_> {
+		let options = self.options;
+		let transcript = self.finalize();
+
+		VerifierTranscript::with_opts(Challenger_::default(), transcript, options)
+	}
+}
+
+impl<Challenger_: Default + Challenger> Default for ProverTranscript<Challenger_> {
+	fn default() -> Self {
+		Self::new(Challenger_::default())
 	}
 }
 
@@ -402,7 +477,7 @@ impl<B: BufMut> TranscriptWriter<'_, B> {
 
 	pub fn write_debug(&mut self, msg: &str) {
 		if self.options.debug_assertions {
-			self.write_bytes(msg.as_bytes())
+			self.write_bytes(msg.as_bytes());
 		}
 	}
 
@@ -443,7 +518,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use binius_field::BinaryField128bGhash as B128;
+	use binius_field::Ghash128b as B128;
 	use sha2::Sha256;
 
 	use super::*;
@@ -529,5 +604,80 @@ mod tests {
 			.into_verifier()
 			.message()
 			.read_debug("test_transcript_debug_should_fail");
+	}
+	#[test]
+	fn grinding_round_trips_and_keeps_both_challengers_in_step() {
+		const BITS: usize = 12;
+
+		let mut prover = ProverTranscript::new(HasherChallenger::<Sha256>::default());
+		prover.message().write_scalar(B128::new(7));
+		let nonce = prover.grind(BITS);
+		// A difficulty this high is not met by the first nonce tried, so the search really ran.
+		assert!(nonce > 0);
+		let prover_challenge: B128 = prover.sample();
+
+		let mut verifier = prover.into_verifier();
+		let echoed: B128 = verifier.message().read_scalar().unwrap();
+		assert_eq!(echoed, B128::new(7));
+		assert_eq!(verifier.verify_grind(BITS).unwrap(), nonce);
+
+		// The nonce and its sample advance both challengers identically, so what follows agrees.
+		let verifier_challenge: B128 = verifier.sample();
+		assert_eq!(verifier_challenge, prover_challenge);
+		verifier.finalize().unwrap();
+	}
+
+	#[test]
+	fn zero_difficulty_is_met_by_the_first_nonce() {
+		let mut prover = ProverTranscript::new(HasherChallenger::<Sha256>::default());
+		// Every nonce satisfies an empty condition, so the search stops immediately.
+		assert_eq!(prover.grind(0), 0);
+
+		// It still consumes a sample, which is what keeps the verifier in step.
+		let mut verifier = prover.into_verifier();
+		assert_eq!(verifier.verify_grind(0).unwrap(), 0);
+		verifier.finalize().unwrap();
+	}
+
+	#[test]
+	fn a_tampered_nonce_is_rejected() {
+		const BITS: usize = 12;
+
+		let mut prover = ProverTranscript::new(HasherChallenger::<Sha256>::default());
+		prover.grind(BITS);
+		let mut tape = prover.finalize();
+
+		// Flip a bit of the written nonce. It is the first thing on the tape, and the challenger
+		// observes it, so the sampled bits move off zero.
+		tape[0] ^= 1;
+
+		let mut verifier =
+			VerifierTranscript::new(HasherChallenger::<Sha256>::default(), tape.clone());
+		let err = verifier.verify_grind(BITS).unwrap_err();
+		let Error::InsufficientWork { bits, sampled } = err else {
+			panic!("expected InsufficientWork, got {err:?}");
+		};
+		assert_eq!(bits, BITS);
+		assert_ne!(sampled, 0);
+		// The masked sample never exceeds the difficulty it was masked to.
+		assert!(sampled < 1 << BITS);
+		verifier.finalize().unwrap();
+	}
+
+	#[test]
+	fn an_empty_tape_has_no_nonce_to_read() {
+		let mut verifier = VerifierTranscript::new(HasherChallenger::<Sha256>::default(), vec![]);
+		let err = verifier.verify_grind(8).unwrap_err();
+		let Error::Serialization(inner) = err else {
+			panic!("expected Serialization, got {err:?}");
+		};
+		assert!(matches!(inner, binius_utils::SerializationError::NotEnoughBytes));
+		verifier.finalize().unwrap();
+	}
+
+	#[test]
+	#[should_panic(expected = "bits must be at most 32")]
+	fn a_difficulty_past_the_sampler_width_is_rejected() {
+		ProverTranscript::new(HasherChallenger::<Sha256>::default()).grind(MAX_GRINDING_BITS + 1);
 	}
 }

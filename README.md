@@ -37,14 +37,14 @@ lto = "thin"
 
 ### Running Examples
 
-The `prover/examples/` directory contains example circuits, which you can run using the [CLI framework](https://www.binius.xyz/building/getting-started/cli).
+The `binius-examples` binary carries one subcommand per example circuit, run through the [CLI framework](https://www.binius.xyz/building/getting-started/cli).
 
 For example, to run an example proving a SHA-512 preimage of a fixed-length 65536-byte message:
 
 ```bash
-$ RUSTFLAGS="-Ctarget-cpu=native" cargo run --release --example sha512 prove --message-len 65536
+$ RUSTFLAGS="-Ctarget-cpu=native" cargo run --release -p binius-examples -- sha512 prove --message-len 65536
    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
-     Running `target/release/examples/sha512 prove --message-len 65536`
+     Running `target/release/binius-examples sha512 prove --message-len 65536`
 Building circuit [ 2.99s | 100.00% ]
 
 Setup [ 619.81ms | 100.00% ] { log_inv_rate = 1 }
@@ -62,12 +62,24 @@ variable-length circuit, whose capacity is fixed at build time but whose message
 witness bounded by that capacity:
 
 ```bash
-$ RUSTFLAGS="-Ctarget-cpu=native" cargo run --release --example sha512 prove --max-message-len 131072
+$ RUSTFLAGS="-Ctarget-cpu=native" cargo run --release -p binius-examples -- sha512 prove --max-message-len 131072
 ```
 
-### Enabling multithreading
+### Controlling parallelism
 
-Multithreading using [Rayon](https://github.com/rayon-rs/rayon) is available, but it is disabled by default. This is controlled by the `rayon` Cargo feature. To run an example with multithreading enabled, use `--features rayon`.
+Binius64 uses [Rayon](https://github.com/rayon-rs/rayon) for multithreading and it is always enabled. By default, Rayon uses one worker thread per available CPU core. To pin the number of threads, set the `RAYON_NUM_THREADS` environment variable, or use `taskset` to restrict which CPUs the process can run on:
+
+```bash
+$ RAYON_NUM_THREADS=4 cargo run --release -p binius-examples -- sha512 prove --message-len 65536
+$ taskset -c 0-3 cargo run --release -p binius-examples -- sha512 prove --message-len 65536
+```
+
+Setting `RAYON_NUM_THREADS=1` runs the proof single-threaded, on the calling thread rather than a spawned worker, which keeps call stacks free of worker frames for profiling and debugging.
+
+## Development
+
+For build, test, and lint commands, project terminology, and an index of the project documentation,
+see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Architecture
 
@@ -94,21 +106,12 @@ being listed as a contributor to the repo.
 Binius64 was originally developed by [Irreducible](https://www.irreducible.com), with funding from
 [Bain Capital Crypto](https://baincapitalcrypto.com/) and [Paradigm](https://www.paradigm.xyz/).
 
-## Contributing
+## Acknowledgements
 
-Developers (both human and artificial intelligence) should read the [CONTRIBUTING.md](CONTRIBUTING.md) file before submitting pull requests.
+Binius uses code and ideas from other great free software codebases. We try our best to attribute credit and include copyright notices in code-level documentation. A few notable influences are:
 
-The project welcomes first time contributions from developers who want to learn more about Binius64 and make an impact
-on the open source cryptography community.
-
-If you are new to the project and don't know where to start, you can look for [open issues labeled
-`good first issue`](https://github.com/IrreducibleOSS/binius/issues?q=is%3Aissue+state%3Aopen+label%3A%22good+first+issue%22) or add
-test coverage for existing code. Adding unit tests is a great way to learn how to interact with the codebase, make a
-meaningful contribution, and maybe even find bugs!
-
-On the other hand, _we do not accept typo fix PRs from first-time contributors_. These are not significant enough to
-justify the additional work for maintainers nor any potential benefits, tangible or intangible, one might get from
-being listed as a contributor to the repo.
+- **[Flock](https://github.com/succinctlabs/flock)**. A binary field STARK protocol that builds on Binius64 and contributed significant algorithmic and codegen-level optimizations.
+- **[Plonky3](https://github.com/Plonky3/Plonky3)**. A small-field STARK framework that especially influenced the design of the `binius-field` core traits.
 
 ## Licensing
 

@@ -23,8 +23,9 @@ use binius_spartan_frontend::circuit_builder::CircuitBuilder;
 ///
 /// # Panics
 ///
-/// * If `inputs.len() != <B::Field as ExtensionField<FSub>>::DEGREE`
-/// * If `B::Field::CHARACTERISTIC != 2`
+/// * If `inputs.len() != B::Field::DEGREE`
+///
+/// Instantiating this with a `B::Field` of characteristic other than 2 fails to compile.
 pub fn square_transpose<B: CircuitBuilder, FSub: Field>(
 	builder: &mut B,
 	inputs: &[B::Wire],
@@ -32,13 +33,14 @@ pub fn square_transpose<B: CircuitBuilder, FSub: Field>(
 where
 	B::Field: ExtensionField<FSub>,
 {
-	assert_eq!(
-		B::Field::CHARACTERISTIC,
-		2,
-		"square_transpose gadget is only implemented for characteristic 2"
-	);
+	const {
+		assert!(
+			B::Field::CHARACTERISTIC == 2,
+			"square_transpose gadget is only implemented for characteristic 2"
+		);
+	}
 
-	let degree = <B::Field as ExtensionField<FSub>>::DEGREE;
+	let degree = B::Field::DEGREE;
 	assert_eq!(inputs.len(), degree);
 
 	if degree == 1 {
@@ -57,11 +59,8 @@ where
 		.map(|i| {
 			(0..degree)
 				.map(|j| {
-					let [c] = builder.hint([inputs[i]], move |[x]| {
-						[B::Field::from(
-							<B::Field as ExtensionField<FSub>>::get_base(&x, j),
-						)]
-					});
+					let [c] = builder
+						.hint([inputs[i]], move |[x]| [B::Field::from(B::Field::get_base(&x, j))]);
 					c
 				})
 				.collect::<Vec<_>>()
@@ -103,13 +102,13 @@ fn basis_linear_combination<B: CircuitBuilder, FSub: Field>(
 where
 	B::Field: ExtensionField<FSub>,
 {
-	assert_eq!(scalars.len(), <B::Field as ExtensionField<FSub>>::DEGREE);
+	assert_eq!(scalars.len(), B::Field::DEGREE);
 
 	// basis(0) is always ONE, so the first term is just scalars[0].
 	let mut scalars = scalars.enumerate();
 	let (_, first) = scalars.next().expect("degree must be at least 1");
 	scalars.fold(first, |sum, (j, scalar)| {
-		let basis = builder.constant(<B::Field as ExtensionField<FSub>>::basis(j));
+		let basis = builder.constant(B::Field::basis(j));
 		let term = builder.mul(scalar, basis);
 		builder.add(sum, term)
 	})

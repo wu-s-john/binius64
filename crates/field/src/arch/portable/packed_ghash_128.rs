@@ -8,14 +8,17 @@ use super::{
 	univariate_mul_utils_128::{Underlier128bLanes, spread_bits_64},
 };
 
-/// Widening-multiply wrapper used by the `PackedBinaryGhash1x128b` packing.
+/// Widening-multiply wrapper used by the `PackedGhash1x128b` packing.
 pub type GhashWideMul1x<T> = super::arithmetic::ghash::GhashWideMul<T>;
 
-/// Square wrapper for the `PackedBinaryGhash1x128b` packing: the shared software square.
+/// Square wrapper for the `PackedGhash1x128b` packing: the shared software square.
 pub type GhashSquare1x<T> = super::arithmetic::ghash::GhashSoftMul<T>;
 
-/// Invert wrapper for the `PackedBinaryGhash1x128b` packing: the shared Itoh-Tsujii inversion.
+/// Invert wrapper for the `PackedGhash1x128b` packing: the shared Itoh-Tsujii inversion.
 pub type GhashInvert1x<T> = super::arithmetic::itoh_tsujii::GhashItohTsujii<T>;
+
+/// Scaling wrapper for the `PackedGhash1x128b` packing: the shared lane walk.
+pub type GhashMulX1x<T> = super::arithmetic::ghash::GhashMulX<T>;
 
 // `M128` packs its GHASH 64-bit lanes the same way `u128` does — delegate through `u128`.
 impl Underlier128bLanes for M128 {

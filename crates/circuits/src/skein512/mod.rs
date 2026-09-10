@@ -366,14 +366,20 @@ fn tweak(
 	pos_bytes_hi = circuit.band(pos_bytes_hi, low_bytes_mask);
 
 	let t_low = pos_bytes_lo;
-	let mut t_high = circuit.bor(pos_bytes_hi, circuit.add_constant_64(cfg << 56));
+	// The high word is assembled from bit ranges that do not overlap, so each OR carries nothing
+	// and lowers to a free XOR instead of an AND:
+	//   - `pos_bytes_hi` is masked to bits 0..32, and the type field `cfg << 56` sits in bits
+	//     56..62 (the tweak type field is bits 120..125, i.e. cfg < 64), so the two never share a
+	//     bit;
+	//   - the first and final flags own bits 62 and 63, which the type field leaves clear.
+	let mut t_high = circuit.bxor(pos_bytes_hi, circuit.add_constant_64(cfg << 56));
 
 	if is_first {
-		t_high = circuit.bor(t_high, circuit.add_constant_64(1 << 62));
+		t_high = circuit.bxor(t_high, circuit.add_constant_64(1 << 62));
 	}
 
 	if is_final {
-		t_high = circuit.bor(t_high, circuit.add_constant_64(1 << 63));
+		t_high = circuit.bxor(t_high, circuit.add_constant_64(1 << 63));
 	}
 
 	(t_low, t_high)
@@ -503,7 +509,6 @@ impl Threefish512Block {
 
 #[cfg(test)]
 mod tests {
-	use binius_core::verify::verify_constraints;
 	use binius_frontend::CircuitBuilder;
 
 	use super::*;
@@ -525,7 +530,7 @@ mod tests {
 
 		circuit.populate_wire_witness(&mut w).unwrap();
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &w.into_value_vec()).unwrap();
+		cs.verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -620,7 +625,7 @@ mod tests {
 
 			let cs = built_circuit.constraint_system();
 
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -686,7 +691,7 @@ mod tests {
 
 			let cs = built_circuit.constraint_system();
 
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -782,7 +787,7 @@ mod tests {
 
 			let cs = built_circuit.constraint_system();
 
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -848,7 +853,7 @@ mod tests {
 
 			let cs = built_circuit.constraint_system();
 
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -893,7 +898,7 @@ mod tests {
 			built_circuit.populate_wire_witness(&mut witness).unwrap();
 
 			let cs = built_circuit.constraint_system();
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -959,7 +964,7 @@ mod tests {
 
 			let cs = built_circuit.constraint_system();
 
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 
@@ -1035,7 +1040,7 @@ mod tests {
 			built_circuit.populate_wire_witness(&mut witness).unwrap();
 
 			let cs = built_circuit.constraint_system();
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -1133,7 +1138,7 @@ mod tests {
 			built_circuit.populate_wire_witness(&mut witness).unwrap();
 
 			let cs = built_circuit.constraint_system();
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}
@@ -1205,7 +1210,7 @@ mod tests {
 			built_circuit.populate_wire_witness(&mut witness).unwrap();
 
 			let cs = built_circuit.constraint_system();
-			verify_constraints(cs, &witness.into_value_vec())
+			cs.verify(&witness.into_value_vec())
 				.unwrap_or_else(|_| panic!("Constraints verification failed for {}", description));
 		}
 	}

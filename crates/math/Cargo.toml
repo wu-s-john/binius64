@@ -18,7 +18,6 @@ rand.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-assert_matches.workspace = true
 binius-math = { path = ".", features = ["test-utils"] }
 criterion.workspace = true
 proptest.workspace = true
@@ -28,7 +27,6 @@ rstest.workspace = true
 [features]
 default = []
 test-utils = []
-rayon = ["binius-utils/rayon"]
 
 [lib]
 bench = false
@@ -51,4 +49,8 @@ harness = false
 
 [[bench]]
 name = "eq_ind_partial_eval"
+harness = false
+
+[[bench]]
+name = "reed_solomon"
 harness = false

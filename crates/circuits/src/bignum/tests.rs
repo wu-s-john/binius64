@@ -2,7 +2,7 @@
 // Copyright 2025 Irreducible Inc.
 use std::iter::repeat_with;
 
-use binius_core::{verify::verify_constraints, word::Word};
+use binius_core::word::Word;
 use binius_frontend::{CircuitBuilder, WitnessFiller};
 use num_integer::Integer;
 use proptest::prelude::*;
@@ -21,7 +21,7 @@ use super::{num_biguint_from_u64_limbs as from_u64_limbs, *};
 ///
 /// # Returns
 /// The `BigUint` value as a `num_biguint::BigUint`
-pub fn biguint_to_num_biguint(w: &WitnessFiller, biguint: &BigUint) -> num_bigint::BigUint {
+pub fn biguint_to_num_biguint(w: &WitnessFiller<'_>, biguint: &BigUint) -> num_bigint::BigUint {
 	let limb_vals: Vec<_> = biguint.limbs.iter().map(|&l| w[l].as_u64()).collect();
 	from_u64_limbs(&limb_vals)
 }
@@ -97,7 +97,7 @@ fn test_textbook_mul_single_case() {
 	}
 
 	// Verify all constraints are satisfied
-	verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+	cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 }
 
 #[test]
@@ -107,6 +107,11 @@ fn test_karatsuba_sqr_single_case() {
 	let n = 64;
 	let a = BigUint::new_witness(&builder, n);
 	let mul = karatsuba_mul(&builder, &a, &a);
+
+	// Nothing else reads these limbs, so pin them or pooling could reclaim their slots first.
+	for &limb in &mul.limbs {
+		builder.force_commit(limb);
+	}
 
 	let cs = builder.build();
 	let mut w = cs.new_witness_filler();
@@ -196,7 +201,7 @@ fn test_prime_field() {
 	let mut w = cs.new_witness_filler();
 
 	cs.populate_wire_witness(&mut w).unwrap();
-	verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+	cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 }
 
 #[test]
@@ -256,7 +261,7 @@ fn test_prime_field_div() {
 	let mut w = cs.new_witness_filler();
 
 	cs.populate_wire_witness(&mut w).unwrap();
-	verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+	cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 }
 
 proptest! {
@@ -306,7 +311,7 @@ proptest! {
 			);
 		}
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -320,6 +325,11 @@ proptest! {
 		let b = BigUint::new_inout(&builder, b_limbs.len());
 
 		let result = textbook_mul(&builder, &a, &b);
+
+		// Nothing else reads these limbs, so pin them or pooling could reclaim their slots first.
+		for &limb in &result.limbs {
+			builder.force_commit(limb);
+		}
 
 		let cs = builder.build();
 		let mut w = cs.new_witness_filler();
@@ -344,7 +354,7 @@ proptest! {
 			"Multiplication failed: {a_big} * {b_big} = {result_big} (expected {expected})"
 		);
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -353,6 +363,11 @@ proptest! {
 
 		let a = BigUint::new_witness(&builder, a_limbs.len());
 		let result = textbook_square(&builder, &a);
+
+		// Nothing else reads these limbs, so pin them or pooling could reclaim their slots first.
+		for &limb in &result.limbs {
+			builder.force_commit(limb);
+		}
 
 		let cs = builder.build();
 
@@ -373,7 +388,7 @@ proptest! {
 			"Squaring failed: {a_big}^2 = {result_big} (expected {expected})"
 		);
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -394,6 +409,10 @@ proptest! {
 		let lt_flag = biguint_lt(&builder, &a, &b);
 		let eq_flag = biguint_eq(&builder, &a, &b);
 
+		// Nothing else reads these, so pin them or pooling could reclaim their slots first.
+		builder.force_commit(lt_flag);
+		builder.force_commit(eq_flag);
+
 		let cs = builder.build();
 		let mut w = cs.new_witness_filler();
 
@@ -410,7 +429,7 @@ proptest! {
 		let eq_flag_big = from_u64_limbs(&a_vals) == from_u64_limbs(&b_vals);
 		assert!(eq_flag_big == (eq_flag_wire >> 63 == Word::ONE));
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -421,6 +440,11 @@ proptest! {
 
 		let square_result = textbook_square(&builder, &a);
 		let mul_result = textbook_mul(&builder, &a, &a);
+
+		// Nothing else reads these limbs, so pin them or pooling could reclaim their slots first.
+		for &limb in square_result.limbs.iter().chain(&mul_result.limbs) {
+			builder.force_commit(limb);
+		}
 
 		let cs = builder.build();
 		let mut w = cs.new_witness_filler();
@@ -436,7 +460,7 @@ proptest! {
 
 		assert_eq!(square_big, mul_big, "square(a) != mul(a,a): {square_big} != {mul_big}");
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -457,7 +481,7 @@ proptest! {
 		}
 
 		cs.populate_wire_witness(&mut w).unwrap();
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -516,7 +540,7 @@ proptest! {
 		b.populate_limbs(&mut w, &b_vals);
 
 		cs.populate_wire_witness(&mut w).unwrap();
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -568,7 +592,7 @@ proptest! {
 			"ModReduce failed: {a_big} != {quotient_big} * {modulus_big} + {remainder_big}"
 		);
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -656,6 +680,6 @@ proptest! {
 
 		cs.populate_wire_witness(&mut w).unwrap();
 
-		verify_constraints(cs.constraint_system(), &w.into_value_vec()).unwrap();
+		cs.constraint_system().verify(&w.into_value_vec()).unwrap();
 	}
 }

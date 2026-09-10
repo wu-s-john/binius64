@@ -1,6 +1,7 @@
 // Copyright 2023-2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
+use binius_compute::BufferData;
 use binius_field::{Field, PackedField, WideMul};
 use binius_ip::sumcheck::RoundCoeffs;
 use binius_math::{FieldBuffer, multilinear::fold::fold_highest_var_inplace};
@@ -8,11 +9,8 @@ use binius_utils::{bitwise::Bitwise, rayon::prelude::*};
 use itertools::izip;
 
 use super::{
-	common::SumcheckProver,
-	eq_tracker::ChunkedEqTracker,
-	round_evals::{RoundEvals2, WideRoundEvals2},
-	round_state::RoundState,
-	switchover::BinarySwitchover,
+	common::SumcheckProver, eq_tracker::ChunkedEqTracker, round_evals::RoundEvals,
+	round_state::RoundState, switchover::BinarySwitchover,
 };
 
 pub struct Claim<F: Field> {
@@ -33,15 +31,17 @@ pub struct Claim<F: Field> {
 /// switchover. See `BinarySwitchover` for more in-depth explanation of the mechanism. Also note
 /// that the need to expand the equality indicator for each multilinear still results in some
 /// blowup.
-pub struct SelectorMlecheckProver<'b, P: PackedField, B: Bitwise> {
+pub struct SelectorMlecheckProver<'b, P: PackedField, B: Bitwise, Data: BufferData<P> = Vec<P>> {
 	last_coeffs_or_sums: RoundState<Vec<RoundCoeffs<P::Scalar>>, Vec<P::Scalar>>,
-	selected: FieldBuffer<P>,
+	selected: FieldBuffer<P, Data>,
 	eq_trackers: Vec<ChunkedEqTracker<P>>,
 	weights: Vec<P::Scalar>,
 	switchover: BinarySwitchover<'b, P, B>,
 }
 
-impl<'b, F: Field, P: PackedField<Scalar = F>, B: Bitwise> SelectorMlecheckProver<'b, P, B> {
+impl<'b, F: Field, P: PackedField<Scalar = F>, B: Bitwise, Data: BufferData<P>>
+	SelectorMlecheckProver<'b, P, B, Data>
+{
 	/// Constructs a prover, given `bitmasks` as representation of 1-bit columns, `selected` being
 	/// the shared large field multilinear, individual `claims` per selector, `weights` to combine
 	/// the per-selector round polynomials into one (one weight per claim), and `switchover` as the
@@ -51,7 +51,7 @@ impl<'b, F: Field, P: PackedField<Scalar = F>, B: Bitwise> SelectorMlecheckProve
 	/// per-selector claims. Supplying the equality-indicator tensor `eq_k(γ, ·)` as the weights
 	/// batches the claims with `eq_k(γ, i)`.
 	pub fn new(
-		selected: FieldBuffer<P>,
+		selected: FieldBuffer<P, Data>,
 		claims: Vec<Claim<F>>,
 		bitmasks: &'b [B],
 		weights: Vec<F>,
@@ -95,34 +95,15 @@ impl<'b, F: Field, P: PackedField<Scalar = F>, B: Bitwise> SelectorMlecheckProve
 	}
 }
 
-impl<'b, F, P, B> SumcheckProver<F> for SelectorMlecheckProver<'b, P, B>
+impl<'b, F, P, B, Data> SumcheckProver<F> for SelectorMlecheckProver<'b, P, B, Data>
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
 	B: Bitwise,
+	Data: BufferData<P>,
 {
 	fn n_vars(&self) -> usize {
 		self.selected.log_len()
-	}
-
-	fn n_claims(&self) -> usize {
-		// The per-selector claims are combined into a single weighted claim.
-		1
-	}
-
-	fn round_claim(&self) -> Vec<F> {
-		let per_claim: Vec<F> = match &self.last_coeffs_or_sums {
-			RoundState::Claim(sums) => sums.clone(),
-			// This prover has a separate evaluation point per claim, so each round polynomial is
-			// interpolated against its own coordinate.
-			RoundState::Coeffs(coeffs) => izip!(coeffs, &self.eq_trackers)
-				.map(|(coeffs, eq_tracker)| {
-					coeffs.lerp_over_endpoints(eq_tracker.next_coordinate())
-				})
-				.collect(),
-		};
-		// Combine the per-claim values into the single weighted claim `Σ_i weights[i] · m_i`.
-		vec![izip!(per_claim, &self.weights).map(|(m, &w)| m * w).sum()]
 	}
 
 	fn execute(&mut self) -> Vec<RoundCoeffs<F>> {
@@ -146,19 +127,21 @@ where
 			.unwrap_or_default();
 		let chunk_count = 1 << (self.n_vars() - 1 - chunk_vars);
 
+		// The fold below reads both halves concurrently from many rayon tasks.
+		// Borrowed halves cross that boundary for any backing store the buffer is built on.
+		let (selected_0, selected_1) = self.selected.split_half();
+
 		let packed_prime_evals = (0..chunk_count)
 			.into_par_iter()
 			.fold(
 				|| {
 					(
-						vec![RoundEvals2::default(); sums.len()],
+						vec![RoundEvals::<P, 2>::default(); sums.len()],
 						FieldBuffer::<P>::zeros(chunk_vars),
 						FieldBuffer::<P>::zeros(chunk_vars),
 					)
 				},
 				|(mut packed_prime_evals, mut binary_chunk_0, mut binary_chunk_1), chunk_index| {
-					let (selected_0, selected_1) = self.selected.split_half_ref();
-
 					let selected_0_chunk = selected_0.chunk(chunk_vars, chunk_index);
 					let selected_1_chunk = selected_1.chunk(chunk_vars, chunk_index);
 
@@ -186,7 +169,8 @@ where
 						// at the end of the chunk. Only the final multiply by `eq_i` is widened;
 						// the `composition` product is reduced as usual because it feeds into that
 						// widening multiply.
-						let mut chunk_wide = WideRoundEvals2::<<P as WideMul>::Output>::default();
+						let mut wide_y_1 = <P as WideMul>::Output::default();
+						let mut wide_y_inf = <P as WideMul>::Output::default();
 						for (&eq_i, &selected_0_i, &selected_1_i, &selector_0_i, &selector_1_i) in izip!(
 							eq_chunk.as_ref(),
 							selected_0_chunk.as_ref(),
@@ -202,10 +186,10 @@ where
 							// @inf: selector * selected (note that lower degree terms are dropped)
 							let y_1_prod = selector_1_i * (selected_1_i - P::one()) + P::one();
 							let y_inf_prod = selector_inf_i * selected_inf_i;
-							chunk_wide.y_1 += P::wide_mul(eq_i, y_1_prod);
-							chunk_wide.y_inf += P::wide_mul(eq_i, y_inf_prod);
+							wide_y_1 += P::wide_mul(eq_i, y_1_prod);
+							wide_y_inf += P::wide_mul(eq_i, y_inf_prod);
 						}
-						let chunk_round_evals = chunk_wide.reduce::<P>();
+						let chunk_round_evals = RoundEvals([wide_y_1, wide_y_inf]).reduce::<P>();
 
 						// Apply the common factor from the outer product representation of the eq
 						// ind
@@ -216,10 +200,11 @@ where
 				},
 			)
 			.map(|(evals, _, _)| evals)
-			.reduce(
-				|| vec![RoundEvals2::<P>::default(); sums.len()],
-				|lhs, rhs| izip!(lhs, rhs).map(|(l, r)| l + &r).collect(),
-			);
+			// A merge seeded with a partial that already exists never touches a buffer of zeros.
+			// An identity would allocate and zero one accumulator per merge, then add all of it.
+			.reduce_with(|lhs, rhs| izip!(lhs, rhs).map(|(l, r)| l + &r).collect())
+			// An empty hypercube yields no partials at all, and its round evals are zero.
+			.unwrap_or_else(|| vec![RoundEvals::<P, 2>::default(); sums.len()]);
 
 		// This prover has multiple evaluation points and cannot implement MleCheckProver.
 		let (prime_coeffs, round_coeffs) = izip!(&self.eq_trackers, sums, packed_prime_evals)
@@ -280,10 +265,10 @@ where
 mod tests {
 	use std::iter::repeat_with;
 
-	use binius_field::{FieldOps, Random};
+	use binius_field::FieldOps;
 	use binius_ip::sumcheck::verify;
 	use binius_math::{
-		multilinear::{eq::eq_ind, evaluate::evaluate as multilinear_evaluate},
+		multilinear::{eq::eq_ind, evaluate::evaluate},
 		test_utils::{Packed128b, random_scalars},
 	};
 	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
@@ -337,7 +322,7 @@ mod tests {
 				let masked = izip!(&selected_scalars, selector_scalars)
 					.map(|(&selected, &selector)| selected * selector + (F::ONE - selector))
 					.collect_vec();
-				let value = multilinear_evaluate(&FieldBuffer::<P>::from_values(&masked), point);
+				let value = evaluate(&FieldBuffer::<P>::from_values(&masked), point);
 				Claim {
 					point: point.clone(),
 					value,
@@ -390,20 +375,13 @@ mod tests {
 
 		// The claimed evaluations must match direct evaluation of the multilinears at the challenge
 		// point.
-		assert_eq!(
-			selected_eval,
-			multilinear_evaluate(&selected, &reduced_point),
-			"selected evaluation"
-		);
+		assert_eq!(selected_eval, evaluate(&selected, &reduced_point), "selected evaluation");
 		for (i, (&selector_eval, selector_scalars)) in
 			izip!(selector_evals, &selector_columns).enumerate()
 		{
 			assert_eq!(
 				selector_eval,
-				multilinear_evaluate(
-					&FieldBuffer::<P>::from_values(selector_scalars),
-					&reduced_point
-				),
+				evaluate(&FieldBuffer::<P>::from_values(selector_scalars), &reduced_point),
 				"selector {i} evaluation"
 			);
 		}
@@ -420,50 +398,5 @@ mod tests {
 			expected_eval, sumcheck_output.eval,
 			"reduced sumcheck claim must match the composition evaluated at the challenge point"
 		);
-	}
-
-	// `round_claim` must return the same value before and after `execute()`. This prover has a
-	// distinct evaluation point per claim, so it exercises the per-claim coordinate path.
-	#[test]
-	fn test_round_claim_per_claim_coordinate() {
-		let mut rng = StdRng::seed_from_u64(1);
-		let n_vars = 6;
-		let selector_count = 3;
-
-		let selector_mask = (1u16 << selector_count) - 1;
-		let bitmasks = repeat_with(|| rng.random::<u16>() & selector_mask)
-			.take(1 << n_vars)
-			.collect_vec();
-		let selected_scalars = random_scalars::<F>(&mut rng, 1 << n_vars);
-		let selected = FieldBuffer::<P>::from_values(&selected_scalars);
-
-		let claims = (0..selector_count)
-			.map(|i| {
-				let selector_scalars = bitmasks
-					.iter()
-					.map(|b| if (b >> i) & 1 == 1 { F::ONE } else { F::ZERO })
-					.collect_vec();
-				// The composition is `selected * selector + (1 - selector)`.
-				let masked = izip!(&selected_scalars, &selector_scalars)
-					.map(|(&selected, &selector)| selected * selector + (F::ONE - selector))
-					.collect_vec();
-				let masked = FieldBuffer::<P>::from_values(&masked);
-				let point = random_scalars::<F>(&mut rng, n_vars);
-				let value = multilinear_evaluate(&masked, &point);
-				Claim { point, value }
-			})
-			.collect_vec();
-
-		let weights = random_scalars::<F>(&mut rng, selector_count);
-		let mut prover = SelectorMlecheckProver::new(selected, claims, &bitmasks, weights, 0);
-
-		for _ in 0..n_vars {
-			// The claim recovered from the round coefficients (post-execute, via lerp against each
-			// claim's coordinate) must equal the stored claim (pre-execute).
-			let before = prover.round_claim();
-			let _ = prover.execute();
-			assert_eq!(prover.round_claim(), before, "claim recovered from coeffs");
-			prover.fold(F::random(&mut rng));
-		}
 	}
 }

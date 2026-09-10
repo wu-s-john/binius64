@@ -1,12 +1,15 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use std::ops::Deref;
+use std::{marker::PhantomData, ops::Deref};
 
 use binius_compute::{Allocator, BufferPool, VecLike};
-use binius_core::{constraint_system::ConstraintSystem, word::Word};
-use binius_field::{AESTowerField8b as B8, Field, PackedField};
-use binius_hash::StdHashSuite;
+use binius_core::{
+	constraint_system::{ConstraintSystem, InoutSegment, ValueTable},
+	word::Word,
+};
+use binius_field::{Field, PackedField, Rijndael8b as B8};
+use binius_hash_prover::ParallelHashSuite;
 use binius_iop_prover::{basefold::compiler::BaseFoldProverCompiler, channel::IOPProverChannel};
 use binius_ip_prover::sumcheck::{
 	MleToSumCheckEvaluator,
@@ -17,45 +20,39 @@ use binius_ip_prover::sumcheck::{
 };
 use binius_m4_verifier::{IOPVerifier, Verifier};
 use binius_math::{
-	BinarySubspace, FieldBuffer, FieldVec,
+	BinarySubspace,
 	inner_product::inner_product,
 	multilinear::eq::eq_ind_partial_eval_scalars,
-	ntt::{NeighborsLastMultiThread, domain_context::GenericPreExpanded},
-	univariate::lagrange_evals_scalars,
+	ntt::{NeighborsLastMultiThread, domain_context::GaoMateerPreExpanded},
+	univariate::EvaluationDomain,
 };
 use binius_prover::{
-	and_reduction,
-	fold_word::fold_words,
 	protocols::{
-		binmul, intmul,
-		shift::{KeyCollection, OperatorData, build_key_collection},
+		binmul, bitand, intmul,
+		shift::{KeyCollection, OperatorClaims, OperatorData},
 	},
 	ring_switch::{self, RingSwitchOutput},
 };
 use binius_transcript::{ProverTranscript, fiat_shamir::Challenger};
-use binius_utils::{
-	checked_arithmetics::checked_log_2,
-	rayon::{prelude::*, task_size::IndexedParallelIteratorExt},
-};
+use binius_utils::SerializeBytes;
 use binius_verifier::{
 	config::B128,
 	protocols::{
-		binmul::BinMulOutput,
 		bitand::AndCheckOutput,
-		intmul::IntMulOutput,
-		shift::{BINMUL_ARITY, BITAND_ARITY, INTMUL_ARITY},
+		shift::{BINMUL_ARITY, BITAND_ARITY, INTMUL_ARITY, ZERO_ARITY},
 		zero,
 	},
 };
+use digest::Output;
 
 use crate::{
-	ValueTable,
-	operand_witness::build_operation_columns,
-	shift::{fold_instances, prove as prove_shift},
+	shift::prove as prove_shift,
+	value_table::pack_table,
+	witness::{FoldedWitness, OperandColumns},
 };
 
 /// The multithreaded additive NTT used to encode the committed codeword.
-type ProverNtt = NeighborsLastMultiThread<GenericPreExpanded<B128>>;
+pub(crate) type ProverNtt = NeighborsLastMultiThread<GaoMateerPreExpanded<B128>>;
 
 /// IOP prover for the M4 constraint reduction of a particular constraint system.
 ///
@@ -64,7 +61,8 @@ type ProverNtt = NeighborsLastMultiThread<GenericPreExpanded<B128>>;
 /// [`Prover`] instead, which wraps this with a BaseFold compiler.
 ///
 /// Proving composes the commitment, the reduction, and the ring-switching opening on one
-/// transcript, mirroring [`IOPVerifier::verify`](binius_m4_verifier::IOPVerifier::verify):
+/// transcript, mirroring
+/// [`IOPVerifier::verify_chip`](binius_m4_verifier::IOPVerifier::verify_chip):
 /// - Pack the table into one B128 multilinear and commit it as the trace oracle.
 /// - Run the AND-check and shift reduction to a claim about the instance-folded witness.
 /// - Ring-switch that claim onto the committed trace and open it.
@@ -112,23 +110,28 @@ impl IOPProver {
 	/// channel.
 	///
 	/// This is the core proving logic, independent of the specific IOP compilation strategy. For
-	/// most users, [`Prover::prove`] is the simpler interface.
-	pub fn prove<P, Channel, A>(&self, table: &ValueTable, channel: &mut Channel, alloc: &A)
-	where
+	/// most users, [`Prover::prove_chip`] is the simpler interface.
+	pub fn prove_chip<P, Channel, A, Data>(
+		&self,
+		table: &ValueTable<Data>,
+		channel: &mut Channel,
+		alloc: &A,
+	) where
 		P: PackedField<Scalar = B128>,
 		Channel: IOPProverChannel<P, A>,
 		A: Allocator,
+		Data: Deref<Target = [Word]>,
 	{
 		let cs = &self.cs;
 
 		// Pack the 2-D table into one multilinear and commit it as the trace oracle.
 		let trace_packed = {
 			let _scope = tracing::debug_span!("Prepare trace").entered();
-			table.pack::<P, _>(alloc)
+			pack_table::<P, _, _>(table, alloc)
 		};
 		let trace_oracle = {
 			let _scope = tracing::debug_span!("Commit trace").entered();
-			channel.send_oracle(trace_packed.to_ref())
+			channel.send_oracle(trace_packed.as_view())
 		};
 
 		// One base domain shared by the AND-check and the shift, consistent by construction.
@@ -149,7 +152,7 @@ impl IOPProver {
 		// Its per-bit operand evaluations are bound to the transcript here.
 		// BitAnd then draws the univariate challenge that collapses them.
 		// Committing them first stops a malicious prover choosing them as a function of that
-		// challenge. Do not reorder these, and keep the same order in `IOPVerifier::verify`.
+		// challenge. Do not reorder these, and keep the same order in `IOPVerifier::verify_chip`.
 		//
 		// The columns are the four operands of every constraint over every instance, laid out
 		// constraint-major.
@@ -158,13 +161,12 @@ impl IOPProver {
 		let mul = (!cs.imul_constraints.is_empty()).then(|| {
 			let columns = {
 				let _scope = tracing::debug_span!("Assemble IntMul witness").entered();
-				build_operation_columns(table, &cs.constants, &cs.imul_constraints, alloc)
+				OperandColumns::build(table, &cs.constants, &cs.imul_constraints, alloc)
 			};
-			// `build_operation_columns` rounds the constraint axis up to a power of two and
-			// zero-fills the tail, and the table holds `2^log_instances` instances, so every column
-			// has the power-of-two length the IntMul witness requires.
-			let output = intmul::prove::<_, _, P, _>(column_slices(&columns), channel, alloc)
-				.expect("the operand columns are equal-length and power-of-two length");
+			// The columns are built together from one constraint slice, so they are equal-length —
+			// the only shape IntMul requires. It rounds the constraint axis up itself.
+			let output = intmul::prove::<_, _, P, _>(columns.as_slices(), channel, alloc)
+				.expect("the operand columns are equal-length");
 			(columns, output)
 		});
 
@@ -174,7 +176,7 @@ impl IOPProver {
 		// SOUNDNESS: the BinMul check runs after the IntMul check and before the BitAnd check
 		// below. Its per-bit operand evaluations are bound to the transcript here, before BitAnd
 		// draws the univariate challenge that collapses them. Do not reorder these, and keep the
-		// same order in `IOPVerifier::verify`.
+		// same order in `IOPVerifier::verify_chip`.
 		//
 		// The six columns are the `(lo, hi)` word pairs of the two multiplicands and the product of
 		// every constraint over every instance, laid out constraint-major. They are kept alongside
@@ -184,9 +186,9 @@ impl IOPProver {
 		let bmul = (!cs.bmul_constraints.is_empty()).then(|| {
 			let columns = {
 				let _scope = tracing::debug_span!("Assemble BinMul witness").entered();
-				build_operation_columns(table, &cs.constants, &cs.bmul_constraints, alloc)
+				OperandColumns::build(table, &cs.constants, &cs.bmul_constraints, alloc)
 			};
-			let output = binmul::prove::<_, B128, P, _>(column_slices(&columns), channel, alloc);
+			let output = binmul::prove::<_, B128, P, _>(columns.as_slices(), channel, alloc);
 			(columns, output)
 		});
 
@@ -205,36 +207,17 @@ impl IOPProver {
 		) = {
 			let _scope = tracing::debug_span!("BitAnd check").entered();
 
-			let [a, b] = {
+			let columns = {
 				let _scope = tracing::debug_span!("Assemble BitAnd witness").entered();
-				build_operation_columns(table, &cs.constants, &cs.and_constraints, alloc)
+				OperandColumns::build(table, &cs.constants, &cs.and_constraints, alloc)
 			};
-			// Reduce over borrowed columns so the owned `a`/`b` can be moved into `and_columns`
-			// afterward, avoiding a full clone. Nothing touches the channel between the reduction
-			// and building `and_columns`, so the transcript is unchanged.
-			let output = and_reduction::prove::<_, B128, P, _, _>([&a[..], &b[..]], channel, alloc);
-			let and_columns = (mul.is_some() || bmul.is_some()).then(|| {
-				// The re-randomization re-reads the three BitAnd operand columns.
-				// Only `A` and `B` are stored.
-				// On a satisfying witness `C = A & B` holds word-by-word.
-				// So `C` is materialized here, on this multiplication-only path.
-				// The multizip truncates to the shortest of its three sides, so `set_len(n_rows)`
-				// below is sound only because the two source columns have equal length.
-				debug_assert_eq!(a.len(), b.len());
-				let n_rows = a.len();
-				let mut c_column = alloc.alloc::<Word>(n_rows);
-				// One conjunction per item is a single instruction.
-				// The cost is streaming three word columns, two read and one written.
-				(&a[..], &b[..], c_column.spare_capacity_mut())
-					.into_par_iter()
-					.with_min_task_bytes::<[Word; 3]>()
-					.for_each(|(&a_i, &b_i, out)| {
-						out.write(a_i & b_i);
-					});
-				// Safety: every entry of `c_column` is written exactly once in the loop above.
-				unsafe { c_column.set_len(n_rows) };
-				[a, b, c_column]
-			});
+			// Reduce over borrowed columns so the owned ones can be reused below without a clone.
+			// Nothing touches the channel between the reduction and the derivation, so the
+			// transcript is unchanged.
+			let output = bitand::prove::<_, B128, P, _, _>(columns.as_slices(), channel, alloc);
+			// The re-randomization re-reads all three columns, so derive the third only there.
+			let and_columns =
+				(mul.is_some() || bmul.is_some()).then(|| columns.with_derived_and(alloc));
 			(and_columns, output)
 		};
 
@@ -243,10 +226,10 @@ impl IOPProver {
 		let (r_rho_and, r_x_and) = eval_point.split_at(table.log_instances());
 
 		// The Zero reduction's claim, at the constraint half of the AND-check output point. See
-		// `IOPVerifier::verify` for why it skips the re-randomization below.
+		// `IOPVerifier::verify_chip` for why it skips the re-randomization below.
 		let log_n_zero = cs.log_zero_constraints().unwrap_or(0);
 		let zero_data = OperatorData {
-			evals: vec![B128::ZERO],
+			evals: [B128::ZERO],
 			r_zhat_prime: z_challenge,
 			r_x_prime: zero::reduction_point(r_x_and, log_n_zero, || channel.sample()),
 		};
@@ -255,60 +238,60 @@ impl IOPProver {
 		//
 		// The re-randomization runs whenever IntMul or BinMul is present: BitAnd always enters,
 		// plus each present multiplication operation, all unified onto one shared `r_rho`.
-		let (r_rho, bitand_data, intmul_data, binmul_data) = if mul.is_some() || bmul.is_some() {
+		let (r_rho, claims) = if mul.is_some() || bmul.is_some() {
 			// Every present operation enters the re-randomization as operand columns with their
 			// oblong claims at their own instance point.
 			// BitAnd is already oblong.
 			// IntMul and BinMul are collapsed from their per-bit form.
-			let lagrange = lagrange_evals_scalars::<B128, B128>(&shift_domain, &z_challenge);
+			let lagrange = shift_domain.lagrange_evals::<B128>(&z_challenge);
 			let and_columns = and_columns
 				.expect("AND columns are retained whenever there are IMUL or BMUL constraints");
 			let log_instances = table.log_instances();
 			RerandomizedOperations {
-				bitand: Operation::new(
-					column_slices(&and_columns),
-					[a_eval, b_eval, c_eval],
-					r_x_and,
-					r_rho_and,
-				),
-				intmul: mul.as_ref().map(|(columns, output)| {
-					Operation::from_intmul(
-						column_slices(columns),
-						output.clone(),
+				bitand: Operation::new(&and_columns, [a_eval, b_eval, c_eval], r_x_and, r_rho_and),
+				// The operand order of each mapping is the order the columns were built in.
+				intmul: mul.as_ref().map(|(columns, out)| {
+					Operation::from_mul_check(
+						columns,
+						&out.eval_point,
+						[&out.a_evals, &out.b_evals, &out.c_lo_evals, &out.c_hi_evals],
 						&lagrange,
 						log_instances,
 					)
 				}),
-				binmul: bmul.as_ref().map(|(columns, output)| {
-					Operation::from_binmul(
-						column_slices(columns),
-						output.clone(),
+				binmul: bmul.as_ref().map(|(columns, out)| {
+					Operation::from_mul_check(
+						columns,
+						&out.eval_point,
+						[
+							&out.a_lo_evals,
+							&out.a_hi_evals,
+							&out.b_lo_evals,
+							&out.b_hi_evals,
+							&out.c_lo_evals,
+							&out.c_hi_evals,
+						],
 						&lagrange,
 						log_instances,
 					)
 				}),
 			}
-			.prove::<P, _, _>(&lagrange, z_challenge, channel, alloc)
+			.prove::<P, _>(zero_data, &lagrange, z_challenge, channel, alloc)
 		} else {
 			// Neither IMUL nor BMUL constraints: the AND-check instance point is used directly.
 			// The IntMul and BinMul claims are zero claims at an empty point, contributing nothing
 			// to the shift.
 			(
 				r_rho_and.to_vec(),
-				OperatorData {
-					evals: vec![a_eval, b_eval, c_eval],
-					r_zhat_prime: z_challenge,
-					r_x_prime: r_x_and.to_vec(),
-				},
-				OperatorData {
-					evals: vec![B128::ZERO; INTMUL_ARITY],
-					r_zhat_prime: z_challenge,
-					r_x_prime: Vec::new(),
-				},
-				OperatorData {
-					evals: vec![B128::ZERO; BINMUL_ARITY],
-					r_zhat_prime: z_challenge,
-					r_x_prime: Vec::new(),
+				OperatorClaims {
+					zero: zero_data,
+					bitand: OperatorData {
+						evals: [a_eval, b_eval, c_eval],
+						r_zhat_prime: z_challenge,
+						r_x_prime: r_x_and.to_vec(),
+					},
+					intmul: OperatorData::zero_claim(z_challenge),
+					binmul: OperatorData::zero_claim(z_challenge),
 				},
 			)
 		};
@@ -316,24 +299,14 @@ impl IOPProver {
 		// Fold the committed witness over the instance axis at the shared point.
 		let folded_witness = {
 			let _scope = tracing::debug_span!("Fold instances").entered();
-			fold_instances::<B128, _>(table, &r_rho, alloc)
+			FoldedWitness::<B128, _>::fold_instances(table, &r_rho, alloc)
 		};
 
-		// The public segment is the shared constants, padded with zeros to the layout's
-		// power-of-two word count.
-		// The shift folds it against the monster's public part, which is sized to that padded
-		// count. The padding makes the two lengths agree, and matches the zeros the verifier
-		// assumes.
-		let n_public_words = cs.n_public_words();
-		// Growing a pooled buffer past the block it was handed would reallocate and free that block
-		// at the element's alignment rather than the pool's, so the fill below must fit exactly.
-		assert!(
-			cs.constants.len() <= n_public_words,
-			"the public segment is padded to at least the constant count"
-		);
-		let mut public_words = alloc.alloc::<Word>(n_public_words);
+		// The public segment is the shared constants alone: the inout values are committed, so
+		// nothing else is public. The shift folds it against the monster's public part, which is
+		// sized to the same count.
+		let mut public_words = alloc.alloc::<Word>(cs.constants.len());
 		public_words.extend_from_slice(&cs.constants);
-		public_words.resize(n_public_words, Word::ZERO);
 
 		// Reduce the operand claims to one witness evaluation.
 		let witness_claim = {
@@ -342,15 +315,29 @@ impl IOPProver {
 				&self.key_collection,
 				&public_words,
 				&folded_witness,
-				zero_data,
-				bitand_data,
-				intmul_data,
-				binmul_data,
+				claims,
 				&shift_domain,
 				channel,
 				alloc,
 			)
 		};
+
+		// Split the shift's final point `r_j || r_y || r_segment` into its three parts.
+		// The bit index `r_j` is the low coordinates addressing a bit within a 64-bit word.
+		// The segment selector `r_segment` is the last coordinate, choosing public or hidden
+		// words. The hidden-only trace drops it.
+		// The word index `r_y` is everything in between.
+		let challenges = &witness_claim.sumcheck.challenges;
+		let r_j = &challenges[..Word::LOG_BITS];
+		let r_y = &challenges[Word::LOG_BITS..challenges.len() - 1];
+
+		// Prove the public segment's evaluation claim, which the verifier's public-input check
+		// consumes.
+		ring_switch::prove_public_eval::<_, P, _>(alloc, &public_words, r_j, r_y, channel);
+
+		// The wiring evaluation the verifier closes the shift check with, sent where it reads it:
+		// after the public segment's claim.
+		channel.send_public_claim(witness_claim.wiring_eval);
 
 		let RingSwitchOutput {
 			rs_eq_ind,
@@ -358,25 +345,17 @@ impl IOPProver {
 		} = {
 			let _scope = tracing::debug_span!("Ring-switching reduction").entered();
 
-			// Split the shift's final point `r_j || r_y || r_segment` into its three parts.
-			// The bit index `r_j` is the low coordinates addressing a bit within a 64-bit word.
-			// The segment selector `r_segment` is the last coordinate, choosing public or hidden
-			// words. The hidden-only trace drops it.
-			// The word index `r_y` is everything in between.
-			let challenges = &witness_claim.challenges;
-			let r_j = &challenges[..Word::LOG_BITS];
-			let r_y = &challenges[Word::LOG_BITS..challenges.len() - 1];
-
 			// Ring-switch the reduced claim onto the committed trace.
 			// The point is `r_j || r_rho || r_y`.
 			// Its instance coordinates fold the trace at `r_rho`.
 			let trace_point = [r_j, r_rho.as_slice(), r_y].concat();
-			ring_switch::prove(alloc, trace_packed.to_ref(), &trace_point, channel)
+			ring_switch::prove(alloc, trace_packed.as_view(), &trace_point, channel)
 		};
 
 		// Queue the trace opening against the ring-switch's transparent multilinear.
 		// The final call runs the single combined FRI opening and writes it to the transcript.
-		channel.prove_oracle_relations([(trace_oracle, trace_packed, rs_eq_ind, sumcheck_claim)]);
+		channel.prove_oracle_relation(trace_oracle.clone(), rs_eq_ind, sumcheck_claim);
+		channel.finalize_oracle(trace_oracle, trace_packed);
 	}
 }
 
@@ -384,9 +363,10 @@ impl IOPProver {
 ///
 /// One-time setup builds the shift keys and the BaseFold prover, reusing the verifier's parameters.
 /// A later proving call commits a witness table and proves it satisfies every AND constraint.
-pub struct Prover<P>
+pub struct Prover<P, H>
 where
 	P: PackedField<Scalar = B128>,
+	H: ParallelHashSuite,
 {
 	iop_prover: IOPProver,
 	/// The precomputed BaseFold prover, holding the NTT and the FRI parameters.
@@ -394,20 +374,26 @@ where
 	/// The pool that recycles this prover's working buffers. It lives for the prover's lifetime,
 	/// so blocks freed by one `prove` call are reused by the next.
 	pool: BufferPool,
+	/// The prover creates its Merkle transcript channels with the hash suite `H`, matching the
+	/// verifier it was built from.
+	_hash_marker: PhantomData<H>,
 }
 
-impl<P> Prover<P>
+impl<P, H> Prover<P, H>
 where
 	P: PackedField<Scalar = B128>,
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes,
 {
 	/// Builds the prover from a verifier, inheriting its constraint system and FRI parameters.
 	///
 	/// The prover encodes the codeword with the multithreaded NTT, spread across the cores.
 	/// Reusing the verifier's compiler keeps both sides on one set of FRI parameters.
-	pub fn setup(verifier: &Verifier) -> Self {
-		// Reuse the verifier's evaluation domain so both sides agree on the code.
+	pub fn setup(verifier: &Verifier<H>) -> Self {
+		// Reuse the verifier's evaluation domain so both sides agree on the code: its compiler
+		// fixed that domain as the Gao-Mateer basis of this dimension.
 		let domain_context =
-			GenericPreExpanded::generate_from_subspace(verifier.iop_compiler().max_subspace());
+			GaoMateerPreExpanded::generate(verifier.iop_compiler().max_log_domain_size());
 
 		// Spread the NTT across the available cores.
 		let log_num_shares = binius_utils::rayon::current_num_threads().ilog2() as usize;
@@ -418,7 +404,8 @@ where
 			BaseFoldProverCompiler::from_verifier_compiler(verifier.iop_compiler(), ntt);
 
 		// Build the shift keys once from the shared constraint system.
-		let key_collection = build_key_collection(verifier.constraint_system());
+		let key_collection =
+			KeyCollection::build(verifier.constraint_system(), InoutSegment::Hidden);
 
 		let iop_prover = IOPProver::new(verifier.iop_verifier().clone(), key_collection);
 
@@ -426,6 +413,7 @@ where
 			iop_prover,
 			basefold_compiler,
 			pool: BufferPool::new(),
+			_hash_marker: PhantomData,
 		}
 	}
 
@@ -436,41 +424,28 @@ where
 
 	/// Proves that every instance in the batch satisfies the constraint system.
 	///
-	/// Creates the IOP channel from the transcript, delegates to [`IOPProver::prove`], then
+	/// Creates the IOP channel from the transcript, delegates to [`IOPProver::prove_chip`], then
 	/// finishes the channel with the combined FRI opening.
-	pub fn prove<Challenger_>(
+	pub fn prove_chip<Challenger_, Data>(
 		&self,
-		table: &ValueTable,
+		table: &ValueTable<Data>,
 		transcript: &mut ProverTranscript<Challenger_>,
 	) where
 		Challenger_: Challenger,
+		Data: Deref<Target = [Word]>,
 	{
+		// Working buffers for this proof are drawn from the prover's pool, recycling blocks freed
+		// by earlier proofs. The channel commits its Merkle trees out of the same pool.
+		let alloc = &self.pool;
 		let mut channel = self
 			.basefold_compiler
-			.create_channel_without_zk_from_transcript::<StdHashSuite, Challenger_, _, _>(
-				transcript,
-			);
-
-		// Working buffers for this proof are drawn from the prover's pool, recycling blocks freed
-		// by earlier proofs.
-		let alloc = &self.pool;
+			.create_channel_without_zk_from_transcript::<H, Challenger_, _, _>(transcript, alloc);
 		self.iop_prover
-			.prove::<P, _, _>(table, &mut channel, &alloc);
+			.prove_chip::<P, _, _, _>(table, &mut channel, &alloc);
 
 		let _scope = tracing::debug_span!("PCS opening").entered();
-		channel.finish(&alloc);
+		channel.finish();
 	}
-}
-
-/// Borrows an operation's allocator-backed operand columns as plain word slices.
-///
-/// The reductions and [`Operation`] read the columns without caring which allocator produced them,
-/// so this drops the buffer type at the seam rather than propagating it through their signatures.
-fn column_slices<Data, const N: usize>(columns: &[Data; N]) -> [&[Word]; N]
-where
-	Data: Deref<Target = [Word]>,
-{
-	columns.each_ref().map(|column| &**column)
 }
 
 /// One operation's operand columns, oblong claims, and the points they are claimed at.
@@ -478,9 +453,9 @@ where
 /// The AND-check and the IntMul check both reduce to this shape.
 /// The re-randomization folds each column into its instance-axis multilinear.
 /// It then transports the claims to the instance point shared by both operations.
-struct Operation<'a, const ARITY: usize> {
-	/// The operand columns, constraint-major, one per operand.
-	columns: [&'a [Word]; ARITY],
+struct Operation<'a, A: Allocator, const ARITY: usize> {
+	/// The operand columns of this operation, constraint-major, one per operand.
+	columns: &'a OperandColumns<A, ARITY>,
 	/// The oblong operand claim per operand: its multilinear-eval claim at the instance point.
 	operand_claims: [B128; ARITY],
 	/// The constraint-index point the operands are claimed at.
@@ -489,11 +464,11 @@ struct Operation<'a, const ARITY: usize> {
 	r_rho: Vec<B128>,
 }
 
-impl<'a, const ARITY: usize> Operation<'a, ARITY> {
+impl<'a, A: Allocator, const ARITY: usize> Operation<'a, A, ARITY> {
 	/// The operand columns with their claims at the constraint point `r_x` and instance point
 	/// `r_rho`.
 	fn new(
-		columns: [&'a [Word]; ARITY],
+		columns: &'a OperandColumns<A, ARITY>,
 		operand_claims: [B128; ARITY],
 		r_x: &[B128],
 		r_rho: &[B128],
@@ -512,7 +487,7 @@ impl<'a, const ARITY: usize> Operation<'a, ARITY> {
 	/// So the store expands that indicator once, not once per operand.
 	/// Each operand's instance-axis multilinear becomes a store column.
 	/// Its evaluator is an identity-composition quadratic MLE-check: a multilinear evaluation.
-	fn push_to<'alloc, A, P>(
+	fn push_to<'alloc, P>(
 		&self,
 		lagrange: &[B128],
 		store: &mut MleStore<'alloc, A, P>,
@@ -520,20 +495,19 @@ impl<'a, const ARITY: usize> Operation<'a, ARITY> {
 		claims: &mut Vec<B128>,
 		alloc: &'alloc A,
 	) where
-		A: Allocator,
 		P: PackedField<Scalar = B128>,
 	{
 		// The wrappers run under a plain sumcheck prover, so each holds this operation's shared eq
 		// tracker; register it once.
 		let eq_tracker = store.register_eq_tracker(&self.r_rho);
 		// The constraint tensor is the same for every operand of this operation, so expand it once.
-		let r_x_tensor = eq_ind_partial_eval_scalars::<B128>(&self.r_x);
-		for (&column, &claim) in self.columns.iter().zip(&self.operand_claims) {
-			let col = store.push_owned(operand_rho_multilinear::<A, P>(
-				alloc,
-				column,
+		let r_x_tensor = eq_ind_partial_eval_scalars(&self.r_x);
+		for (operand, &claim) in self.operand_claims.iter().enumerate() {
+			let col = store.push_owned(self.columns.rho_multilinear::<P>(
+				operand,
 				lagrange,
 				&r_x_tensor,
+				alloc,
 			));
 			let evaluator = QuadraticMleEvaluator::new(
 				[col],
@@ -545,81 +519,26 @@ impl<'a, const ARITY: usize> Operation<'a, ARITY> {
 			claims.push(claim);
 		}
 	}
-}
 
-impl<'a> Operation<'a, INTMUL_ARITY> {
-	/// Builds the IntMul operation by collapsing its per-bit operand claims to oblong claims.
+	/// Builds a multiplication operation by collapsing its per-bit operand claims.
 	///
-	/// The Lagrange weights fold the per-bit claims at the univariate challenge.
-	/// This gives the oblong form the BitAnd claims already have.
-	/// The IntMul row point splits into an instance part (low) and a constraint part (high).
-	fn from_intmul(
-		columns: [&'a [Word]; INTMUL_ARITY],
-		intmul_output: IntMulOutput<B128>,
+	/// IntMul and BinMul both close with one claim per bit of each operand.
+	/// The Lagrange weights fold those into one claim per operand, at the univariate challenge.
+	///
+	/// That is the oblong form the BitAnd claims already arrive in.
+	///
+	/// The row point splits at the instance count: instances low, constraints high.
+	fn from_mul_check(
+		columns: &'a OperandColumns<A, ARITY>,
+		eval_point: &[B128],
+		per_bit_evals: [&[B128]; ARITY],
 		lagrange: &[B128],
 		log_instances: usize,
 	) -> Self {
-		let IntMulOutput {
-			eval_point: r_out_mul,
-			a_evals,
-			b_evals,
-			c_lo_evals,
-			c_hi_evals,
-		} = intmul_output;
-		let oblong =
-			|evals: &[B128]| inner_product(evals.iter().copied(), lagrange.iter().copied());
-		let (r_rho, r_x) = r_out_mul.split_at(log_instances);
-		Self::new(
-			columns,
-			[
-				oblong(&a_evals),
-				oblong(&b_evals),
-				oblong(&c_lo_evals),
-				oblong(&c_hi_evals),
-			],
-			r_x,
-			r_rho,
-		)
-	}
-}
-
-impl<'a> Operation<'a, BINMUL_ARITY> {
-	/// Builds the BinMul operation by collapsing its per-bit operand claims to oblong claims.
-	///
-	/// The Lagrange weights fold the per-bit claims at the univariate challenge.
-	/// This gives the oblong form the BitAnd claims already have.
-	/// The BinMul row point splits into an instance part (low) and a constraint part (high).
-	fn from_binmul(
-		columns: [&'a [Word]; BINMUL_ARITY],
-		binmul_output: BinMulOutput<B128>,
-		lagrange: &[B128],
-		log_instances: usize,
-	) -> Self {
-		let BinMulOutput {
-			eval_point: r_out_binmul,
-			a_lo_evals,
-			a_hi_evals,
-			b_lo_evals,
-			b_hi_evals,
-			c_lo_evals,
-			c_hi_evals,
-		} = binmul_output;
-		let oblong =
-			|evals: &[B128]| inner_product(evals.iter().copied(), lagrange.iter().copied());
-		let (r_rho, r_x) = r_out_binmul.split_at(log_instances);
-		Self::new(
-			columns,
-			[
-				oblong(&a_lo_evals),
-				oblong(&a_hi_evals),
-				oblong(&b_lo_evals),
-				oblong(&b_hi_evals),
-				oblong(&c_lo_evals),
-				oblong(&c_hi_evals),
-			],
-			r_x,
-			r_rho,
-		)
+		let (r_rho, r_x) = eval_point.split_at(log_instances);
+		let operand_claims = per_bit_evals
+			.map(|evals| inner_product(evals.iter().copied(), lagrange.iter().copied()));
+		Self::new(columns, operand_claims, r_x, r_rho)
 	}
 }
 
@@ -627,16 +546,16 @@ impl<'a> Operation<'a, BINMUL_ARITY> {
 ///
 /// BitAnd is always present. IntMul and BinMul enter only when the circuit carries their
 /// constraints; an absent operation reduces to a zero claim contributing nothing to the shift.
-struct RerandomizedOperations<'a> {
+struct RerandomizedOperations<'a, A: Allocator> {
 	/// The BitAnd operation, at the AND-check instance point.
-	bitand: Operation<'a, BITAND_ARITY>,
+	bitand: Operation<'a, A, BITAND_ARITY>,
 	/// The IntMul operation, at the IntMul instance point, when the circuit has IMUL constraints.
-	intmul: Option<Operation<'a, INTMUL_ARITY>>,
+	intmul: Option<Operation<'a, A, INTMUL_ARITY>>,
 	/// The BinMul operation, at the BinMul instance point, when the circuit has BMUL constraints.
-	binmul: Option<Operation<'a, BINMUL_ARITY>>,
+	binmul: Option<Operation<'a, A, BINMUL_ARITY>>,
 }
 
-impl RerandomizedOperations<'_> {
+impl<A: Allocator> RerandomizedOperations<'_, A> {
 	/// Re-randomizes every present operation's instance point to one shared point.
 	///
 	/// Each operation reduces to operand claims at its own instance point.
@@ -647,25 +566,33 @@ impl RerandomizedOperations<'_> {
 	/// - A batched sumcheck transports every claim to one shared instance point.
 	/// - The reduced evaluations there are the operand claims the shift consumes.
 	///
-	/// The operands are pushed in the order [BitAnd | IntMul (if present) | BinMul (if present)],
-	/// so the reduced evaluations split back into contiguous per-operation segments in that same
-	/// order. An absent operation reduces to a zero claim at an empty point.
+	/// The operands are pushed in the order [BitAnd | IntMul (if present) | BinMul (if present)].
+	/// The reduced evaluations therefore split back into per-operation segments in that same order.
+	/// An absent operation reduces to a zero claim at an empty point.
+	///
+	/// The Zero reduction closes at its own constraint point, so it takes no part in this.
+	/// Its claim passes straight through into the returned bundle.
+	///
+	/// # Arguments
+	///
+	/// - `zero`: the Zero reduction's claim, carried into the result unchanged.
+	/// - `lagrange`: the Lagrange weights at the shared univariate challenge.
+	/// - `z_challenge`: that univariate challenge, carried by every returned claim.
 	///
 	/// # Returns
 	///
-	/// The shared instance point, the BitAnd operand data, the IntMul operand data, and the BinMul
-	/// operand data.
-	fn prove<'alloc, P, Channel, A>(
+	/// The shared instance point, and the operand claims of every operation at that point.
+	fn prove<'alloc, P, Channel>(
 		self,
+		zero: OperatorData<B128, ZERO_ARITY>,
 		lagrange: &[B128],
 		z_challenge: B128,
 		channel: &mut Channel,
 		alloc: &'alloc A,
-	) -> (Vec<B128>, OperatorData<B128>, OperatorData<B128>, OperatorData<B128>)
+	) -> (Vec<B128>, OperatorClaims<B128>)
 	where
 		P: PackedField<Scalar = B128>,
 		Channel: IOPProverChannel<P, A>,
-		A: Allocator,
 	{
 		let _scope = tracing::debug_span!("Re-randomize instances").entered();
 
@@ -697,125 +624,67 @@ impl RerandomizedOperations<'_> {
 		let output = batch_prove_and_write_evals(vec![shared], channel);
 		let reduced = &output.multilinear_evals[0];
 
-		// The reduced evaluations split back into contiguous per-operation segments, in push order.
-		let mut offset = 0;
-		let bitand_data = OperatorData {
-			evals: reduced[offset..offset + BITAND_ARITY].to_vec(),
+		// The reduced evaluations split back into per-operation chunks, in push order.
+		// Each chunk is as wide as its operation's arity, so the split is driven by the types.
+		let (bitand_evals, reduced) = split_evals(reduced);
+		let bitand = OperatorData {
+			evals: bitand_evals,
 			r_zhat_prime: z_challenge,
 			r_x_prime: self.bitand.r_x,
 		};
-		offset += BITAND_ARITY;
 
-		// IntMul: the next INTMUL_ARITY reduced evaluations when present, else a zero claim.
-		let intmul_data = match self.intmul {
+		// IntMul: the next chunk when present, else a zero claim that leaves the rest untouched.
+		let (intmul, reduced) = match self.intmul {
 			Some(intmul) => {
+				let (evals, reduced) = split_evals(reduced);
 				let data = OperatorData {
-					evals: reduced[offset..offset + INTMUL_ARITY].to_vec(),
+					evals,
 					r_zhat_prime: z_challenge,
 					r_x_prime: intmul.r_x,
 				};
-				offset += INTMUL_ARITY;
-				data
+				(data, reduced)
 			}
-			None => OperatorData {
-				evals: vec![B128::ZERO; INTMUL_ARITY],
-				r_zhat_prime: z_challenge,
-				r_x_prime: Vec::new(),
-			},
+			None => (OperatorData::zero_claim(z_challenge), reduced),
 		};
 
-		// BinMul: the final BINMUL_ARITY reduced evaluations when present, else a zero claim.
-		let binmul_data = match self.binmul {
+		// BinMul: the final chunk when present, else a zero claim.
+		let binmul = match self.binmul {
 			Some(binmul) => OperatorData {
-				evals: reduced[offset..offset + BINMUL_ARITY].to_vec(),
+				evals: split_evals(reduced).0,
 				r_zhat_prime: z_challenge,
 				r_x_prime: binmul.r_x,
 			},
-			None => OperatorData {
-				evals: vec![B128::ZERO; BINMUL_ARITY],
-				r_zhat_prime: z_challenge,
-				r_x_prime: Vec::new(),
-			},
+			None => OperatorData::zero_claim(z_challenge),
 		};
 
 		// `batch_prove` returns binding-order challenges; reverse to variable-indexed to match
 		// the verifier's `r_rho`.
 		let mut r_rho = output.challenges;
 		r_rho.reverse();
-		(r_rho, bitand_data, intmul_data, binmul_data)
+		(
+			r_rho,
+			OperatorClaims {
+				zero,
+				bitand,
+				intmul,
+				binmul,
+			},
+		)
 	}
 }
 
-/// Builds the instance-axis multilinear of one operand column, folded over its bit and constraint
-/// axes.
+/// Takes one operation's reduced evaluations off the front, and returns the rest.
 ///
-/// The operand column is constraint-major: `row = local_constraint * n_instances + instance`.
-/// Folding collapses the two other axes and leaves one field element per instance:
+/// The chunk width is the operation's arity, inferred from the claim it is about to fill.
 ///
-/// ```text
-/// M[rho] = sum_{local, j} lagrange[j] * r_x_tensor[local] * bit_j(column[local * K + rho])
-/// ```
+/// # Panics
 ///
-/// - The Lagrange weights fold each 64-bit word over its bit axis at the shared univariate
-///   challenge.
-/// - The constraint tensor `r_x_tensor` folds the constraint axis; the caller expands it once per
-///   operation and shares it across the operands.
-///
-/// Its evaluation at the operation's instance point equals that operation's oblong operand claim.
-/// So the re-randomization sumcheck can transport that claim to a shared instance point.
-fn operand_rho_multilinear<A, P>(
-	alloc: &A,
-	column: &[Word],
-	lagrange: &[B128],
-	r_x_tensor: &[B128],
-) -> FieldVec<P, A>
-where
-	A: Allocator,
-	P: PackedField<Scalar = B128>,
-{
-	// Fold each word's bits at the univariate challenge: one scalar per row, laid out
-	// constraint-major.
-	// Folding into scalars keeps the row indexing flat for the constraint fold.
-	let folded_rows = fold_words::<B128, B128, _>(alloc, column, lagrange);
-	let folded_rows = folded_rows.as_ref();
-
-	// Produce the packed instance-axis multilinear directly into the allocator's buffer, one packed
-	// element per parallel task.
-	// Each element's lanes are the constraint folds of consecutive instances.
-	// Lanes past the instance count are the multilinear's zero padding.
-	//
-	// The constraint axis is the high, strided axis: constraint `local` of instance `rho` sits at
-	// row `local * n_instances + rho`.
-	let n_constraints = r_x_tensor.len();
-	let n_instances = folded_rows.len() / n_constraints;
-	let log_instances = checked_log_2(n_instances);
-	let log_packed = log_instances.saturating_sub(P::LOG_WIDTH);
-	let packed_len = 1usize << log_packed;
-	let mut packed = alloc.alloc::<P>(packed_len);
-	packed
-		.spare_capacity_mut()
-		.par_iter_mut()
-		.enumerate()
-		.for_each(|(packed_index, slot)| {
-			slot.write(P::from_scalars((0..P::WIDTH).map(|lane| {
-				let instance = (packed_index << P::LOG_WIDTH) | lane;
-				if instance < n_instances {
-					r_x_tensor
-						.iter()
-						.enumerate()
-						.map(|(local, &weight)| {
-							weight * folded_rows[local * n_instances + instance]
-						})
-						.sum()
-				} else {
-					B128::ZERO
-				}
-			})));
-		});
-	// Safety: every packed slot is written exactly once by the parallel loop above.
-	unsafe { packed.set_len(packed_len) };
-
-	FieldBuffer::new(log_instances, packed)
+/// Panics if fewer than `ARITY` evaluations remain.
+fn split_evals<const ARITY: usize>(reduced: &[B128]) -> ([B128; ARITY], &[B128]) {
+	let (chunk, rest) = reduced
+		.split_first_chunk::<ARITY>()
+		.expect("the sumcheck returns one evaluation per pushed operand");
+	(*chunk, rest)
 }
 
 #[cfg(test)]
@@ -823,8 +692,10 @@ mod tests {
 	use std::array;
 
 	use assert_matches::assert_matches;
-	use binius_field::PackedBinaryGhash1x128b;
+	use binius_compute::GlobalAllocator;
+	use binius_field::PackedGhash1x128b;
 	use binius_frontend::CircuitBuilder;
+	use binius_hash::StdHashSuite;
 	use binius_iop::{
 		basefold::{Error as BaseFoldError, VerificationError as BaseFoldVerificationError},
 		channel::Error as IOPChannelError,
@@ -838,7 +709,7 @@ mod tests {
 	use super::*;
 	use crate::test_utils::{N_INPUT_WORDS, crc64_circuit, populate_crc64_witness};
 
-	type P = PackedBinaryGhash1x128b;
+	type P = PackedGhash1x128b;
 
 	// Builds a batch of `2^log_instances` CRC-64 instances with random input words.
 	fn setup_batch(log_instances: usize, seed: u64) -> (ConstraintSystem, ValueTable) {
@@ -877,15 +748,12 @@ mod tests {
 		use binius_frontend::Wire;
 
 		let builder = CircuitBuilder::new();
-		let inputs: [Wire; 4] = array::from_fn(|_| builder.add_witness());
-		let and = builder.band(inputs[0], inputs[1]);
-		builder.force_commit(and);
+		let inputs: [Wire; 4] = array::from_fn(|_| builder.add_inout());
 		let (hi, lo) = builder.imul(inputs[0], inputs[1]);
-		builder.force_commit(hi);
-		builder.force_commit(lo);
 		let (c_lo, c_hi) = builder.bmul(inputs[0], inputs[1], inputs[2], inputs[3]);
-		builder.force_commit(c_lo);
-		builder.force_commit(c_hi);
+		for wire in [builder.band(inputs[0], inputs[1]), hi, lo, c_lo, c_hi] {
+			builder.mark_inout(wire);
+		}
 		let circuit = builder.build();
 
 		let cs = circuit.constraint_system().clone();
@@ -896,21 +764,22 @@ mod tests {
 		assert!(!cs.bmul_constraints.is_empty(), "the fixture must emit BMUL constraints");
 
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			for &wire in &inputs {
-				w[wire] = Word(rng.next_u64());
-			}
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				for &wire in &inputs {
+					w[wire] = Word(rng.next_u64());
+				}
+			})
+			.unwrap();
 
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		// One prover, two proofs of the same table: the second reuses the first's freed blocks.
 		let prove_once = || {
 			let mut transcript = ProverTranscript::new(StdChallenger::default());
-			prover.prove(&table, &mut transcript);
+			prover.prove_chip(&table, &mut transcript);
 			transcript.finalize()
 		};
 		let first = prove_once();
@@ -921,7 +790,7 @@ mod tests {
 		for proof in [first, second] {
 			let mut verifier_transcript = VerifierTranscript::new(StdChallenger::default(), proof);
 			verifier
-				.verify(&mut verifier_transcript)
+				.verify_chip(&mut verifier_transcript)
 				.expect("a faithful proof verifies");
 			verifier_transcript
 				.finalize()
@@ -947,23 +816,17 @@ mod tests {
 		//
 		// Gate fusion is off: it inlines a linear definition into the gate that consumes it, which
 		// would leave no linear constraint to lower.
-		let builder = CircuitBuilder::with_opts(Options {
-			enable_gate_fusion: false,
-			..Options::default()
-		});
-		let inputs: [Wire; 4] = array::from_fn(|_| builder.add_witness());
+		let mut opts = Options::default();
+		opts.enable_gate_fusion = false;
+		let builder = CircuitBuilder::with_opts(opts);
+		let inputs: [Wire; 4] = array::from_fn(|_| builder.add_inout());
 		let x = builder.bxor(inputs[0], inputs[1]);
 		let y = builder.bxor(x, inputs[2]);
-		builder.force_commit(x);
-		builder.force_commit(y);
-		let and_out = builder.band(inputs[0], inputs[1]);
-		builder.force_commit(and_out);
 		let (hi, lo) = builder.imul(inputs[0], inputs[1]);
-		builder.force_commit(hi);
-		builder.force_commit(lo);
 		let (c_lo, c_hi) = builder.bmul(inputs[0], inputs[1], inputs[2], inputs[3]);
-		builder.force_commit(c_lo);
-		builder.force_commit(c_hi);
+		for wire in [x, y, builder.band(inputs[0], inputs[1]), hi, lo, c_lo, c_hi] {
+			builder.mark_inout(wire);
+		}
 		let circuit = builder.build();
 
 		let cs = circuit.constraint_system().clone();
@@ -974,23 +837,24 @@ mod tests {
 		assert!(!cs.bmul_constraints.is_empty(), "the fixture must emit BMUL constraints");
 
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			for &wire in &inputs {
-				w[wire] = Word(rng.next_u64());
-			}
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				for &wire in &inputs {
+					w[wire] = Word(rng.next_u64());
+				}
+			})
+			.unwrap();
 
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1010,13 +874,11 @@ mod tests {
 		use binius_frontend::{Options, Wire};
 
 		// Gate fusion off, so the `bxor` survives as a linear constraint to lower.
-		let builder = CircuitBuilder::with_opts(Options {
-			enable_gate_fusion: false,
-			..Options::default()
-		});
-		let inputs: [Wire; 3] = array::from_fn(|_| builder.add_witness());
-		let x = builder.bxor(inputs[0], inputs[1]);
-		builder.force_commit(x);
+		let mut opts = Options::default();
+		opts.enable_gate_fusion = false;
+		let builder = CircuitBuilder::with_opts(opts);
+		let inputs: [Wire; 3] = array::from_fn(|_| builder.add_inout());
+		builder.mark_inout(builder.bxor(inputs[0], inputs[1]));
 		let circuit = builder.build();
 
 		let mut cs = circuit.constraint_system().clone();
@@ -1031,23 +893,24 @@ mod tests {
 		cs.validate().unwrap();
 
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			for &wire in &inputs {
-				w[wire] = Word(rng.next_u64());
-			}
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				for &wire in &inputs {
+					w[wire] = Word(rng.next_u64());
+				}
+			})
+			.unwrap();
 
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		assert!(
-			verifier.verify(&mut verifier_transcript).is_err(),
+			verifier.verify_chip(&mut verifier_transcript).is_err(),
 			"a violated ZERO constraint must not verify"
 		);
 	}
@@ -1061,17 +924,17 @@ mod tests {
 
 		// Setup once: the verifier fixes the shape and FRI parameters.
 		// The prover inherits them.
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		// Prover: commit, reduce, and open on a fresh transcript.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		// Verifier: replay the same transcript end to end.
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1096,11 +959,11 @@ mod tests {
 	fn protocol_round_trips_with_mul() {
 		// One product per instance, with both result words committed as hidden words.
 		let builder = CircuitBuilder::new();
-		let x = builder.add_witness();
-		let y = builder.add_witness();
+		let x = builder.add_inout();
+		let y = builder.add_inout();
 		let (hi, lo) = builder.imul(x, y);
-		builder.force_commit(hi);
-		builder.force_commit(lo);
+		builder.mark_inout(hi);
+		builder.mark_inout(lo);
 		let circuit = builder.build();
 
 		let cs = circuit.constraint_system().clone();
@@ -1111,25 +974,89 @@ mod tests {
 		// Fill each instance's two multiplicands from a per-instance seed; the circuit derives the
 		// two product words.
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			w[x] = Word(rng.next_u64());
-			w[y] = Word(rng.next_u64());
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				w[x] = Word(rng.next_u64());
+				w[y] = Word(rng.next_u64());
+			})
+			.unwrap();
 
 		// Setup once: the verifier fixes the shape and FRI parameters, the prover inherits them.
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		// Prover: commit both oracles, reduce, and open on a fresh transcript.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		// Verifier: replay the same transcript end to end.
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
+			.expect("a faithful proof verifies");
+		verifier_transcript
+			.finalize()
+			.expect("no trailing proof data");
+	}
+
+	// A circuit declaring inout wires round-trips through the whole protocol.
+	//
+	// The inout values are committed with the private ones, so they lead the hidden segment and the
+	// public segment is the constants alone. That moves the boundary the shift reduction splits at,
+	// which every stage below it must agree on: the key collection, the word-index tensor, the
+	// committed shape, and the trace point the ring-switch opens at.
+	//
+	// Fixture: a per-instance public input and output either side of a private computation, over
+	// 2^6 instances. A constant keeps the public segment non-empty, so both halves carry words.
+	#[test]
+	fn protocol_round_trips_with_inout_wires() {
+		let builder = CircuitBuilder::new();
+		let input = builder.add_inout();
+		let output = builder.add_inout();
+		let secret = builder.add_witness();
+		let k = builder.add_constant_64(0x0123_4567_89ab_cdef);
+		// output == (input & secret) ^ k, so both inout wires are read by real constraints.
+		let masked = builder.band(input, secret);
+		builder.assert_eq("output", output, builder.bxor(masked, k));
+		let circuit = builder.build();
+
+		let cs = circuit.constraint_system().clone();
+		cs.validate().unwrap();
+		// Confirm the fixture genuinely exercises the inout path, on both sides of the boundary.
+		assert!(cs.n_inout > 0, "the fixture must declare inout wires");
+		assert!(!cs.constants.is_empty(), "the public segment must hold words of its own");
+
+		// Every instance chooses its own inout words — the reason they cannot be shared public
+		// data.
+		let log_instances = 6;
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				let input_word = rng.next_u64();
+				let secret_word = rng.next_u64();
+				w[input] = Word(input_word);
+				w[secret] = Word(secret_word);
+				w[output] = Word((input_word & secret_word) ^ 0x0123_4567_89ab_cdef);
+			})
+			.unwrap();
+
+		// The committed segment covers the inout words as well as the private ones.
+		assert_eq!(
+			table.n_hidden_words(),
+			cs.n_hidden_words(InoutSegment::Hidden),
+			"the table commits the inout values with the private ones"
+		);
+
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
+
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		prover.prove_chip(&table, &mut prover_transcript);
+
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		verifier
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1148,15 +1075,15 @@ mod tests {
 		use binius_frontend::Wire;
 
 		let builder = CircuitBuilder::new();
-		let cv: [Wire; 8] = array::from_fn(|_| builder.add_witness());
-		let block: [Wire; 16] = array::from_fn(|_| builder.add_witness());
-		let counter = builder.add_witness();
-		let block_len = builder.add_witness();
-		let flags = builder.add_witness();
-		// Force-commit the output so the circuit has no inout wires.
-		let out = blake3_compress(&builder, cv, block, counter, block_len, flags);
-		for wire in out {
-			builder.force_commit(wire);
+		let cv: [Wire; 8] = array::from_fn(|_| builder.add_inout());
+		let block: [Wire; 16] = array::from_fn(|_| builder.add_inout());
+		let counter = builder.add_inout();
+		let block_len = builder.add_inout();
+		let flags = builder.add_inout();
+		// Promoting the output chaining value keeps the compression alive under dead-code
+		// elimination.
+		for wire in blake3_compress(&builder, cv, block, counter, block_len, flags) {
+			builder.mark_inout(wire);
 		}
 		let circuit = builder.build();
 
@@ -1167,34 +1094,35 @@ mod tests {
 
 		// Fill each instance's inputs from a per-instance seed; the compression derives the rest.
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			// A 32-bit value per chaining-value word.
-			for wire in cv {
-				w[wire] = Word(rng.next_u32() as u64);
-			}
-			// A 32-bit value per message word.
-			for wire in block {
-				w[wire] = Word(rng.next_u32() as u64);
-			}
-			// A full 64-bit block counter.
-			w[counter] = Word(rng.next_u64());
-			// A byte length in 0..=64.
-			w[block_len] = Word((rng.next_u32() % 65) as u64);
-			// Arbitrary domain-separation flags.
-			w[flags] = Word(rng.next_u32() as u64);
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				// A 32-bit value per chaining-value word.
+				for wire in cv {
+					w[wire] = Word(rng.next_u32() as u64);
+				}
+				// A 32-bit value per message word.
+				for wire in block {
+					w[wire] = Word(rng.next_u32() as u64);
+				}
+				// A full 64-bit block counter.
+				w[counter] = Word(rng.next_u64());
+				// A byte length in 0..=64.
+				w[block_len] = Word((rng.next_u32() % 65) as u64);
+				// Arbitrary domain-separation flags.
+				w[flags] = Word(rng.next_u32() as u64);
+			})
+			.unwrap();
 
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1209,23 +1137,22 @@ mod tests {
 	// instance-axis multilinears, which the width-1 fixtures never reach.
 	#[test]
 	fn protocol_round_trips_with_mixed_constraints_and_wide_packing() {
-		use binius_field::PackedBinaryGhash2x128b;
+		use binius_field::PackedGhash2x128b;
 		use binius_frontend::Wire;
 
-		type WideP = PackedBinaryGhash2x128b;
+		type WideP = PackedGhash2x128b;
 
 		let builder = CircuitBuilder::new();
-		let inputs: [Wire; 8] = array::from_fn(|_| builder.add_witness());
+		let inputs: [Wire; 8] = array::from_fn(|_| builder.add_inout());
 		// Four standalone AND gates on distinct wires — the AND work is not tied to the products.
 		for pair in inputs.chunks_exact(2) {
-			let and = builder.band(pair[0], pair[1]);
-			builder.force_commit(and);
+			builder.mark_inout(builder.band(pair[0], pair[1]));
 		}
 		// Two products — fewer IMUL constraints than AND constraints.
 		for pair in inputs.chunks_exact(2).take(2) {
 			let (hi, lo) = builder.imul(pair[0], pair[1]);
-			builder.force_commit(hi);
-			builder.force_commit(lo);
+			builder.mark_inout(hi);
+			builder.mark_inout(lo);
 		}
 		let circuit = builder.build();
 
@@ -1242,24 +1169,25 @@ mod tests {
 		);
 
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			for &wire in &inputs {
-				w[wire] = Word(rng.next_u64());
-			}
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				for &wire in &inputs {
+					w[wire] = Word(rng.next_u64());
+				}
+			})
+			.unwrap();
 
 		// Prove with the wide packing; the verifier is packing-agnostic.
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<WideP>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<WideP, StdHashSuite>::setup(&verifier);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1281,11 +1209,11 @@ mod tests {
 		// One GHASH-field squaring per instance: `(c_lo, c_hi) = (x_lo, x_hi)^2`, with both result
 		// words committed as hidden words.
 		let builder = CircuitBuilder::new();
-		let x_lo = builder.add_witness();
-		let x_hi = builder.add_witness();
+		let x_lo = builder.add_inout();
+		let x_hi = builder.add_inout();
 		let (c_lo, c_hi) = builder.bmul(x_lo, x_hi, x_lo, x_hi);
-		builder.force_commit(c_lo);
-		builder.force_commit(c_hi);
+		builder.mark_inout(c_lo);
+		builder.mark_inout(c_hi);
 		let circuit = builder.build();
 
 		let cs = circuit.constraint_system().clone();
@@ -1296,25 +1224,26 @@ mod tests {
 		// Fill each instance's multiplicand from a per-instance seed; the circuit derives the two
 		// product words.
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			w[x_lo] = Word(rng.next_u64());
-			w[x_hi] = Word(rng.next_u64());
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				w[x_lo] = Word(rng.next_u64());
+				w[x_hi] = Word(rng.next_u64());
+			})
+			.unwrap();
 
 		// Setup once: the verifier fixes the shape and FRI parameters, the prover inherits them.
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		// Prover: commit the trace, reduce, and open on a fresh transcript.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		// Verifier: replay the same transcript end to end.
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1329,28 +1258,26 @@ mod tests {
 	// instance-axis multilinears, which the width-1 fixtures never reach.
 	#[test]
 	fn protocol_round_trips_with_and_intmul_binmul_and_wide_packing() {
-		use binius_field::PackedBinaryGhash2x128b;
+		use binius_field::PackedGhash2x128b;
 		use binius_frontend::Wire;
-
-		type WideP = PackedBinaryGhash2x128b;
+		type WideP = PackedGhash2x128b;
 
 		let builder = CircuitBuilder::new();
-		let inputs: [Wire; 8] = array::from_fn(|_| builder.add_witness());
+		let inputs: [Wire; 8] = array::from_fn(|_| builder.add_inout());
 		// Four standalone AND gates on distinct wires.
 		for pair in inputs.chunks_exact(2) {
-			let and = builder.band(pair[0], pair[1]);
-			builder.force_commit(and);
+			builder.mark_inout(builder.band(pair[0], pair[1]));
 		}
 		// Two integer products — fewer IMUL constraints than AND constraints.
 		for pair in inputs.chunks_exact(2).take(2) {
 			let (hi, lo) = builder.imul(pair[0], pair[1]);
-			builder.force_commit(hi);
-			builder.force_commit(lo);
+			builder.mark_inout(hi);
+			builder.mark_inout(lo);
 		}
 		// One GHASH-field product — the fewest of the three operations.
 		let (c_lo, c_hi) = builder.bmul(inputs[0], inputs[1], inputs[2], inputs[3]);
-		builder.force_commit(c_lo);
-		builder.force_commit(c_hi);
+		builder.mark_inout(c_lo);
+		builder.mark_inout(c_hi);
 		let circuit = builder.build();
 
 		let cs = circuit.constraint_system().clone();
@@ -1370,24 +1297,91 @@ mod tests {
 		);
 
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64);
-			for &wire in &inputs {
-				w[wire] = Word(rng.next_u64());
-			}
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				for &wire in &inputs {
+					w[wire] = Word(rng.next_u64());
+				}
+			})
+			.unwrap();
 
 		// Prove with the wide packing; the verifier is packing-agnostic.
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<WideP>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<WideP, StdHashSuite>::setup(&verifier);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(&mut verifier_transcript)
+			.verify_chip(&mut verifier_transcript)
+			.expect("a faithful proof verifies");
+		verifier_transcript
+			.finalize()
+			.expect("no trailing proof data");
+	}
+
+	// None of the three operations has a power-of-two constraint count, so each one's operand
+	// columns stop partway through the constraint axis its reduction runs over.
+	//
+	// Every other fixture in this module happens to land on a power of two, where the columns span
+	// the axis exactly and the short-column path is never taken. This is the one that reaches it.
+	#[test]
+	fn protocol_round_trips_with_non_power_of_two_constraint_counts() {
+		use binius_frontend::Wire;
+		let builder = CircuitBuilder::new();
+		let inputs: [Wire; 8] = array::from_fn(|_| builder.add_inout());
+		// Three standalone AND gates, three integer products, and three GHASH-field products.
+		for pair in inputs.chunks_exact(2).take(3) {
+			builder.mark_inout(builder.band(pair[0], pair[1]));
+		}
+		for pair in inputs.chunks_exact(2).take(3) {
+			let (hi, lo) = builder.imul(pair[0], pair[1]);
+			builder.mark_inout(hi);
+			builder.mark_inout(lo);
+		}
+		for i in 0..3 {
+			let (c_lo, c_hi) = builder.bmul(inputs[i], inputs[i + 1], inputs[i + 2], inputs[i + 3]);
+			builder.mark_inout(c_lo);
+			builder.mark_inout(c_hi);
+		}
+		let circuit = builder.build();
+
+		let cs = circuit.constraint_system().clone();
+		cs.validate().unwrap();
+		// Confirm the fixture reaches the case it exists for. A power-of-two count would leave
+		// every column spanning its axis exactly, which the other fixtures already cover.
+		for (name, count) in [
+			("AND", cs.n_and_constraints()),
+			("IMUL", cs.n_imul_constraints()),
+			("BMUL", cs.n_bmul_constraints()),
+		] {
+			assert!(
+				!count.is_power_of_two(),
+				"the fixture must give {name} a non-power-of-two constraint count, got {count}"
+			);
+		}
+
+		let log_instances = 6;
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64);
+				for &wire in &inputs {
+					w[wire] = Word(rng.next_u64());
+				}
+			})
+			.unwrap();
+
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
+
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		prover.prove_chip(&table, &mut prover_transcript);
+
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		verifier
+			.verify_chip(&mut verifier_transcript)
 			.expect("a faithful proof verifies");
 		verifier_transcript
 			.finalize()
@@ -1400,12 +1394,12 @@ mod tests {
 		let log_instances = 6;
 		let (cs, table) = setup_batch(log_instances, 1);
 
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		// Produce a faithful proof, then collect its bytes.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 		let mut proof = prover_transcript.finalize();
 
 		// Flip one bit in the last byte, which lands in a FRI query's Merkle opening.
@@ -1414,7 +1408,7 @@ mod tests {
 		proof[last] ^= 1;
 
 		let mut verifier_transcript = VerifierTranscript::new(StdChallenger::default(), proof);
-		let err = verifier.verify(&mut verifier_transcript).unwrap_err();
+		let err = verifier.verify_chip(&mut verifier_transcript).unwrap_err();
 		assert_matches!(
 			err,
 			Error::IOPChannel(IOPChannelError::BaseFold(BaseFoldError::Verification(
@@ -1430,29 +1424,30 @@ mod tests {
 	#[test]
 	fn tampered_mul_opening_is_rejected() {
 		let builder = CircuitBuilder::new();
-		let x = builder.add_witness();
-		let y = builder.add_witness();
+		let x = builder.add_inout();
+		let y = builder.add_inout();
 		let (hi, lo) = builder.imul(x, y);
-		builder.force_commit(hi);
-		builder.force_commit(lo);
+		builder.mark_inout(hi);
+		builder.mark_inout(lo);
 		let circuit = builder.build();
 
 		let cs = circuit.constraint_system().clone();
 		cs.validate().unwrap();
 
 		let log_instances = 6;
-		let table = ValueTable::populate(&circuit, log_instances, |i, w| {
-			let mut rng = StdRng::seed_from_u64(i as u64 + 1);
-			w[x] = Word(rng.next_u64());
-			w[y] = Word(rng.next_u64());
-		})
-		.unwrap();
+		let table = circuit
+			.populate_batch(&GlobalAllocator, log_instances, |i, w| {
+				let mut rng = StdRng::seed_from_u64(i as u64 + 1);
+				w[x] = Word(rng.next_u64());
+				w[y] = Word(rng.next_u64());
+			})
+			.unwrap();
 
-		let verifier = Verifier::setup(&cs, log_instances, 1);
-		let prover = Prover::<P>::setup(&verifier);
+		let verifier = Verifier::<StdHashSuite>::setup(&cs, log_instances, 1);
+		let prover = Prover::<P, StdHashSuite>::setup(&verifier);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover.prove(&table, &mut prover_transcript);
+		prover.prove_chip(&table, &mut prover_transcript);
 		let mut proof = prover_transcript.finalize();
 
 		// Flip a bit early in the proof, in the IntMul check's first message. The verifier then
@@ -1462,7 +1457,7 @@ mod tests {
 
 		let mut verifier_transcript = VerifierTranscript::new(StdChallenger::default(), proof);
 		assert!(
-			verifier.verify(&mut verifier_transcript).is_err(),
+			verifier.verify_chip(&mut verifier_transcript).is_err(),
 			"a proof tampered in the IntMul check's first message must not verify"
 		);
 	}

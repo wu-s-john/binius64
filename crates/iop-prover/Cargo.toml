@@ -9,8 +9,10 @@ workspace = true
 
 [dependencies]
 binius-compute = { path = "../compute" }
+binius-core = { path = "../core" }
 binius-field = { path = "../field" }
 binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
 binius-iop = { path = "../iop" }
 binius-ip = { path = "../ip" }
 binius-ip-prover = { path = "../ip-prover" }
@@ -33,7 +35,6 @@ sha2.workspace = true
 
 [features]
 default = []
-rayon = ["binius-utils/rayon"]
 
 [[bench]]
 name = "binary_merkle_tree"

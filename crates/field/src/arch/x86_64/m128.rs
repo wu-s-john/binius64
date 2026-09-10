@@ -8,7 +8,7 @@ use std::{
 };
 
 use binius_utils::{
-	DeserializeBytes, SerializationError, SerializeBytes,
+	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 	serialization::{assert_enough_data_for, assert_enough_space_for},
 };
@@ -21,10 +21,9 @@ use seq_macro::seq;
 
 use crate::{
 	BinaryField,
-	arch::portable::packed::PackedPrimitiveType,
-	underlier::{
-		Divisible, SmallU, UnderlierType, impl_divisible_bitmask, impl_divisible_self, mapget,
-	},
+	divisible::{Divisible, impl_divisible_memcast, impl_divisible_self},
+	packed_fields::primitive::PackedPrimitiveType,
+	underlier::{SmallU, Underlier, impl_divisible_bitmask},
 };
 
 pub const fn m128i_from_u128(x: u128) -> __m128i {
@@ -90,11 +89,16 @@ impl<const N: usize> From<SmallU<N>> for M128 {
 
 impl From<M128> for u128 {
 	fn from(value: M128) -> Self {
+		const {
+			assert!(
+				align_of::<u128>() == 16,
+				"the store below needs a 16-byte aligned destination"
+			);
+		}
 		let mut result = 0u128;
 		unsafe {
-			// Safety: u128 is 16-byte aligned
-			assert_eq!(align_of::<u128>(), 16);
-			_mm_store_si128(&raw mut result as *mut __m128i, value.0)
+			// Safety: u128 is 16-byte aligned, as the const assertion above checks.
+			_mm_store_si128(&raw mut result as *mut __m128i, value.0);
 		};
 		result
 	}
@@ -131,6 +135,10 @@ impl DeserializeBytes for M128 {
 	}
 }
 
+impl FixedSizeSerializeBytes for M128 {
+	const BYTE_SIZE: usize = 16;
+}
+
 impl_divisible_bitmask!(M128, 1, 2, 4);
 
 impl Default for M128 {
@@ -152,7 +160,7 @@ impl BitAnd for M128 {
 impl BitAndAssign for M128 {
 	#[inline(always)]
 	fn bitand_assign(&mut self, rhs: Self) {
-		*self = *self & rhs
+		*self = *self & rhs;
 	}
 }
 
@@ -168,7 +176,7 @@ impl BitOr for M128 {
 impl BitOrAssign for M128 {
 	#[inline(always)]
 	fn bitor_assign(&mut self, rhs: Self) {
-		*self = *self | rhs
+		*self = *self | rhs;
 	}
 }
 
@@ -312,7 +320,7 @@ impl std::fmt::Debug for M128 {
 	}
 }
 
-impl UnderlierType for M128 {
+impl Underlier for M128 {
 	const LOG_BITS: usize = 7;
 	const ZERO: Self = { Self::from_u128(0) };
 	const ONE: Self = { Self::from_u128(1) };
@@ -419,323 +427,22 @@ unsafe fn interleave_bits_imm<const BLOCK_LEN: i32>(
 	}
 }
 
-// Divisible implementations using SIMD extract/insert intrinsics
-
 // Reflexive divisibility, needed when M128 is itself a field underlier (a width-1 packed field).
 impl_divisible_self!(M128);
 
-impl Divisible<u128> for M128 {
-	const LOG_N: usize = 0;
-
-	#[inline]
-	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = u128> + Send + Clone {
-		std::iter::once(u128::from(value))
-	}
-
-	#[inline]
-	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = u128> + Send + Clone + '_ {
-		std::iter::once(u128::from(*value))
-	}
-
-	#[inline]
-	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = u128> + Send + Clone + '_ {
-		slice.iter().map(|&v| u128::from(v))
-	}
-
-	#[inline]
-	unsafe fn get_unchecked(&self, _index: usize) -> u128 {
-		u128::from(*self)
-	}
-
-	#[inline]
-	unsafe fn set_unchecked(&mut self, _index: usize, val: u128) {
-		*self = Self::from(val);
-	}
-
-	#[inline]
-	fn broadcast(val: u128) -> Self {
-		Self::from(val)
-	}
-
-	#[inline]
-	fn from_iter(mut iter: impl Iterator<Item = u128>) -> Self {
-		iter.next().map(Self::from).unwrap_or(Self::ZERO)
-	}
-}
-
-impl Divisible<u64> for M128 {
-	const LOG_N: usize = 1;
-
-	#[inline]
-	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = u64> + Send + Clone {
-		mapget::value_iter(value)
-	}
-
-	#[inline]
-	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = u64> + Send + Clone + '_ {
-		mapget::value_iter(*value)
-	}
-
-	#[inline]
-	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = u64> + Send + Clone + '_ {
-		mapget::slice_iter(slice)
-	}
-
-	#[inline]
-	unsafe fn get_unchecked(&self, index: usize) -> u64 {
-		unsafe {
-			match index {
-				0 => _mm_extract_epi64(self.0, 0) as u64,
-				1 => _mm_extract_epi64(self.0, 1) as u64,
-				_ => core::hint::unreachable_unchecked(),
-			}
-		}
-	}
-
-	#[inline]
-	unsafe fn set_unchecked(&mut self, index: usize, val: u64) {
-		*self = unsafe {
-			match index {
-				0 => Self(_mm_insert_epi64(self.0, val as i64, 0)),
-				1 => Self(_mm_insert_epi64(self.0, val as i64, 1)),
-				_ => core::hint::unreachable_unchecked(),
-			}
-		};
-	}
-
-	#[inline]
-	fn broadcast(val: u64) -> Self {
-		unsafe { Self(_mm_set1_epi64x(val as i64)) }
-	}
-
-	#[inline]
-	fn from_iter(iter: impl Iterator<Item = u64>) -> Self {
-		let mut result = Self::ZERO;
-		let arr: &mut [u64; 2] = bytemuck::cast_mut(&mut result);
-		for (i, val) in iter.take(2).enumerate() {
-			arr[i] = val;
-		}
-		result
-	}
-}
-
-impl Divisible<u32> for M128 {
-	const LOG_N: usize = 2;
-
-	#[inline]
-	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = u32> + Send + Clone {
-		mapget::value_iter(value)
-	}
-
-	#[inline]
-	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = u32> + Send + Clone + '_ {
-		mapget::value_iter(*value)
-	}
-
-	#[inline]
-	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = u32> + Send + Clone + '_ {
-		mapget::slice_iter(slice)
-	}
-
-	#[inline]
-	unsafe fn get_unchecked(&self, index: usize) -> u32 {
-		unsafe {
-			match index {
-				0 => _mm_extract_epi32(self.0, 0) as u32,
-				1 => _mm_extract_epi32(self.0, 1) as u32,
-				2 => _mm_extract_epi32(self.0, 2) as u32,
-				3 => _mm_extract_epi32(self.0, 3) as u32,
-				_ => core::hint::unreachable_unchecked(),
-			}
-		}
-	}
-
-	#[inline]
-	unsafe fn set_unchecked(&mut self, index: usize, val: u32) {
-		*self = unsafe {
-			match index {
-				0 => Self(_mm_insert_epi32(self.0, val as i32, 0)),
-				1 => Self(_mm_insert_epi32(self.0, val as i32, 1)),
-				2 => Self(_mm_insert_epi32(self.0, val as i32, 2)),
-				3 => Self(_mm_insert_epi32(self.0, val as i32, 3)),
-				_ => core::hint::unreachable_unchecked(),
-			}
-		};
-	}
-
-	#[inline]
-	fn broadcast(val: u32) -> Self {
-		unsafe { Self(_mm_set1_epi32(val as i32)) }
-	}
-
-	#[inline]
-	fn from_iter(iter: impl Iterator<Item = u32>) -> Self {
-		let mut result = Self::ZERO;
-		let arr: &mut [u32; 4] = bytemuck::cast_mut(&mut result);
-		for (i, val) in iter.take(4).enumerate() {
-			arr[i] = val;
-		}
-		result
-	}
-}
-
-impl Divisible<u16> for M128 {
-	const LOG_N: usize = 3;
-
-	#[inline]
-	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = u16> + Send + Clone {
-		mapget::value_iter(value)
-	}
-
-	#[inline]
-	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = u16> + Send + Clone + '_ {
-		mapget::value_iter(*value)
-	}
-
-	#[inline]
-	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = u16> + Send + Clone + '_ {
-		mapget::slice_iter(slice)
-	}
-
-	#[inline]
-	unsafe fn get_unchecked(&self, index: usize) -> u16 {
-		unsafe {
-			match index {
-				0 => _mm_extract_epi16(self.0, 0) as u16,
-				1 => _mm_extract_epi16(self.0, 1) as u16,
-				2 => _mm_extract_epi16(self.0, 2) as u16,
-				3 => _mm_extract_epi16(self.0, 3) as u16,
-				4 => _mm_extract_epi16(self.0, 4) as u16,
-				5 => _mm_extract_epi16(self.0, 5) as u16,
-				6 => _mm_extract_epi16(self.0, 6) as u16,
-				7 => _mm_extract_epi16(self.0, 7) as u16,
-				_ => core::hint::unreachable_unchecked(),
-			}
-		}
-	}
-
-	#[inline]
-	unsafe fn set_unchecked(&mut self, index: usize, val: u16) {
-		*self = unsafe {
-			match index {
-				0 => Self(_mm_insert_epi16(self.0, val as i32, 0)),
-				1 => Self(_mm_insert_epi16(self.0, val as i32, 1)),
-				2 => Self(_mm_insert_epi16(self.0, val as i32, 2)),
-				3 => Self(_mm_insert_epi16(self.0, val as i32, 3)),
-				4 => Self(_mm_insert_epi16(self.0, val as i32, 4)),
-				5 => Self(_mm_insert_epi16(self.0, val as i32, 5)),
-				6 => Self(_mm_insert_epi16(self.0, val as i32, 6)),
-				7 => Self(_mm_insert_epi16(self.0, val as i32, 7)),
-				_ => core::hint::unreachable_unchecked(),
-			}
-		};
-	}
-
-	#[inline]
-	fn broadcast(val: u16) -> Self {
-		unsafe { Self(_mm_set1_epi16(val as i16)) }
-	}
-
-	#[inline]
-	fn from_iter(iter: impl Iterator<Item = u16>) -> Self {
-		let mut result = Self::ZERO;
-		let arr: &mut [u16; 8] = bytemuck::cast_mut(&mut result);
-		for (i, val) in iter.take(8).enumerate() {
-			arr[i] = val;
-		}
-		result
-	}
-}
-
-impl Divisible<u8> for M128 {
-	const LOG_N: usize = 4;
-
-	#[inline]
-	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = u8> + Send + Clone {
-		mapget::value_iter(value)
-	}
-
-	#[inline]
-	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = u8> + Send + Clone + '_ {
-		mapget::value_iter(*value)
-	}
-
-	#[inline]
-	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = u8> + Send + Clone + '_ {
-		mapget::slice_iter(slice)
-	}
-
-	#[inline]
-	unsafe fn get_unchecked(&self, index: usize) -> u8 {
-		unsafe {
-			match index {
-				0 => _mm_extract_epi8(self.0, 0) as u8,
-				1 => _mm_extract_epi8(self.0, 1) as u8,
-				2 => _mm_extract_epi8(self.0, 2) as u8,
-				3 => _mm_extract_epi8(self.0, 3) as u8,
-				4 => _mm_extract_epi8(self.0, 4) as u8,
-				5 => _mm_extract_epi8(self.0, 5) as u8,
-				6 => _mm_extract_epi8(self.0, 6) as u8,
-				7 => _mm_extract_epi8(self.0, 7) as u8,
-				8 => _mm_extract_epi8(self.0, 8) as u8,
-				9 => _mm_extract_epi8(self.0, 9) as u8,
-				10 => _mm_extract_epi8(self.0, 10) as u8,
-				11 => _mm_extract_epi8(self.0, 11) as u8,
-				12 => _mm_extract_epi8(self.0, 12) as u8,
-				13 => _mm_extract_epi8(self.0, 13) as u8,
-				14 => _mm_extract_epi8(self.0, 14) as u8,
-				15 => _mm_extract_epi8(self.0, 15) as u8,
-				_ => core::hint::unreachable_unchecked(),
-			}
-		}
-	}
-
-	#[inline]
-	unsafe fn set_unchecked(&mut self, index: usize, val: u8) {
-		*self = unsafe {
-			match index {
-				0 => Self(_mm_insert_epi8(self.0, val as i32, 0)),
-				1 => Self(_mm_insert_epi8(self.0, val as i32, 1)),
-				2 => Self(_mm_insert_epi8(self.0, val as i32, 2)),
-				3 => Self(_mm_insert_epi8(self.0, val as i32, 3)),
-				4 => Self(_mm_insert_epi8(self.0, val as i32, 4)),
-				5 => Self(_mm_insert_epi8(self.0, val as i32, 5)),
-				6 => Self(_mm_insert_epi8(self.0, val as i32, 6)),
-				7 => Self(_mm_insert_epi8(self.0, val as i32, 7)),
-				8 => Self(_mm_insert_epi8(self.0, val as i32, 8)),
-				9 => Self(_mm_insert_epi8(self.0, val as i32, 9)),
-				10 => Self(_mm_insert_epi8(self.0, val as i32, 10)),
-				11 => Self(_mm_insert_epi8(self.0, val as i32, 11)),
-				12 => Self(_mm_insert_epi8(self.0, val as i32, 12)),
-				13 => Self(_mm_insert_epi8(self.0, val as i32, 13)),
-				14 => Self(_mm_insert_epi8(self.0, val as i32, 14)),
-				15 => Self(_mm_insert_epi8(self.0, val as i32, 15)),
-				_ => core::hint::unreachable_unchecked(),
-			}
-		};
-	}
-
-	#[inline]
-	fn broadcast(val: u8) -> Self {
-		unsafe { Self(_mm_set1_epi8(val as i8)) }
-	}
-
-	#[inline]
-	fn from_iter(iter: impl Iterator<Item = u8>) -> Self {
-		let mut result = Self::ZERO;
-		let arr: &mut [u8; 16] = bytemuck::cast_mut(&mut result);
-		for (i, val) in iter.take(16).enumerate() {
-			arr[i] = val;
-		}
-		result
-	}
-}
+impl_divisible_memcast!(
+	M128,
+	u128 => |val| M128::from(val),
+	u64 => |val| unsafe { M128(_mm_set1_epi64x(val as i64)) },
+	u32 => |val| unsafe { M128(_mm_set1_epi32(val as i32)) },
+	u16 => |val| unsafe { M128(_mm_set1_epi16(val as i16)) },
+	u8 => |val| unsafe { M128(_mm_set1_epi8(val as i8)) },
+);
 
 #[cfg(test)]
 mod tests {
 	use binius_utils::bytes::BytesMut;
 	use proptest::{arbitrary::any, proptest};
-	use rand::prelude::*;
 
 	use super::*;
 
@@ -774,7 +481,7 @@ mod tests {
 
 		#[test]
 		fn test_negate(a in any::<u128>()) {
-			assert_eq!(M128::from(!a), !M128::from(a))
+			assert_eq!(M128::from(!a), !M128::from(a));
 		}
 
 		#[test]
@@ -798,12 +505,6 @@ mod tests {
 				assert_eq!(get(d, height, i+1), get(b, height, i+1));
 			}
 		}
-	}
-
-	#[test]
-	fn test_fill_with_bit() {
-		assert_eq!(M128::fill_with_bit(1), M128::from(u128::MAX));
-		assert_eq!(M128::fill_with_bit(0), M128::from(0u128));
 	}
 
 	#[test]

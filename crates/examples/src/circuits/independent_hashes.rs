@@ -14,6 +14,7 @@ use binius_circuits::{
 	blake3::{blake3_compress, ref_compress},
 	keccak::permutation::keccak_f1600,
 	sha256::{State as Sha256State, populate_message_block, sha256_compress},
+	util::clear_high_bits,
 };
 use binius_core::word::Word;
 use binius_frontend::{CircuitBuilder, Wire, WitnessFiller};
@@ -83,7 +84,7 @@ impl ExampleCircuit for IndependentSha256Compressions {
 		Ok(Self { compressions })
 	}
 
-	fn populate_witness(&self, instance: Instance, w: &mut WitnessFiller) -> Result<()> {
+	fn populate_witness(&self, instance: Instance, w: &mut WitnessFiller<'_>) -> Result<()> {
 		let mut rng = StdRng::seed_from_u64(instance.seed.unwrap_or(DEFAULT_RANDOM_SEED));
 		for compression in &self.compressions {
 			let block_bytes = next_block(&mut rng);
@@ -135,8 +136,10 @@ impl ExampleCircuit for IndependentBlake3Compressions {
 				let block_len = builder.add_witness();
 				let flags = builder.add_witness();
 				let out = blake3_compress(builder, cv, block, counter, block_len, flags);
+				// Unlike SHA-256, this gadget splits its rounds across the two 32-bit lanes and
+				// leaves the discarded one in each word's high half, so the comparison masks it.
+				let out = out.map(|word| clear_high_bits(builder, word, 32));
 				let out_cv = std::array::from_fn(|_| builder.add_inout());
-				// See the SHA-256 note on raw 64-bit equality over 32-bit lanes.
 				builder.assert_eq_v(format!("blake3_compression_out[{i}]"), out, out_cv);
 				Blake3Compression {
 					cv,
@@ -152,7 +155,7 @@ impl ExampleCircuit for IndependentBlake3Compressions {
 		Ok(Self { compressions })
 	}
 
-	fn populate_witness(&self, instance: Instance, w: &mut WitnessFiller) -> Result<()> {
+	fn populate_witness(&self, instance: Instance, w: &mut WitnessFiller<'_>) -> Result<()> {
 		let mut rng = StdRng::seed_from_u64(instance.seed.unwrap_or(DEFAULT_RANDOM_SEED));
 		for compression in &self.compressions {
 			let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
@@ -221,7 +224,7 @@ impl ExampleCircuit for IndependentKeccakPermutations {
 		Ok(Self { permutations })
 	}
 
-	fn populate_witness(&self, instance: Instance, w: &mut WitnessFiller) -> Result<()> {
+	fn populate_witness(&self, instance: Instance, w: &mut WitnessFiller<'_>) -> Result<()> {
 		let mut rng = StdRng::seed_from_u64(instance.seed.unwrap_or(DEFAULT_RANDOM_SEED));
 		for permutation in &self.permutations {
 			let state: [u64; 25] = std::array::from_fn(|_| rng.next_u64());
@@ -253,7 +256,6 @@ fn next_block(rng: &mut StdRng) -> [u8; 64] {
 
 #[cfg(test)]
 mod tests {
-	use binius_core::verify::verify_constraints;
 	use binius_frontend::CircuitBuilder;
 
 	use super::*;
@@ -271,7 +273,10 @@ mod tests {
 			.populate_witness(Instance { seed: Some(7) }, &mut filler)
 			.unwrap();
 		circuit.populate_wire_witness(&mut filler).unwrap();
-		verify_constraints(circuit.constraint_system(), &filler.into_value_vec()).unwrap();
+		circuit
+			.constraint_system()
+			.verify(&filler.into_value_vec())
+			.unwrap();
 	}
 
 	#[test]

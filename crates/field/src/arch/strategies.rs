@@ -12,13 +12,11 @@ use bytemuck::TransparentWrapper;
 
 use crate::{
 	BinaryField,
-	arch::PackedPrimitiveType,
 	arithmetic_traits::{InvertOrZero, Square, WideMul},
-	underlier::{Divisible, UnderlierType},
+	divisible::Divisible,
+	packed_fields::primitive::PackedPrimitiveType,
+	underlier::Underlier,
 };
-
-/// Pairwise strategy. Apply the result of the operation to each packed element independently.
-pub struct PairwiseStrategy;
 
 /// Strategy that splits the underlier into `SubU`-sized lanes, applies the sub-packing
 /// `PackedPrimitiveType<SubU, F>`'s op to each lane, and recombines — a generic fallback for
@@ -39,8 +37,8 @@ pub struct Divide<SubU, T, const N: usize>(T, PhantomData<SubU>);
 
 impl<U, SubU, F, const N: usize> Square for Divide<SubU, PackedPrimitiveType<U, F>, N>
 where
-	U: UnderlierType + Divisible<SubU>,
-	SubU: UnderlierType,
+	U: Underlier + Divisible<SubU>,
+	SubU: Underlier,
 	F: BinaryField,
 	PackedPrimitiveType<SubU, F>: Square,
 {
@@ -58,8 +56,8 @@ where
 
 impl<U, SubU, F, const N: usize> InvertOrZero for Divide<SubU, PackedPrimitiveType<U, F>, N>
 where
-	U: UnderlierType + Divisible<SubU>,
-	SubU: UnderlierType,
+	U: Underlier + Divisible<SubU>,
+	SubU: Underlier,
 	F: BinaryField,
 	PackedPrimitiveType<SubU, F>: InvertOrZero,
 {
@@ -129,8 +127,8 @@ impl<O: Copy + Default + Add<Output = O>, const N: usize> Sum for LaneWideProduc
 
 impl<U, SubU, F, const N: usize> WideMul for Divide<SubU, PackedPrimitiveType<U, F>, N>
 where
-	U: UnderlierType + Divisible<SubU>,
-	SubU: UnderlierType,
+	U: Underlier + Divisible<SubU>,
+	SubU: Underlier,
 	F: BinaryField,
 	PackedPrimitiveType<SubU, F>: WideMul,
 	<PackedPrimitiveType<SubU, F> as WideMul>::Output: Copy + Default,
@@ -163,21 +161,5 @@ where
 			<PackedPrimitiveType<SubU, F> as WideMul>::reduce(product).to_underlier()
 		});
 		Self::wrap(PackedPrimitiveType::from_underlier(Divisible::<SubU>::from_iter(lanes)))
-	}
-}
-
-/// Wrapper that defines multiplication as `reduce(wide_mul(a, b))`, deferring to the type's own
-/// [`WideMul`] impl, making the widening multiply the single source of truth for both `Mul` and
-/// `WideMul`. Used by every GHASH and AES packing.
-#[repr(transparent)]
-#[derive(TransparentWrapper)]
-pub struct MulFromWideMul<T>(T);
-
-impl<P: WideMul> std::ops::Mul for MulFromWideMul<P> {
-	type Output = Self;
-
-	#[inline]
-	fn mul(self, rhs: Self) -> Self {
-		Self::wrap(P::reduce(P::wide_mul(Self::peel(self), Self::peel(rhs))))
 	}
 }

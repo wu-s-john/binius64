@@ -12,6 +12,25 @@ pub trait Square {
 	fn square(self) -> Self;
 }
 
+/// Scales a value by `X`, the generator of the field's polynomial basis.
+///
+/// A one-bit shift plus a masked exclusive or, not a field multiply.
+///
+/// The scaling is `GF(2)`-linear, so it commutes with the modular reduction.
+/// That is what lets one trait serve both a reduced element and an unreduced product:
+///
+/// ```text
+///     reduce(mul_x(wide)) == mul_x(reduce(wide))
+/// ```
+///
+/// Scaling an unreduced product folds the `X` of an irreducible polynomial into a reduction the
+/// caller is going to pay for anyway.
+pub trait MulX {
+	/// Returns the value scaled by `X`.
+	#[must_use]
+	fn mul_x(self) -> Self;
+}
+
 /// A field type that supports widening (unreduced) multiplication.
 ///
 /// The multiply phase produces an [`Output`](Self::Output) value that can be accumulated via
@@ -39,18 +58,6 @@ pub trait WideMul: Sized {
 	fn reduce(wide: Self::Output) -> Self;
 }
 
-/// An unreduced widening product (a [`WideMul::Output`]) that can be scaled by the field element
-/// `X` while still unreduced.
-///
-/// Scaling by `X` and the modular reduction are both `GF(2)`-linear, and they commute:
-/// `reduce(wide.mul_x_wide()) == reduce(wide).mul_x()`. Doing the scaling on the unreduced product
-/// lets an extension-field multiply fold the `X` of its irreducible polynomial into a product it is
-/// going to reduce anyway, saving a reduction over scaling the reduced coordinate.
-pub trait MulXWide {
-	/// Returns the unreduced product scaled by `X`.
-	fn mul_x_wide(self) -> Self;
-}
-
 /// Value that can be inverted
 pub trait InvertOrZero {
 	/// Returns the inverted value or zero in case when `self` is zero
@@ -69,30 +76,8 @@ pub trait InvertOrZero {
 	}
 }
 
-// The `@ strategy` arm wires `$name`'s `Mul` to a strategy wrapper: a `TransparentWrapper` struct
-// (e.g. `Gfni`, `MulFromWideMul`) that carries the actual algorithm. We wrap the inputs, run
-// the wrapper's `Mul`, and peel the result. `$strategy` is captured as raw token-trees (not
-// `:ty`/`:path`) because a matched type fragment is opaque and can't have `<$name>` appended to it.
-macro_rules! impl_mul_with {
-	($name:ident @ $($strategy:tt)*) => {
-		impl std::ops::Mul for $name {
-			type Output = Self;
-
-			#[inline]
-			fn mul(self, rhs: Self) -> Self {
-				$crate::tracing::trace_multiplication!($name);
-
-				<$($strategy)* <$name> as ::bytemuck::TransparentWrapper<$name>>::peel(
-					<$($strategy)* <$name> as ::bytemuck::TransparentWrapper<$name>>::wrap(self)
-						* <$($strategy)* <$name> as ::bytemuck::TransparentWrapper<$name>>::wrap(rhs),
-				)
-			}
-		}
-	};
-}
-
-pub(crate) use impl_mul_with;
-
+// A strategy is captured as raw token-trees rather than a type fragment.
+// A matched type fragment is opaque, so it cannot take the packed type as a generic argument.
 macro_rules! impl_square_with {
 	($name:ident @ $($strategy:tt)*) => {
 		impl $crate::arithmetic_traits::Square for $name {
@@ -109,6 +94,23 @@ macro_rules! impl_square_with {
 }
 
 pub(crate) use impl_square_with;
+
+macro_rules! impl_mul_x_with {
+	($name:ident @ $($strategy:tt)*) => {
+		impl $crate::arithmetic_traits::MulX for $name {
+			#[inline]
+			fn mul_x(self) -> Self {
+				<$($strategy)* <$name> as ::bytemuck::TransparentWrapper<$name>>::peel(
+					$crate::arithmetic_traits::MulX::mul_x(
+						<$($strategy)* <$name> as ::bytemuck::TransparentWrapper<$name>>::wrap(self),
+					),
+				)
+			}
+		}
+	};
+}
+
+pub(crate) use impl_mul_x_with;
 
 macro_rules! impl_invert_with {
 	($name:ident @ $($strategy:tt)*) => {

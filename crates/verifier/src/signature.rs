@@ -60,7 +60,7 @@
 //!   an empty message (`Some(&[])`, which binds `H("")`) is distinct from no message at all
 //!   (`None`, which binds nothing).
 
-use binius_hash::binary_merkle_tree::HashSuite;
+use binius_hash::HashSuite;
 use binius_transcript::{BufMut, TranscriptWriter};
 use digest::Digest;
 
@@ -73,7 +73,7 @@ use digest::Digest;
 ///
 /// The `writer` must be an *observing* writer (obtained from `transcript.observe()`), so the
 /// digest is mixed into the Fiat-Shamir state without being written to the proof tape.
-pub fn observe_message<H, B>(writer: &mut TranscriptWriter<B>, message: &[u8])
+pub fn observe_message<H, B>(writer: &mut TranscriptWriter<'_, B>, message: &[u8])
 where
 	H: HashSuite,
 	B: BufMut,

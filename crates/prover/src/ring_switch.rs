@@ -1,32 +1,37 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use std::{iter, ops::Deref};
+use std::{array, iter, ops::Deref};
 
 use binius_compute::{Allocator, VecLike};
+use binius_core::word::Word;
 use binius_field::{
-	ExtensionField, Field, PackedBinaryField128x1b, PackedField, cast_base,
+	ExtensionField, PackedField,
 	linear_transformation::{
 		BytewiseLookupTransformationFactory, InputWrappingTransformationFactory,
 		LinearTransformationFactory, OutputWrappingTransformationFactory, Transformation,
 	},
+	packed_extension,
 };
-use binius_ip_prover::channel::IPProverChannel;
+use binius_ip_prover::{
+	channel::IPProverChannel,
+	sumcheck::{bivariate_product_prover, prove_single},
+};
 use binius_math::{
-	FieldBuffer, FieldSlice, FieldVec, inner_product::inner_product,
+	FieldBuffer, FieldSlice, FieldVec, inner_product::inner_product_packed,
 	multilinear::eq::eq_ind_partial_eval, tensor_algebra::TensorAlgebra,
 };
-use binius_utils::rayon::prelude::*;
-use binius_verifier::config::{B1, B128};
+use binius_utils::{checked_arithmetics::log2_ceil_usize, rayon::prelude::*};
+use binius_verifier::{
+	config::{B1, B128, LOG_WORDS_PER_ELEM},
+	protocols::shift::evaluate_words_mle,
+};
 use itertools::izip;
 
-use crate::fold_word::{fold_row_group, row_fold_tables};
-
-/// Base-2 log of the row group one subset-sum table covers.
-///
-/// Eight rows is the widest group whose lookup index still fits one byte.
-/// One table load then replaces eight conditional additions.
-const LOG_SPLIT_CHUNK_BITS: usize = 3;
+use crate::{
+	bit_matrix::{ColumnSums, LOG_WEIGHTS_PER_TABLE, RowFoldTables},
+	prove::pack_witness,
+};
 
 /// Base-2 log of the low-factor length the tensor split targets.
 ///
@@ -38,9 +43,7 @@ const LOG_SPLIT_CHUNK_BITS: usize = 3;
 pub const LOG_SPLIT_BLOCK: usize = <B128 as ExtensionField<B1>>::LOG_DEGREE;
 
 /// Number of subset-sum tables one chunk of the split fold uses.
-const N_ROW_TABLES: usize = 1 << (LOG_SPLIT_BLOCK - LOG_SPLIT_CHUNK_BITS);
-/// Rows one subset-sum table covers.
-const ROW_GROUP: usize = 1 << LOG_SPLIT_CHUNK_BITS;
+const N_ROW_TABLES: usize = 1 << (LOG_SPLIT_BLOCK - LOG_WEIGHTS_PER_TABLE);
 
 /// Folds the 1-bit rows of a matrix against an equality tensor supplied as two factors.
 ///
@@ -108,7 +111,7 @@ where
 	// So every row past its end is weighted zero, whatever bits that row holds:
 	// rows past the end of a block read as zero, and a matrix narrower than one packed
 	// element leaves lanes that are not rows at all.
-	let lo_tables = row_fold_tables::<B128, N_ROW_TABLES>(eq_lo.as_ref());
+	let lo_tables = RowFoldTables::<B128, N_ROW_TABLES>::new(eq_lo.as_ref());
 
 	// A sub-width low factor still occupies its one packed element, so the block is that element.
 	let block_packed_len = 1 << eq_lo.log_len().saturating_sub(P::LOG_WIDTH);
@@ -124,44 +127,42 @@ where
 				//
 				// A matrix row is 128 single-bit columns, which is one full-width packed row.
 				let mut rows = P::iter_slice(mat_block);
-				let mut columns = [[B128::ZERO; ROW_GROUP]; N_ROW_TABLES];
+				let mut sums = ColumnSums::zero();
 
-				for table in &lo_tables {
-					// Gather this group's rows out of the packed elements they sit in.
-					// Rows past the end of the block stay zero, and lanes past the last row
-					// carry weight zero, so neither contributes.
-					// A field element and a 128-bit row of single-bit scalars share one underlier,
-					// so each view is free.
-					let mut group = [PackedBinaryField128x1b::default(); ROW_GROUP];
-					iter::zip(&mut group, &mut rows)
-						.for_each(|(dst, src)| *dst = cast_base::<B1, _>(src));
+				// Gather each group's rows out of the packed elements they sit in, lazily, so a
+				// group is folded as soon as it is complete.
+				// Rows past the end of the block stay zero, and lanes past the last row carry
+				// weight zero, so neither contributes.
+				// A field element and a 128-bit row of single-bit scalars share one underlier, so
+				// each view is free.
+				lo_tables.fold_into(
+					iter::repeat_with(|| {
+						array::from_fn(|_| {
+							rows.next()
+								.map(packed_extension::cast_base::<B1, _>)
+								.unwrap_or_default()
+						})
+					})
+					.take(N_ROW_TABLES),
+					&mut sums,
+				);
 
-					fold_row_group(&group, table, &mut columns);
-				}
-
-				// Scale by this block's high-factor entry and merge, unpacking the nesting into
-				// bit-position order.
+				// Scale by this block's high-factor entry and merge.
 				// That is 128 multiplies per block, one per row.
-				{
-					let acc = acc.as_mut();
-					for (i, group) in columns.iter().enumerate() {
-						for (j, &column) in group.iter().enumerate() {
-							acc[(i << LOG_SPLIT_CHUNK_BITS) | j] += eq_hi_val * column;
-						}
-					}
-				}
+				sums.add_scaled_to(eq_hi_val, acc.as_mut());
 				acc
 			},
 		)
-		.reduce(
-			|| FieldBuffer::zeros(log_scalar_bit_width),
-			|mut lhs, rhs| {
-				for (lhs_i, &rhs_i) in izip!(lhs.as_mut(), rhs.as_ref()) {
-					*lhs_i += rhs_i;
-				}
-				lhs
-			},
-		)
+		// A merge seeded with a partial that already exists never touches a buffer of zeros.
+		// An identity would allocate and zero one accumulator per merge, then add all of it.
+		.reduce_with(|mut lhs, rhs| {
+			for (lhs_i, &rhs_i) in izip!(lhs.as_mut(), rhs.as_ref()) {
+				*lhs_i += rhs_i;
+			}
+			lhs
+		})
+		// An empty matrix yields no partials at all, and folds to zero.
+		.unwrap_or_else(|| FieldBuffer::zeros(log_scalar_bit_width))
 }
 
 /// Builds the ring-switching equality indicator directly from the tensor's two factors.
@@ -282,7 +283,7 @@ pub struct RingSwitchOutput<A: Allocator, P: PackedField> {
 ///   log of the extension degree of B128 over B1 (= 7)
 pub fn prove<A, P, Channel>(
 	alloc: &A,
-	packed_witness: FieldSlice<P>,
+	packed_witness: FieldSlice<'_, P>,
 	eval_point: &[B128],
 	channel: &mut Channel,
 ) -> RingSwitchOutput<A, P>
@@ -312,8 +313,13 @@ where
 	let r_double_prime = channel.sample_many(log_packing);
 	let eq_r_double_prime = eq_ind_partial_eval::<B128>(&r_double_prime);
 
-	// Compute sumcheck claim
-	let sumcheck_claim = inner_product(s_hat_u, eq_r_double_prime.as_ref().iter().copied());
+	// GF(2^128) reduction is F2-linear, so it commutes with XOR.
+	// Summing 128 wide products then reducing once matches reducing each term first.
+	let sumcheck_claim = inner_product_packed::<B128, B128>(
+		log_packing,
+		s_hat_u.into_iter(),
+		eq_r_double_prime.as_ref().iter().copied(),
+	);
 
 	// Compute ring-switching equality indicator (transparent poly)
 	let rs_eq_ind = tracing::debug_span!("Compute ring-switching equality indicator")
@@ -325,12 +331,68 @@ where
 	}
 }
 
+/// Proves the public segment's evaluation claim.
+///
+/// The shift closes over the public segment as a bit matrix, at `r_j` over the bit within a word
+/// and the low coordinates of `r_y` over the word index. The verifier holds the segment but not
+/// its bits, so the claim is stated here and reduced in two steps:
+///
+/// 1. a ring-switch onto the segment's packed form, leaving the claim `sum_x P(x) A(x)` against the
+///    ring-switching indicator;
+/// 2. a sumcheck over the packed segment's own variables, leaving one evaluation of each factor.
+///
+/// Nothing here is committed, so the verifier finishes on its own: it evaluates the packed
+/// segment's multilinear from the words it holds, and the indicator from its succinct formula.
+///
+/// ## Arguments
+///
+/// * `alloc` - the allocator the packed segment and the indicator are drawn from
+/// * `public_words` - the public segment, unpadded
+/// * `r_j` - the bit-index challenges
+/// * `r_y` - the word-index challenges, of which the segment spans the low ones
+/// * `channel` - the prover channel for sending/sampling
+///
+/// ## Preconditions
+///
+/// * `r_y` must have at least as many coordinates as the packed segment spans words
+pub fn prove_public_eval<A, P, Channel>(
+	alloc: &A,
+	public_words: &[Word],
+	r_j: &[B128],
+	r_y: &[B128],
+	channel: &mut Channel,
+) where
+	A: Allocator,
+	P: PackedField<Scalar = B128>,
+	Channel: IPProverChannel<B128>,
+{
+	// The claim is over the packed segment, so it spans whole field elements: a segment shorter
+	// than one still spans one, reading the words past its end as zero.
+	let log_public_elems = log2_ceil_usize(public_words.len()).saturating_sub(LOG_WORDS_PER_ELEM);
+	let r_y_public = &r_y[..log_public_elems + LOG_WORDS_PER_ELEM];
+
+	channel.send_one(evaluate_words_mle::<B128, B128>(public_words, r_j, r_y_public));
+
+	let packed = pack_witness::<P, _>(alloc, log_public_elems, public_words)
+		.expect("the element count is derived from the words being packed");
+	let RingSwitchOutput {
+		rs_eq_ind,
+		sumcheck_claim,
+	} = prove(alloc, packed.as_view(), &[r_j, r_y_public].concat(), channel);
+
+	// The reduced claim is the sum of the two multilinears' product over the hypercube, which is
+	// what the trace's opening hands to BaseFold. Here it is discharged by the sumcheck alone: the
+	// final evaluations need no message, since the verifier computes both itself.
+	let prover = bivariate_product_prover(alloc, [packed, rs_eq_ind], sumcheck_claim);
+	prove_single(prover, channel);
+}
+
 #[cfg(test)]
 mod test {
 	use binius_compute::GlobalAllocator;
 	use binius_field::{
-		BinaryField128bGhash, ExtensionField, PackedBinaryGhash2x128b, PackedBinaryGhash4x128b,
-		PackedField, PackedSubfield, cast_ext,
+		ExtensionField, Field, Ghash128b, PackedField, PackedGhash2x128b, PackedGhash4x128b,
+		PackedSubfield, packed_extension,
 	};
 	use binius_math::{
 		FieldBuffer,
@@ -343,7 +405,7 @@ mod test {
 
 	use super::*;
 
-	type F = BinaryField128bGhash;
+	type F = Ghash128b;
 
 	// The row fold, written straight from its definition:
 	//
@@ -399,8 +461,8 @@ mod test {
 		for (i, log_len) in [0, 1, 2, 6, 7, 8].into_iter().enumerate() {
 			let seed = i as u64;
 			check_split_fold_matches_definition::<F>(log_len, seed);
-			check_split_fold_matches_definition::<PackedBinaryGhash2x128b>(log_len, seed);
-			check_split_fold_matches_definition::<PackedBinaryGhash4x128b>(log_len, seed);
+			check_split_fold_matches_definition::<PackedGhash2x128b>(log_len, seed);
+			check_split_fold_matches_definition::<PackedGhash4x128b>(log_len, seed);
 		}
 	}
 
@@ -448,8 +510,8 @@ mod test {
 		for (i, log_len) in [0, 1, 2, 6, 7, 8].into_iter().enumerate() {
 			let seed = i as u64;
 			check_rs_eq_ind_from_factors::<F>(log_len, seed);
-			check_rs_eq_ind_from_factors::<PackedBinaryGhash2x128b>(log_len, seed);
-			check_rs_eq_ind_from_factors::<PackedBinaryGhash4x128b>(log_len, seed);
+			check_rs_eq_ind_from_factors::<PackedGhash2x128b>(log_len, seed);
+			check_rs_eq_ind_from_factors::<PackedGhash4x128b>(log_len, seed);
 		}
 	}
 
@@ -497,7 +559,7 @@ mod test {
 	fn test_row_fold_composes_into_the_claim() {
 		let mut rng = StdRng::seed_from_u64(0);
 
-		type P = PackedBinaryGhash2x128b;
+		type P = PackedGhash2x128b;
 
 		// The prover's row fold and the verifier's partial evaluation compose into the claim:
 		//
@@ -528,7 +590,7 @@ mod test {
 			bit_matrix
 				.as_ref()
 				.iter()
-				.map(|&bits_packed| cast_ext::<B1, P>(bits_packed))
+				.map(|&bits_packed| packed_extension::cast_ext::<B1, P>(bits_packed))
 				.collect(),
 		);
 		let (eq_lo, eq_hi) = expand_tensor_factors(suffix);

@@ -3,7 +3,7 @@
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr};
 
 use binius_utils::{
-	DeserializeBytes, SerializationError, SerializeBytes,
+	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 	serialization::{assert_enough_data_for, assert_enough_space_for},
 };
@@ -16,11 +16,9 @@ use rand::{
 
 use crate::{
 	BinaryField,
-	arch::portable::packed::PackedPrimitiveType,
-	underlier::{
-		Divisible, SmallU, UnderlierType, impl_divisible_bitmask, impl_divisible_memcast,
-		impl_divisible_self,
-	},
+	divisible::{Divisible, impl_divisible_memcast, impl_divisible_self},
+	packed_fields::primitive::PackedPrimitiveType,
+	underlier::{SmallU, Underlier, impl_divisible_bitmask},
 };
 
 /// 128-bit underlier for the portable build — a transparent wrapper over `u128`.
@@ -28,7 +26,7 @@ use crate::{
 /// On x86_64/aarch64 `M128` is a SIMD register and on wasm32 (with `simd128`) a `v128`; here it is
 /// a plain `u128` newtype. Wrapping rather than aliasing `u128` keeps `M128` a distinct type on
 /// every target, so the `M128 <-> u128` conversions never collide with `u128`'s own reflexive
-/// impls and the architecture-gated `BinaryField128bGhash` conversions need no cfg gate.
+/// impls and the architecture-gated `Ghash128b` conversions need no cfg gate.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, From, Into)]
 #[repr(transparent)]
 pub struct M128(u128);
@@ -88,6 +86,10 @@ impl DeserializeBytes for M128 {
 		assert_enough_data_for(&read_buf, std::mem::size_of::<Self>())?;
 		Ok(Self(read_buf.get_u128_le()))
 	}
+}
+
+impl FixedSizeSerializeBytes for M128 {
+	const BYTE_SIZE: usize = 16;
 }
 
 unsafe impl Zeroable for M128 {}
@@ -198,7 +200,7 @@ impl std::fmt::LowerHex for M128 {
 	}
 }
 
-impl UnderlierType for M128 {
+impl Underlier for M128 {
 	const LOG_BITS: usize = 7;
 	const ZERO: Self = Self(0);
 	const ONE: Self = Self(1);

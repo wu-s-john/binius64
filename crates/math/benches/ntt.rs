@@ -1,8 +1,7 @@
 // Copyright 2025 Irreducible Inc.
 
 use binius_field::{
-	BinaryField, FieldOps, PackedBinaryGhash1x128b, PackedBinaryGhash2x128b,
-	PackedBinaryGhash4x128b, PackedField,
+	BinaryField, FieldOps, PackedField, PackedGhash1x128b, PackedGhash2x128b, PackedGhash4x128b,
 };
 use binius_math::{
 	ntt::{
@@ -12,7 +11,7 @@ use binius_math::{
 	},
 	test_utils::random_field_buffer,
 };
-use binius_utils::{env::boolean_env_flag_set, rayon::ThreadPoolBuilder};
+use binius_utils::rayon::ThreadPoolBuilder;
 use criterion::{
 	BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 	measurement::WallTime,
@@ -36,7 +35,7 @@ enum ThroughputVariant {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::single_element_loop)]
 fn bench_ntts<F: BinaryField, P: PackedField<Scalar = F>>(
-	group: &mut BenchmarkGroup<WallTime>,
+	group: &mut BenchmarkGroup<'_, WallTime>,
 	throughput_var: ThroughputVariant,
 	log_d: usize,
 	domain_context: &(impl DomainContext<Field = P::Scalar> + Sync),
@@ -65,7 +64,7 @@ fn bench_ntts<F: BinaryField, P: PackedField<Scalar = F>>(
 			};
 
 			let mut data = random_field_buffer::<P>(&mut rng, log_d);
-			b.iter(|| ntt.forward_transform(data.to_mut(), skip_early, skip_late))
+			b.iter(|| ntt.forward_transform(data.as_mut_view(), skip_early, skip_late));
 		});
 	}
 
@@ -74,7 +73,7 @@ fn bench_ntts<F: BinaryField, P: PackedField<Scalar = F>>(
 		let ntt = NeighborsLastBreadthFirst { domain_context };
 
 		let mut data = random_field_buffer::<P>(&mut rng, log_d);
-		b.iter(|| ntt.forward_transform(data.to_mut(), skip_early, skip_late))
+		b.iter(|| ntt.forward_transform(data.as_mut_view(), skip_early, skip_late));
 	});
 
 	for log_num_shares in [0, 3] {
@@ -97,8 +96,8 @@ fn bench_ntts<F: BinaryField, P: PackedField<Scalar = F>>(
 					.build()
 					.unwrap();
 				thread_pool.install(|| {
-					b.iter(|| ntt.forward_transform(data.to_mut(), skip_early, skip_late))
-				})
+					b.iter(|| ntt.forward_transform(data.as_mut_view(), skip_early, skip_late));
+				});
 			});
 		}
 	}
@@ -209,12 +208,14 @@ fn bench_fields(c: &mut Criterion) {
 			("pre-expanded", GaoMateerPreExpanded<_>, GaoMateerPreExpanded::generate),
 		],
 		fields = [
-			(PackedBinaryGhash1x128b, "1xGhash"),
-			(PackedBinaryGhash2x128b, "2xGhash"),
-			(PackedBinaryGhash4x128b, "4xGhash"),
+			(PackedGhash1x128b, "1xGhash"),
+			(PackedGhash2x128b, "2xGhash"),
+			(PackedGhash4x128b, "4xGhash"),
 		],
 		log_d = [16, 20, 24],
-		skip_params = [(0, 0), (4, 0), (0, 4)],
+		// `skip_early = 1` is the shape a rate-1/2 Reed-Solomon encoder asks for.
+		// It is also the smallest skip that leaves the multithreaded shared phase non-empty.
+		skip_params = [(0, 0), (1, 0), (4, 0), (0, 4)],
 	}
 }
 
@@ -226,11 +227,23 @@ const fn num_muls(log_d: usize, skip_early: usize, skip_late: usize) -> u64 {
 	num_rounds as u64 * muls_per_round
 }
 
+/// Returns whether `flag` is set in the environment to an affirmative value.
+///
+/// Matching ignores surrounding whitespace and ASCII case, so `On` and `TRUE` both count.
+fn env_flag_set(flag: &str) -> bool {
+	std::env::var(flag).is_ok_and(|val| {
+		let val = val.trim();
+		["1", "on", "true", "yes"]
+			.iter()
+			.any(|affirmative| val.eq_ignore_ascii_case(affirmative))
+	})
+}
+
 /// Determine the throughput variant based on an environment variable.
 fn determine_throughput_variant() -> ThroughputVariant {
 	const VAR_NAME: &str = "NTT_MUL_THROUGHPUT";
 
-	if boolean_env_flag_set(VAR_NAME) {
+	if env_flag_set(VAR_NAME) {
 		println!("{VAR_NAME} is activated - using *multiplication* throughput");
 		ThroughputVariant::Multiplication
 	} else {

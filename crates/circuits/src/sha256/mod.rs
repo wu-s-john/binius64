@@ -5,8 +5,8 @@ pub mod compress;
 use binius_core::word::Word;
 use binius_frontend::{CircuitBuilder, Wire};
 pub use compress::{
-	State, populate_message_block, ref_compress, sha256_compress, sha256_compress_2x,
-	sha256_compress_2x_seq,
+	Sha256Compress2x, State, populate_message_block, ref_compress, sha256_compress,
+	sha256_compress_2x, sha256_compress_2x_seq,
 };
 
 use crate::{
@@ -144,21 +144,23 @@ pub fn sha256_fixed(builder: &CircuitBuilder, message: &[Wire], len_bytes: usize
 		block_idx += 2;
 	}
 	if block_idx < n_blocks {
-		state = sha256_compress(
-			&builder.subcircuit(format!("sha256_fixed_compress[{block_idx}]")),
-			state,
-			blocks[block_idx],
-		);
+		// The trailing odd block has no partner, so the paired core would idle a whole lane on
+		// it. The single-lane core fills that lane from the block itself, splitting its own 64
+		// rounds across the two halves, and costs half as much.
+		//
+		// It takes a pair's leftover high halves, since it reads an input state's low half only.
+		let sub = builder.subcircuit(format!("sha256_fixed_compress[{block_idx}]"));
+		state = sha256_compress(&sub, state, blocks[block_idx]);
 	}
 
 	// The escaping digest is the one place a clean high half is required.
 	// So clear the high half once here rather than after every pair, since a caller compares all
 	// 64 bits.
 	//
-	// Why a single-block message skips it:
-	// - Such a message never enters the paired core.
-	// - The one-lane core maps an empty high half to an empty high half.
-	if n_blocks < 2 {
+	// Why an odd block count skips it:
+	// - Such a message ends on the one-lane core.
+	// - That core empties the high half of every word it returns.
+	if n_blocks % 2 == 1 {
 		return state.0;
 	}
 	std::array::from_fn(|i| clear_high_bits(builder, state.0[i], 32))
@@ -353,8 +355,8 @@ pub fn sha256_varlen(builder: &CircuitBuilder, message: &ByteVec) -> [Wire; 4] {
 mod tests {
 	use std::array;
 
-	use binius_core::{Word, verify::verify_constraints};
-	use binius_frontend::{CircuitBuilder, Wire};
+	use binius_core::Word;
+	use binius_frontend::{CircuitBuilder, CircuitStat, Wire};
 	use hex_literal::hex;
 	use sha2::Digest;
 
@@ -395,7 +397,7 @@ mod tests {
 		}
 
 		circuit.populate_wire_witness(&mut w).unwrap();
-		verify_constraints(cs, &w.into_value_vec()).unwrap();
+		cs.verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -512,7 +514,7 @@ mod tests {
 		}
 
 		circuit.populate_wire_witness(&mut w).unwrap();
-		verify_constraints(cs, &w.into_value_vec()).unwrap();
+		cs.verify(&w.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -567,5 +569,104 @@ mod tests {
 			// Test with our circuit
 			test_sha256_fixed_with_input(&message, expected_bytes);
 		}
+	}
+
+	#[test]
+	fn every_block_costs_the_same() {
+		// AND constraints one compression spends, as `compress`'s own bound pins it.
+		const AND_PER_BLOCK: usize = 364;
+
+		// Lengths chosen to end on a word, so no boundary mask joins the count.
+		for (len_bytes, n_blocks) in [(32, 1), (64, 2), (128, 3), (192, 4), (256, 5)] {
+			let b = CircuitBuilder::new();
+			let message: Vec<Wire> = (0..len_bytes / 4).map(|_| b.add_inout()).collect();
+
+			// Bind the digest, or dead code elimination drops the last compression's tail.
+			for wire in sha256_fixed(&b, &message, len_bytes) {
+				let public = b.add_inout();
+				b.assert_eq("digest", wire, public);
+			}
+
+			// The paired core carries two blocks and the single-lane core carries one.
+			// Both spend the two 32-bit halves of every gate, so an odd count costs no more
+			// per block than an even one.
+			let stat = CircuitStat::collect(&b.build());
+			assert_eq!(stat.n_and_constraints, n_blocks * AND_PER_BLOCK, "{len_bytes} bytes");
+		}
+	}
+
+	/// Hashes `message` with [`Sha256Compress2x`] as a chip, and checks the digest and the system.
+	///
+	/// The digest wires are public and filled with the reference digest, so a disagreement fails
+	/// to populate. What the chip adds is checked after: the paired compressions have to be
+	/// served by an instance that recomputes the same words.
+	fn check_fixed_with_compress_chip(message: &[u8]) {
+		let b = CircuitBuilder::new();
+		b.register_chip(Sha256Compress2x, &[]);
+
+		let n_words = message.len().div_ceil(4);
+		let message_wires: Vec<Wire> = (0..n_words).map(|_| b.add_witness()).collect();
+		let computed_digest = sha256_fixed(&b, &message_wires, message.len());
+		let digest_out: [Wire; 8] = array::from_fn(|_| b.add_inout());
+		for i in 0..8 {
+			b.assert_eq(format!("digest[{i}]"), computed_digest[i], digest_out[i]);
+		}
+
+		let circuit = b.build_m4();
+		circuit.validate().unwrap();
+		let cs = circuit.to_constraint_system();
+		cs.validate().unwrap();
+
+		let expected: [u8; 32] = sha2::Sha256::digest(message).into();
+
+		let witness = circuit
+			.generate_witness(|w| {
+				for (word_idx, wire) in message_wires.iter().enumerate() {
+					let mut packed = 0u32;
+					for i in 0..4 {
+						let byte_idx = word_idx * 4 + i;
+						if byte_idx < message.len() {
+							packed |= (message[byte_idx] as u32) << (24 - i * 8);
+						}
+					}
+					w[*wire] = Word(packed as u64);
+				}
+				for i in 0..8 {
+					let mut word = 0u32;
+					for j in 0..4 {
+						word |= (expected[i * 4 + j] as u32) << (24 - j * 8);
+					}
+					w[digest_out[i]] = Word(word as u64);
+				}
+			})
+			.unwrap_or_else(|e| {
+				panic!("sha256_fixed failed for len_bytes={}: {e:?}", message.len())
+			});
+
+		witness.verify(&cs).unwrap();
+	}
+
+	// The layers between `sha256_fixed` and `sha256_compress_2x` are untouched by the chip: block
+	// pairs, and the trailing odd block riding the paired core with a dead lane, land as calls
+	// because the builder holds the chip, not because anything in between was told. Lengths cover
+	// one pair, a pair plus a trailing block, two pairs, and two pairs plus a trailing block.
+	#[test]
+	fn a_registered_chip_serves_every_paired_compression() {
+		for &len in &[64usize, 128, 192, 300] {
+			let message: Vec<u8> = (0..len).map(|i| (i * 37 + 1) as u8).collect();
+			check_fixed_with_compress_chip(&message);
+		}
+	}
+
+	// A single-block message compresses single-lane only and never reaches the paired gadget, so
+	// its chip goes uncalled and the system it leaves is not one that can be populated.
+	#[test]
+	fn a_chip_no_paired_compression_reaches_leaves_an_uncalled_chip() {
+		let b = CircuitBuilder::new();
+		b.register_chip(Sha256Compress2x, &[]);
+		sha256_fixed(&b, &[b.add_witness()], 4);
+
+		let error = b.build_m4().validate().unwrap_err();
+		assert!(matches!(error, binius_frontend::CircuitM4Error::NeverCalled { .. }), "{error:?}");
 	}
 }

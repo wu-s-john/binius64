@@ -7,7 +7,7 @@ use binius_math::{FieldSlice, FieldVec};
 
 use super::{
 	mle_store::{ColId, ColumnChunk, EvaluationChunk, MleStore, RoundContext},
-	round_evals::RoundEvals2,
+	round_evals::RoundEvals,
 	round_evaluator::{MleCheckRoundEvaluator, SharedMleCheckProver},
 };
 
@@ -148,7 +148,14 @@ where
 		// corresponds to x=0, the high half to x=1.
 		let cols: [&ColumnChunk<'_, P>; N] = self.cols.map(|id| chunk.col(id));
 
-		// The evaluator's run holds `y_1` in slot 0 and `y_inf` in slot 1.
+		// Bind each half to a slice ahead of the element loop.
+		// A half is a base pointer and a length, so deriving it per element makes it a memory read.
+		//
+		//     per element, 4 columns:  derived in-loop   9 vector + 29 scalar loads
+		//                              bound here        9 vector loads
+		let los: [&[P]; N] = cols.map(|col| col.lo.as_ref());
+		let his: [&[P]; N] = cols.map(|col| col.hi.as_ref());
+
 		let mut y_1 = <P as WideMul>::Output::default();
 		let mut y_inf = <P as WideMul>::Output::default();
 		for (idx, &eq_i) in eq_ind.as_ref().iter().enumerate() {
@@ -157,8 +164,8 @@ where
 			let mut evals_inf = [P::default(); N];
 
 			for i in 0..N {
-				let lo_i = cols[i].lo.as_ref()[idx];
-				let hi_i = cols[i].hi.as_ref()[idx];
+				let lo_i = los[i][idx];
+				let hi_i = his[i][idx];
 
 				// Compose once with the high half and once with the lo+hi combination.
 				// The lo+hi branch corresponds to evaluation at infinity for multilinears.
@@ -173,8 +180,7 @@ where
 			y_inf += P::wide_mul((self.infinity_composition)(evals_inf), eq_i);
 		}
 
-		accum[0] += y_1;
-		accum[1] += y_inf;
+		RoundEvals([y_1, y_inf]).add_to(accum);
 	}
 
 	fn interpolate(
@@ -191,12 +197,9 @@ where
 		// `accum` is already reduced (the prover's `map` pass reduced the wide accumulators). Sum
 		// the packed lanes into scalars, then interpolate. `claim` is this round's prime eval;
 		// `alpha`, this round's eq coordinate, ties it to the point.
-		RoundEvals2 {
-			y_1: accum[0],
-			y_inf: accum[1],
-		}
-		.sum_scalars(n_vars_remaining)
-		.interpolate_eq(claim, alpha)
+		RoundEvals::<P, 2>::from_slots(accum)
+			.sum_scalars(n_vars_remaining)
+			.interpolate_eq(claim, alpha)
 	}
 }
 
@@ -205,7 +208,7 @@ mod tests {
 	use std::{array, iter};
 
 	use binius_compute::GlobalAllocator;
-	use binius_field::{Random, arch::OptimalPackedB128, field::FieldOps};
+	use binius_field::{arch::OptimalPackedB128, field::FieldOps};
 	use binius_ip::mlecheck;
 	use binius_math::{
 		FieldBuffer,
@@ -217,7 +220,7 @@ mod tests {
 	use rand::prelude::*;
 
 	use super::*;
-	use crate::sumcheck::{common::SumcheckProver, prove_single_mlecheck};
+	use crate::sumcheck::prove_single_mlecheck;
 
 	type StdChallenger = HasherChallenger<sha2::Sha256>;
 
@@ -297,6 +300,12 @@ mod tests {
 	}
 
 	#[test]
+	fn test_identity_mlecheck() {
+		// One column returned unchanged: the narrowest gather a round pass performs.
+		prove_verify::<_, OptimalPackedB128, 1>(|[a]| a, |[_a]| OptimalPackedB128::zero());
+	}
+
+	#[test]
 	fn test_linear_mlecheck() {
 		prove_verify::<_, OptimalPackedB128, 2>(
 			|[a, b]| a + b,
@@ -320,43 +329,5 @@ mod tests {
 			|[a, b, c, d]| (a + b) * (c + d),
 			|[a, b, c, d]| (a + b) * (c + d),
 		);
-	}
-
-	#[test]
-	fn test_round_claim_lerp_recovery() {
-		type P = OptimalPackedB128;
-		type F = <P as FieldOps>::Scalar;
-
-		let n_vars = 8;
-		let mut rng = StdRng::seed_from_u64(0);
-		let alloc = GlobalAllocator;
-
-		let multilinears: [_; 2] = array::from_fn(|_| random_field_buffer::<P>(&mut rng, n_vars));
-		let composition = |[a, b]: [P; 2]| a * b;
-		let composite_vals = (0..1 << n_vars.saturating_sub(P::LOG_WIDTH))
-			.map(|i| composition(array::from_fn(|j| multilinears[j].as_ref()[i])))
-			.collect_vec();
-		let composite_vals = FieldBuffer::new(n_vars, composite_vals);
-		let eval_point = random_scalars::<F>(&mut rng, n_vars);
-		let eval_claim = evaluate(&composite_vals, &eval_point);
-
-		let mut prover = quadratic_mlecheck_prover(
-			&alloc,
-			multilinears,
-			composition,
-			composition,
-			eval_point,
-			eval_claim,
-		);
-
-		let mut expected = vec![eval_claim];
-		for _ in 0..n_vars {
-			assert_eq!(prover.round_claim(), expected, "claim before execute");
-			let round = prover.execute();
-			assert_eq!(prover.round_claim(), expected, "claim recovered from coeffs");
-			let challenge = F::random(&mut rng);
-			expected = round.iter().map(|r| r.evaluate(&challenge)).collect();
-			prover.fold(challenge);
-		}
 	}
 }

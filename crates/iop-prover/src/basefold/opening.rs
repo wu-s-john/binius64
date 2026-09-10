@@ -3,11 +3,13 @@
 
 //! The core BaseFold opening protocol on the prover side.
 
+use std::ops::Deref;
+
 use binius_compute::Allocator;
 use binius_field::{BinaryField, PackedField};
 use binius_ip::mlecheck;
 use binius_ip_prover::sumcheck::{
-	common::SumcheckProver, multilinear_eval::multilinear_eval_prover,
+	common::MleCheckProver, multilinear_eval::multilinear_eval_prover,
 };
 use binius_math::{FieldVec, ntt::AdditiveNTT};
 
@@ -21,10 +23,10 @@ use crate::{fri::FRIFoldProver, merkle_channel::MerkleIPProverChannel};
 /// A prior batched sumcheck reduced the `k` masked opening claims to per-oracle point-evaluation
 /// claims `π_i'(ρ_i) = α_i` at a shared point `r ∈ K^𝐧` (`𝐧 = max_i n_i`). The caller has collapsed
 /// the oracle-index variables up front at sampled batching challenges `r'` into a single combined
-/// multilinear `𝛑(X) = Σ_i e[i]·π_i^↑(X)`, `e = eq_ind_partial_eval(r')` (passed as `witness`),
-/// with target `s' = 𝛑(r)`. Here we run the degree-1 MLE-check on `𝛑` against `r`, interleaved with
-/// the FRI codeword built (via [`FRIFoldProver::new_batch`]) from the `k` committed interleaved
-/// `[π_i ‖ ω_i]` codewords.
+/// multilinear `𝛑(X) = Σ_i e[i]·π_i^↑(X)`, `e` the indicator expanded at `r'` (passed as
+/// `witness`), with target `s' = 𝛑(r)`. Here we run the degree-1 MLE-check on `𝛑` against `r`,
+/// interleaved with the FRI codeword built (via [`FRIFoldProver::new_batch`]) from the `k`
+/// committed interleaved `[π_i ‖ ω_i]` codewords.
 ///
 /// ## Arguments
 ///
@@ -42,13 +44,13 @@ use crate::{fri::FRIFoldProver, merkle_channel::MerkleIPProverChannel};
 /// The final FRI value equals the final MLE-check value.
 /// The verifier asserts that equality when it runs the matching opening.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_mlecheck_basefold<A, F, P, NTT, Channel>(
+pub fn prove_mlecheck_basefold<A, F, P, NTT, Channel, Data>(
 	witness: FieldVec<P, A>,
 	eval_point: &[F],
 	eval_claim: F,
 	batch_challenge: Option<F>,
 	outer_challenges: &[F],
-	mut fri_folder: FRIFoldProver<'_, F, P, NTT, Channel::Commitment>,
+	mut fri_folder: FRIFoldProver<'_, F, P, NTT, Channel::Commitment, Data>,
 	channel: &mut Channel,
 	alloc: &A,
 ) where
@@ -57,6 +59,7 @@ pub fn prove_mlecheck_basefold<A, F, P, NTT, Channel>(
 	P: PackedField<Scalar = F>,
 	NTT: AdditiveNTT<Field = F> + Sync,
 	Channel: MerkleIPProverChannel<F>,
+	Data: Deref<Target = [P]>,
 {
 	let n_vars = witness.log_len();
 	let _scope = tracing::debug_span!(
@@ -119,7 +122,7 @@ pub fn prove_mlecheck_basefold<A, F, P, NTT, Channel>(
 mod test {
 	use anyhow::Result;
 	use binius_compute::GlobalAllocator;
-	use binius_field::{BinaryField, PackedBinaryGhash1x128b, PackedField};
+	use binius_field::{BinaryField, PackedField, PackedGhash1x128b};
 	use binius_hash::{StdDigest, StdHashSuite};
 	use binius_iop::{
 		basefold as verifier_basefold,
@@ -129,11 +132,11 @@ mod test {
 	use binius_ip::channel::IPVerifierChannel;
 	use binius_ip_prover::channel::IPProverChannel;
 	use binius_math::{
-		BinarySubspace, FieldBuffer,
+		FieldBuffer,
 		inner_product::inner_product_buffers,
-		line::extrapolate_line_packed,
+		line::extrapolate_line,
 		multilinear::eq::eq_ind_partial_eval,
-		ntt::{AdditiveNTT, NeighborsLastSingleThread, domain_context::GenericOnTheFly},
+		ntt::{NeighborsLastSingleThread, domain_context::GaoMateerOnTheFly},
 		test_utils::{random_field_buffer, random_scalars},
 	};
 	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
@@ -171,15 +174,13 @@ mod test {
 
 		let merkle_prover = BinaryMerkleTreeProver::<F, StdHashSuite>::new();
 
-		let subspace = BinarySubspace::with_dim(n_vars + 1 + LOG_INV_RATE);
-		let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+		let domain_context = GaoMateerOnTheFly::generate(n_vars + 1 + LOG_INV_RATE);
 		let ntt = NeighborsLastSingleThread::new(domain_context);
 
 		// For a single oracle the combined opening params (`optimal_for_batch`) also satisfy
 		// `encode_masked`'s preconditions (`log_batch_size() == 1`, `rs_code().log_dim() ==
 		// n_vars`).
 		let (fri_params, _) = binius_iop::fri::FRIParams::optimal_for_batch(
-			ntt.domain_context(),
 			merkle_prover.scheme(),
 			&[OracleSpec::new_zk(n_vars)],
 			LOG_INV_RATE,
@@ -189,8 +190,14 @@ mod test {
 		// Encode the interleaved (witness ‖ mask), generating the mask internally, and commit the
 		// codeword over the Merkle channel.
 		let mut commit_rng = StdRng::seed_from_u64(7);
-		let MaskedCodeword { codeword, mask } =
-			fri::encode_masked(&fri_params, 0, &ntt, witness.to_ref(), &mut commit_rng);
+		let MaskedCodeword { codeword, mask } = fri::encode_masked(
+			&fri_params,
+			0,
+			&ntt,
+			witness.as_view(),
+			&mut commit_rng,
+			&GlobalAllocator,
+		);
 
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
 		let mut prover_channel =
@@ -198,7 +205,7 @@ mod test {
 				&mut prover_transcript,
 				merkle_prover,
 			);
-		let codeword_commitment = prover_channel.send_merkle_commitment(codeword.to_ref(), 2);
+		let codeword_commitment = prover_channel.send_merkle_commitment(codeword.as_view(), 2);
 
 		// Sample the masking challenge γ and form π' = (1-γ)·witness + γ·mask.
 		let batch_challenge: F = IPProverChannel::sample(&mut prover_channel);
@@ -207,7 +214,7 @@ mod test {
 		(witness_prime.as_mut(), mask.as_ref())
 			.into_par_iter()
 			.for_each(|(w, &m)| {
-				*w = extrapolate_line_packed(*w, m, gamma_broadcast);
+				*w = extrapolate_line(*w, m, gamma_broadcast);
 			});
 
 		let eval_point_eq = eq_ind_partial_eval::<P>(evaluation_point);
@@ -228,7 +235,8 @@ mod test {
 			&mut prover_channel,
 			&GlobalAllocator,
 		);
-		drop(prover_channel);
+		// Hand the transcript back, releasing the channel's borrow of it.
+		prover_channel.into_transcript();
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		let mut verifier_channel =
@@ -257,7 +265,7 @@ mod test {
 
 	#[test]
 	fn test_mlecheck_basefold_zk_valid_proof() {
-		type P = PackedBinaryGhash1x128b;
+		type P = PackedGhash1x128b;
 
 		let n_vars = 8;
 		let mut rng = StdRng::seed_from_u64(0);
@@ -270,7 +278,7 @@ mod test {
 
 	#[test]
 	fn test_mlecheck_basefold_zk_invalid_proof() {
-		type P = PackedBinaryGhash1x128b;
+		type P = PackedGhash1x128b;
 
 		let n_vars = 8;
 		let mut rng = StdRng::seed_from_u64(0);

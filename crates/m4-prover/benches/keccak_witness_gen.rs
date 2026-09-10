@@ -8,9 +8,9 @@
 use std::array;
 
 use binius_circuits::keccak::permutation::keccak_f1600;
+use binius_compute::GlobalAllocator;
 use binius_core::word::Word;
 use binius_frontend::{Circuit, CircuitBuilder, Wire};
-use binius_m4_prover::ValueTable;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// The base-2 logarithm of the instance count: 2^13 = 8192 instances.
@@ -22,19 +22,19 @@ const STATE_LANES: usize = 25;
 /// Candidate instance-stripe widths for parallel [`ValueTable`] witness generation.
 const STRIPE_WIDTHS: [usize; 3] = [256, 512, 1024];
 
-/// Builds a circuit that applies one Keccak-f1600 permutation to a witness-input state and
-/// force-commits the permuted output words. Returns the circuit and the 25 input state wires.
+/// Builds a circuit that applies one Keccak-f1600 permutation to a public input state and promotes
+/// the permuted lanes to public outputs. Returns the circuit and the 25 input state wires.
 fn build_keccak_circuit() -> (Circuit, [Wire; STATE_LANES]) {
 	let builder = CircuitBuilder::new();
-	let input: [Wire; STATE_LANES] = array::from_fn(|_| builder.add_witness());
+	let input: [Wire; STATE_LANES] = array::from_fn(|_| builder.add_inout());
 
 	// Permute a copy of the input wires in place; `state` then holds the output wires.
 	let mut state = input;
 	keccak_f1600(&builder, &mut state);
 
-	// Pin the outputs so dead-code elimination keeps the whole permutation.
+	// Promoting the permuted state keeps the whole permutation alive under dead-code elimination.
 	for wire in state {
-		builder.force_commit(wire);
+		builder.mark_inout(wire);
 	}
 
 	(builder.build(), input)
@@ -57,29 +57,31 @@ fn bench_keccak_witness_gen(c: &mut Criterion) {
 
 	group.bench_function("value_table", |b| {
 		b.iter(|| {
-			ValueTable::populate(&circuit, LOG_INSTANCES, |instance, w| {
-				for lane in 0..STATE_LANES {
-					w[input[lane]] = input_word(instance, lane);
-				}
-			})
-			.unwrap()
+			circuit
+				.populate_batch(&GlobalAllocator, LOG_INSTANCES, |instance, w| {
+					for lane in 0..STATE_LANES {
+						w[input[lane]] = input_word(instance, lane);
+					}
+				})
+				.unwrap()
 		});
 	});
 
 	for stripe_width in STRIPE_WIDTHS {
 		group.bench_function(format!("value_table_parallel_{stripe_width}"), |b| {
 			b.iter(|| {
-				ValueTable::populate_parallel_with_stripe_width(
-					&circuit,
-					LOG_INSTANCES,
-					stripe_width,
-					|instance, w| {
-						for lane in 0..STATE_LANES {
-							w[input[lane]] = input_word(instance, lane);
-						}
-					},
-				)
-				.unwrap()
+				circuit
+					.populate_batch_parallel_with_stripe_width(
+						&GlobalAllocator,
+						LOG_INSTANCES,
+						stripe_width,
+						|instance, w| {
+							for lane in 0..STATE_LANES {
+								w[input[lane]] = input_word(instance, lane);
+							}
+						},
+					)
+					.unwrap()
 			});
 		});
 	}

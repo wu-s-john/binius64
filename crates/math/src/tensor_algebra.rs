@@ -3,13 +3,12 @@
 use std::{
 	iter::Sum,
 	marker::PhantomData,
-	mem,
 	ops::{Add, AddAssign, Sub, SubAssign},
 };
 
 use binius_field::{ExtensionField, Field, field::FieldOps};
 
-use crate::inner_product::inner_product_scalars;
+use crate::inner_product::inner_product;
 
 /// An element of the tensor algebra defined as the tensor product of `FE` and `FE` as fields.
 ///
@@ -38,7 +37,7 @@ where
 	/// * `elems` must have length equal to the extension degree, otherwise this will pad or
 	///   truncate.
 	pub fn new(mut elems: Vec<FE>) -> Self {
-		elems.resize(<FE::Scalar as ExtensionField<F>>::DEGREE, FE::zero());
+		elems.resize(FE::Scalar::DEGREE, FE::zero());
 		Self {
 			elems,
 			_marker: PhantomData,
@@ -47,12 +46,12 @@ where
 
 	/// Returns $\kappa$, the base-2 logarithm of the extension degree.
 	pub const fn kappa() -> usize {
-		<FE::Scalar as ExtensionField<F>>::LOG_DEGREE
+		FE::Scalar::LOG_DEGREE
 	}
 
 	/// Returns the multiplicative identity element, one.
 	pub fn one() -> Self {
-		let mut elems = vec![FE::zero(); <FE::Scalar as ExtensionField<F>>::DEGREE];
+		let mut elems = vec![FE::zero(); FE::Scalar::DEGREE];
 		elems[0] = FE::one();
 		Self {
 			elems,
@@ -60,14 +59,9 @@ where
 		}
 	}
 
-	/// Returns a slice of the vertical subfield elements composing the tensor algebra element.
-	pub fn vertical_elems(&self) -> &[FE] {
-		&self.elems
-	}
-
 	/// Constructs a [`TensorAlgebra`] in the vertical subring.
 	pub fn from_vertical(x: FE) -> Self {
-		let mut elems = vec![FE::zero(); <FE::Scalar as ExtensionField<F>>::DEGREE];
+		let mut elems = vec![FE::zero(); FE::Scalar::DEGREE];
 		elems[0] = x;
 		Self {
 			elems,
@@ -106,7 +100,7 @@ where
 	///
 	/// * `coeffs` must have length $2^\kappa$
 	pub fn fold_vertical(self, coeffs: &[FE]) -> FE {
-		inner_product_scalars(self.transpose().elems, coeffs.iter().cloned())
+		inner_product(self.transpose().elems, coeffs.iter().cloned())
 	}
 }
 
@@ -117,7 +111,7 @@ where
 {
 	fn default() -> Self {
 		Self {
-			elems: vec![FE::zero(); <FE::Scalar as ExtensionField<F>>::DEGREE],
+			elems: vec![FE::zero(); FE::Scalar::DEGREE],
 			_marker: PhantomData,
 		}
 	}
@@ -128,11 +122,6 @@ where
 	F: Field,
 	FE: ExtensionField<F>,
 {
-	/// Returns the byte size of an element.
-	pub const fn byte_size() -> usize {
-		mem::size_of::<FE>() << <FE as ExtensionField<F>>::LOG_DEGREE
-	}
-
 	/// Tensor product of a vertical subring element and a horizontal subring element.
 	pub fn tensor(vertical: FE, horizontal: FE) -> Self {
 		let elems = horizontal

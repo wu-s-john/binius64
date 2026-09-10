@@ -3,9 +3,8 @@
 
 use std::{iter, vec};
 
-use binius_field::{
-	BinaryField, BinaryField128bGhash as B128, Field, PackedBinaryGhash1x128b, PackedField,
-};
+use binius_compute::GlobalAllocator;
+use binius_field::{BinaryField, Field, Ghash128b as B128, PackedField, PackedGhash1x128b};
 use binius_hash::{StdDigest, StdHashSuite};
 use binius_iop::{
 	fri::{self, CodewordSpec, FRIFoldVerifier, FRIParams, verify::FRIQueryVerifier},
@@ -14,9 +13,9 @@ use binius_iop::{
 use binius_ip::channel::IPVerifierChannel;
 use binius_ip_prover::channel::IPProverChannel;
 use binius_math::{
-	BinarySubspace, ReedSolomonCode,
+	ReedSolomonCode,
 	multilinear::{eq::eq_ind_partial_eval_scalars, evaluate::evaluate},
-	ntt::{AdditiveNTT, NeighborsLastSingleThread, domain_context::GenericOnTheFly},
+	ntt::{NeighborsLastSingleThread, domain_context::GaoMateerOnTheFly},
 	test_utils::{Packed128b, random_field_buffer},
 };
 use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
@@ -45,8 +44,7 @@ fn test_commit_prove_verify_success<F, P>(
 	let params =
 		FRIParams::new(committed_rs_code, log_batch_size, arities.to_vec(), n_test_queries);
 
-	let subspace = BinarySubspace::with_dim(params.rs_code().log_len());
-	let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+	let domain_context = GaoMateerOnTheFly::generate(params.rs_code().log_len());
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 
 	let n_round_commitments = arities.len();
@@ -55,7 +53,7 @@ fn test_commit_prove_verify_success<F, P>(
 	let msg = random_field_buffer::<P>(&mut rng, params.log_msg_len());
 
 	// Prover encodes the message and commits the codeword over a Merkle channel.
-	let codeword = encode_interleaved(&params, 0, &ntt, msg.to_ref());
+	let codeword = encode_interleaved(&params, 0, &ntt, msg.as_view(), &GlobalAllocator);
 
 	let mut prover_challenger = ProverTranscript::new(StdChallenger::default());
 	let mut prover_channel =
@@ -63,7 +61,7 @@ fn test_commit_prove_verify_success<F, P>(
 			&mut prover_challenger,
 		);
 	let codeword_commitment =
-		prover_channel.send_merkle_commitment(codeword.to_ref(), 1 << log_batch_size);
+		prover_channel.send_merkle_commitment(codeword.as_view(), 1 << log_batch_size);
 
 	// Run the prover to generate the proximity proof
 	let mut round_prover = FRIFoldProver::new(&params, &ntt, codeword, codeword_commitment);
@@ -79,7 +77,8 @@ fn test_commit_prove_verify_success<F, P>(
 	}
 
 	round_prover.finish_proof(&mut prover_channel);
-	drop(prover_channel);
+	// Hand the transcript back, releasing the channel's borrow of it.
+	prover_channel.into_transcript();
 	// Now run the verifier, receiving commitments and openings over a Merkle channel.
 	let mut verifier_challenger = prover_challenger.into_verifier();
 	let mut channel = VerifierMerkleTranscriptChannel::<_, StdChallenger, _, StdHashSuite>::new(
@@ -139,7 +138,7 @@ fn test_commit_prove_verify_success_128b_full() {
 	let arities = vec![1; log_dimension - log_final_dimension];
 
 	// TODO: Make this test pass with non-trivial packing width
-	test_commit_prove_verify_success::<B128, PackedBinaryGhash1x128b>(
+	test_commit_prove_verify_success::<B128, PackedGhash1x128b>(
 		log_dimension,
 		log_inv_rate,
 		0,
@@ -154,7 +153,7 @@ fn test_commit_prove_verify_success_128b_higher_arity() {
 	let arities = [3, 2, 1];
 
 	// TODO: Make this test pass with non-trivial packing width
-	test_commit_prove_verify_success::<B128, PackedBinaryGhash1x128b>(
+	test_commit_prove_verify_success::<B128, PackedGhash1x128b>(
 		log_dimension,
 		log_inv_rate,
 		0,
@@ -215,7 +214,7 @@ fn test_commit_prove_verify_success_without_folding() {
 #[test]
 fn test_commit_prove_verify_batched_multi_oracle() {
 	type F = B128;
-	type P = PackedBinaryGhash1x128b;
+	type P = PackedGhash1x128b;
 
 	let mut rng = StdRng::seed_from_u64(0);
 
@@ -226,8 +225,7 @@ fn test_commit_prove_verify_batched_multi_oracle() {
 
 	// The reduced Reed-Solomon code is shared by every input oracle, so the domain only needs to
 	// cover its length.
-	let subspace = BinarySubspace::with_dim(log_dim + log_inv_rate);
-	let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+	let domain_context = GaoMateerOnTheFly::generate(log_dim + log_inv_rate);
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 
 	// Each oracle has RS dimension `log_dim` (no lifting), so every oracle sits at the reduced
@@ -242,8 +240,7 @@ fn test_commit_prove_verify_batched_multi_oracle() {
 			log_later_batch_size: log_batch_size,
 		})
 		.collect::<Vec<_>>();
-	let rs_code =
-		ReedSolomonCode::with_domain_context_subspace(ntt.domain_context(), log_dim, log_inv_rate);
+	let rs_code = ReedSolomonCode::new(log_dim, log_inv_rate);
 	let params = FRIParams::<F>::new_batch(rs_code, oracle_specs, vec![], n_test_queries);
 	assert_eq!(params.rs_code().log_dim(), log_dim);
 
@@ -259,9 +256,9 @@ fn test_commit_prove_verify_batched_multi_oracle() {
 		let oracle_params =
 			FRIParams::new(params.rs_code().clone(), log_batch_size, vec![], n_test_queries);
 		let msg = random_field_buffer::<P>(&mut rng, log_dim + log_batch_size);
-		let codeword = encode_interleaved(&oracle_params, 0, &ntt, msg.to_ref());
+		let codeword = encode_interleaved(&oracle_params, 0, &ntt, msg.as_view(), &GlobalAllocator);
 		let commitment =
-			prover_channel.send_merkle_commitment(codeword.to_ref(), 1 << log_batch_size);
+			prover_channel.send_merkle_commitment(codeword.as_view(), 1 << log_batch_size);
 		messages.push(msg);
 		committed_codewords.push((codeword, commitment));
 	}
@@ -276,7 +273,8 @@ fn test_commit_prove_verify_batched_multi_oracle() {
 		round_prover.execute_fold_round(&mut prover_channel);
 	}
 	round_prover.finish_proof(&mut prover_channel);
-	drop(prover_channel);
+	// Hand the transcript back, releasing the channel's borrow of it.
+	prover_channel.into_transcript();
 
 	// Run the verifier, receiving commitments and openings over a Merkle channel.
 	let mut verifier_challenger = prover_challenger.into_verifier();
@@ -317,14 +315,14 @@ fn test_commit_prove_verify_batched_multi_oracle() {
 	// so `max_early = 0` and the slice is `[outer ++ later]`. Oracle `i` folds with the
 	// `log_batch_size_i`-length suffix of the later group; the remaining (tail) challenges fold the
 	// shared reduced codeword. So the final value is
-	//   sum_i outer_tensor[i] * evaluate(msg_i, reversed(later_i ++ tail)).
+	//   sum_i outer_tensor[i] * msg_i.evaluate(reversed(later_i ++ tail)).
 	let max_later = log_batch_sizes.iter().copied().max().unwrap();
 	let log_n_oracles = log2_ceil_usize(log_batch_sizes.len());
 	let first_fold_arity = params.log_batch_size();
 	let outer = &verifier_challenges[..log_n_oracles];
 	let later = &verifier_challenges[log_n_oracles..log_n_oracles + max_later];
 	let tail = &verifier_challenges[first_fold_arity..];
-	let outer_tensor = eq_ind_partial_eval_scalars::<F>(outer);
+	let outer_tensor = eq_ind_partial_eval_scalars(outer);
 
 	let mut expected = F::ZERO;
 	for (i, (msg, &log_batch_size)) in iter::zip(&messages, &log_batch_sizes).enumerate() {
@@ -349,7 +347,7 @@ fn test_commit_prove_verify_batched_multi_oracle() {
 #[test]
 fn test_commit_prove_verify_batched_mixed_skip() {
 	type F = B128;
-	type P = PackedBinaryGhash1x128b;
+	type P = PackedGhash1x128b;
 
 	let mut rng = StdRng::seed_from_u64(0);
 
@@ -363,8 +361,7 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 
 	// Every oracle reduces to the shared dimension `log_dim`, so no lifting is exercised here — the
 	// focus is the inner-challenge windowing.
-	let subspace = BinarySubspace::with_dim(log_dim + log_inv_rate);
-	let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+	let domain_context = GaoMateerOnTheFly::generate(log_dim + log_inv_rate);
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 
 	// Every oracle sits at the reduced dimension `log_dim` (no lifting). The ZK oracle (batch 1)
@@ -378,8 +375,7 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 			log_later_batch_size: if is_zk { 0 } else { log_batch_size },
 		})
 		.collect::<Vec<_>>();
-	let rs_code =
-		ReedSolomonCode::with_domain_context_subspace(ntt.domain_context(), log_dim, log_inv_rate);
+	let rs_code = ReedSolomonCode::new(log_dim, log_inv_rate);
 	let params = FRIParams::<F>::new_batch(rs_code, oracle_specs, vec![], n_test_queries);
 	assert_eq!(params.rs_code().log_dim(), log_dim);
 
@@ -395,9 +391,9 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 		let oracle_params =
 			FRIParams::new(params.rs_code().clone(), log_batch_size, vec![], n_test_queries);
 		let msg = random_field_buffer::<P>(&mut rng, log_dim + log_batch_size);
-		let codeword = encode_interleaved(&oracle_params, 0, &ntt, msg.to_ref());
+		let codeword = encode_interleaved(&oracle_params, 0, &ntt, msg.as_view(), &GlobalAllocator);
 		let commitment =
-			prover_channel.send_merkle_commitment(codeword.to_ref(), 1 << log_batch_size);
+			prover_channel.send_merkle_commitment(codeword.as_view(), 1 << log_batch_size);
 		messages.push(msg);
 		committed_codewords.push((codeword, commitment));
 	}
@@ -412,7 +408,8 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 		round_prover.execute_fold_round(&mut prover_channel);
 	}
 	round_prover.finish_proof(&mut prover_channel);
-	drop(prover_channel);
+	// Hand the transcript back, releasing the channel's borrow of it.
+	prover_channel.into_transcript();
 
 	// Run the verifier, receiving commitments and openings over a Merkle channel.
 	let mut verifier_challenger = prover_challenger.into_verifier();
@@ -453,7 +450,7 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 	// `early_window ++ later_window`, the suffixes of the early and later groups of lengths
 	// `log_early_batch_size_i` and `log_later_batch_size_i`. The remaining (tail) challenges fold
 	// the shared reduced codeword. So the final value is
-	//   sum_i outer_tensor[i] * evaluate(msg_i, reversed(early_i ++ later_i ++ tail)).
+	//   sum_i outer_tensor[i] * msg_i.evaluate(reversed(early_i ++ later_i ++ tail)).
 	let max_early = params
 		.input_oracles()
 		.iter()
@@ -472,7 +469,7 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 	let outer = &verifier_challenges[max_early..max_early + log_n_oracles];
 	let later = &verifier_challenges[max_early + log_n_oracles..first_fold_arity];
 	let tail = &verifier_challenges[first_fold_arity..];
-	let outer_tensor = eq_ind_partial_eval_scalars::<F>(outer);
+	let outer_tensor = eq_ind_partial_eval_scalars(outer);
 
 	let mut expected = F::ZERO;
 	for (i, (msg, &(_log_batch_size, _is_zk))) in
@@ -506,7 +503,7 @@ fn test_commit_prove_verify_batched_mixed_skip() {
 #[test]
 fn test_commit_prove_verify_lifted_multi_oracle() {
 	type F = B128;
-	type P = PackedBinaryGhash1x128b;
+	type P = PackedGhash1x128b;
 
 	let mut rng = StdRng::seed_from_u64(0);
 
@@ -519,8 +516,7 @@ fn test_commit_prove_verify_lifted_multi_oracle() {
 
 	// A single shared domain context covers the reduced code; every per-oracle (smaller) code is
 	// derived from it so their subspaces are nested prefixes of the reduced subspace.
-	let subspace = BinarySubspace::with_dim(reduced_log_dim + log_inv_rate);
-	let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+	let domain_context = GaoMateerOnTheFly::generate(reduced_log_dim + log_inv_rate);
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 
 	// Each oracle is lifted from its own RS dimension up to `reduced_log_dim` (`log_lift` is the
@@ -533,11 +529,7 @@ fn test_commit_prove_verify_lifted_multi_oracle() {
 			log_later_batch_size: log_batch_size,
 		})
 		.collect::<Vec<_>>();
-	let rs_code = ReedSolomonCode::with_domain_context_subspace(
-		ntt.domain_context(),
-		reduced_log_dim,
-		log_inv_rate,
-	);
+	let rs_code = ReedSolomonCode::new(reduced_log_dim, log_inv_rate);
 	let params = FRIParams::<F>::new_batch(rs_code, oracle_specs, vec![], n_test_queries);
 	assert_eq!(params.rs_code().log_dim(), reduced_log_dim);
 
@@ -551,16 +543,12 @@ fn test_commit_prove_verify_lifted_multi_oracle() {
 	let mut messages = Vec::new();
 	let mut committed_codewords = Vec::new();
 	for (&log_dim, &log_batch_size) in iter::zip(&oracle_log_dims, &log_batch_sizes) {
-		let rs_code = ReedSolomonCode::with_domain_context_subspace(
-			ntt.domain_context(),
-			log_dim,
-			log_inv_rate,
-		);
+		let rs_code = ReedSolomonCode::new(log_dim, log_inv_rate);
 		let oracle_params = FRIParams::new(rs_code, log_batch_size, vec![], n_test_queries);
 		let msg = random_field_buffer::<P>(&mut rng, log_dim + log_batch_size);
-		let codeword = encode_interleaved(&oracle_params, 0, &ntt, msg.to_ref());
+		let codeword = encode_interleaved(&oracle_params, 0, &ntt, msg.as_view(), &GlobalAllocator);
 		let commitment =
-			prover_channel.send_merkle_commitment(codeword.to_ref(), 1 << log_batch_size);
+			prover_channel.send_merkle_commitment(codeword.as_view(), 1 << log_batch_size);
 		messages.push(msg);
 		committed_codewords.push((codeword, commitment));
 	}
@@ -575,7 +563,8 @@ fn test_commit_prove_verify_lifted_multi_oracle() {
 		round_prover.execute_fold_round(&mut prover_channel);
 	}
 	round_prover.finish_proof(&mut prover_channel);
-	drop(prover_channel);
+	// Hand the transcript back, releasing the channel's borrow of it.
+	prover_channel.into_transcript();
 
 	// Run the verifier, receiving commitments and openings over a Merkle channel.
 	let mut verifier_challenger = prover_challenger.into_verifier();
@@ -624,14 +613,14 @@ fn test_commit_prove_verify_lifted_multi_oracle() {
 	// (contributing the factor `prod (1 - tail_k)`), and the surviving `log_dim_i` tail challenges
 	// bind the real message. Hence the final value is
 	//   sum_i outer_tensor[i] * prod_{k<eta_i}(1 - tail_k)
-	//                          * evaluate(msg_i, reversed(later_i ++ tail[eta_i..])).
+	//                          * msg_i.evaluate(reversed(later_i ++ tail[eta_i..])).
 	let max_later = log_batch_sizes.iter().copied().max().unwrap();
 	let log_n_oracles = log2_ceil_usize(log_batch_sizes.len());
 	let first_fold_arity = params.log_batch_size();
 	let outer = &verifier_challenges[..log_n_oracles];
 	let later = &verifier_challenges[log_n_oracles..log_n_oracles + max_later];
 	let tail = &verifier_challenges[first_fold_arity..];
-	let outer_tensor = eq_ind_partial_eval_scalars::<F>(outer);
+	let outer_tensor = eq_ind_partial_eval_scalars(outer);
 
 	let mut expected = F::ZERO;
 	for (i, ((msg, &log_batch_size), &log_dim)) in
@@ -672,13 +661,12 @@ where
 	let params =
 		FRIParams::new(committed_rs_code, log_batch_size, arities.to_vec(), n_test_queries);
 
-	let subspace = BinarySubspace::with_dim(params.rs_code().log_len());
-	let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+	let domain_context = GaoMateerOnTheFly::generate(params.rs_code().log_len());
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 
 	let msg = random_field_buffer::<P>(&mut rng, params.log_msg_len());
 
-	let codeword = encode_interleaved(&params, 0, &ntt, msg.to_ref());
+	let codeword = encode_interleaved(&params, 0, &ntt, msg.as_view(), &GlobalAllocator);
 
 	let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
 	let mut prover_channel =
@@ -686,7 +674,7 @@ where
 			&mut prover_transcript,
 		);
 	let codeword_commitment =
-		prover_channel.send_merkle_commitment(codeword.to_ref(), 1 << log_batch_size);
+		prover_channel.send_merkle_commitment(codeword.as_view(), 1 << log_batch_size);
 
 	let mut round_prover = FRIFoldProver::new(&params, &ntt, codeword, codeword_commitment);
 
@@ -699,7 +687,8 @@ where
 	}
 
 	round_prover.finish_proof(&mut prover_channel);
-	drop(prover_channel);
+	// Hand the transcript back, releasing the channel's borrow of it.
+	prover_channel.into_transcript();
 
 	let scheme = binius_iop::merkle_tree::BinaryMerkleTreeScheme::new();
 	let proof_bytes = prover_transcript.finalize();
@@ -709,7 +698,7 @@ where
 #[test]
 fn test_proof_size_higher_arity() {
 	let (proof_bytes, params, scheme) =
-		generate_fri_proof::<B128, PackedBinaryGhash1x128b>(8, 2, 0, &[3, 2, 1]);
+		generate_fri_proof::<B128, PackedGhash1x128b>(8, 2, 0, &[3, 2, 1]);
 	assert_eq!(proof_bytes.len(), fri::proof_size(&params, &scheme));
 }
 

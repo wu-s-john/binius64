@@ -9,8 +9,10 @@ workspace = true
 
 [dependencies]
 binius-compute = { path = "../compute" }
+binius-core = { path = "../core" }
 binius-field = { path = "../field" }
 binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
 binius-iop = { path = "../iop" }
 binius-iop-prover = { path = "../iop-prover", default-features = false }
 binius-ip = { path = "../ip" }
@@ -27,16 +29,13 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 binius-hash = { path = "../hash" }
 binius-iop = { path = "../iop" }
 binius-ip = { path = "../ip" }
 binius-math = { path = "../math", features = ["test-utils"] }
 binius-spartan-verifier = { path = "../spartan-verifier" }
-binius-verifier = { path = "../verifier" }
 rand = { workspace = true, features = ["thread_rng"] }
 smallvec.workspace = true
 
 [features]
 default = []
-rayon = ["binius-utils/rayon"]

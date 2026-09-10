@@ -3,7 +3,7 @@
 //! GHASH² widening multiply for targets with a 256-bit carry-less multiply.
 //!
 //! The two diagonal Karatsuba products `[a·e, b·f]` are batched into a single
-//! [`PackedBinaryGhash2x128b`] widening multiply — one VPCLMUL over both 128-bit lanes — leaving
+//! [`PackedGhash2x128b`] widening multiply — one VPCLMUL over both 128-bit lanes — leaving
 //! only the Karatsuba cross product to a scalar widening multiply.
 
 use std::{
@@ -14,14 +14,14 @@ use std::{
 use bytemuck::TransparentWrapper;
 
 use crate::{
-	BinaryField128bGhash, Divisible, PackedBinaryGhash2x128b, PackedGhashSq1x256b, WideMul,
-	cast_base, packed_ghash_sq::ghash_sq_from_coords,
+	Divisible, Ghash128b, PackedGhash2x128b, PackedGhashSq1x256b, WideMul, arithmetic_traits::MulX,
+	packed_extension, packed_fields::ghash_sq::ghash_sq_from_coords,
 };
 
 /// The two unreduced GHASH products `[a·e, b·f]` batched into one packed widening multiply.
-type DiagWide = <PackedBinaryGhash2x128b as WideMul>::Output;
+type DiagWide = <PackedGhash2x128b as WideMul>::Output;
 /// The single unreduced GHASH cross product `(a+b)·(e+f)` from a scalar widening multiply.
-type CrossWide = <BinaryField128bGhash as WideMul>::Output;
+type CrossWide = <Ghash128b as WideMul>::Output;
 
 /// The unreduced product of two [`PackedGhashSq1x256b`] elements.
 ///
@@ -96,24 +96,24 @@ impl WideMul for GhashSqHybridWideMul<PackedGhashSq1x256b> {
 	fn wide_mul(a: Self, b: Self) -> Self::Output {
 		// The GHASH² coordinates already sit in the two 128-bit lanes of the 256-bit value, so
 		// viewing an operand as a packed GHASH pair is a free reinterpretation.
-		let a = cast_base::<BinaryField128bGhash, _>(Self::peel(a));
-		let b = cast_base::<BinaryField128bGhash, _>(Self::peel(b));
+		let a = packed_extension::cast_base::<Ghash128b, _>(Self::peel(a));
+		let b = packed_extension::cast_base::<Ghash128b, _>(Self::peel(b));
 
 		WideGhashSqProduct {
 			// Diagonal `[a·e, b·f]` as one two-lane packed widening multiply.
-			diag: PackedBinaryGhash2x128b::wide_mul(a, b),
+			diag: PackedGhash2x128b::wide_mul(a, b),
 			// Karatsuba cross product `(a+b)·(e+f)` as a scalar widening multiply.
-			cross: BinaryField128bGhash::wide_mul(a.get(0) + a.get(1), b.get(0) + b.get(1)),
+			cross: Ghash128b::wide_mul(a.get(0) + a.get(1), b.get(0) + b.get(1)),
 		}
 	}
 
 	#[inline]
 	fn reduce(wide: Self::Output) -> Self {
 		// Reduce the batched diagonal back to `t_0 = a·e`, `t_2 = b·f`, and the cross to `t_1`.
-		let diag = PackedBinaryGhash2x128b::reduce(wide.diag);
+		let diag = PackedGhash2x128b::reduce(wide.diag);
 		let t0 = diag.get(0);
 		let t2 = diag.get(1);
-		let t1 = BinaryField128bGhash::reduce(wide.cross);
+		let t1 = Ghash128b::reduce(wide.cross);
 
 		// Fold `Y² = X·Y + X`, recovering the cross term as `t_1 + t_0 + t_2`:
 		// `z_0 = t_0 + X·t_2`, `z_1 = (t_1 + t_0 + t_2) + X·t_2 = z_0 + t_1 + t_2`.

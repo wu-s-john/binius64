@@ -7,6 +7,8 @@
 //! Multiple lookers may share one table (and one pushforward) by a random linear combination:
 //! a challenge `gamma` weights looker `j` by `gamma^j`, and the per-looker circuits run batched
 //! (see [`crate::fracaddcheck`]).
+//! Several tables may be read in one reduction, each looker naming the one it reads. Every table
+//! keeps its own pushforward and its own logUp challenge; only the batching machinery is shared.
 //! See [Soukhanov25] for the construction.
 //!
 //! [Soukhanov25]: <https://eprint.iacr.org/2025/946>
@@ -78,6 +80,20 @@
 //! So both can run as one `(m-1)`-variable sumcheck followed by one shared line-fold.
 //! That yields a single evaluation point, collapsing the two `Y` evaluations into one.
 //!
+//! # Transparent tables
+//!
+//! A transparent (succinct) table is one the verifier evaluates itself, without a commitment.
+//! Against such a table the product sumcheck is not needed at all.
+//! Both of the claims it would reduce are linear relations on the one multilinear `Y`:
+//!
+//! ```text
+//!     <Y, eq_z> = Y(z)      the fractional-addition leaf claim
+//!     <Y, T>    = e         the product claim
+//! ```
+//!
+//! A caller holding `Y` as a committed oracle opens the two together against that one commitment.
+//! [`verify_reduction_transparent`] stops the reduction there and hands both claims back.
+//!
 //! # Soundness
 //!
 //! - The logUp identity for a random `c` catches a wrong `Y` except with probability `(n + m) /
@@ -87,6 +103,10 @@
 //! - The cross-multiplication of the root fractions assumes both root denominators are nonzero.
 //! - A root denominator is a product of factors `c - I(i)` or `c - j`.
 //! - That product is nonzero except with probability `(n + m) / |F|` over the random `c`.
+//! - With several tables, each is randomized by its own challenge `c_t`, so its contribution to the
+//!   root fraction is a rational function of `c_t` alone. A sum of such functions in disjoint
+//!   variables vanishes only when each does, which is what lets the one root check certify every
+//!   table. Under a shared challenge two tables' errors could cancel.
 //!
 //! # Index embedding
 //!
@@ -102,12 +122,12 @@
 //! This matches the index encoding used elsewhere in the Spartan verifier.
 
 mod error;
-mod final_layer;
 mod output;
+mod pushforward;
 mod verify;
 
 pub use self::{
 	error::{Error, VerificationError},
-	output::LogupOutput,
-	verify::{LookerClaim, verify_reduction},
+	output::{LogupOutput, LogupTableOutput, LogupTransparentOutput, LogupTransparentTableOutput},
+	verify::{LookerClaim, TableLookup, verify_reduction, verify_reduction_transparent},
 };

@@ -4,12 +4,12 @@ use std::array;
 
 use bytemuck::{Pod, TransparentWrapper};
 
-use super::packed::PackedPrimitiveType;
 use crate::{
 	BinaryField,
 	arch::LaneWideProduct,
 	arithmetic_traits::{InvertOrZero, Square, WideMul},
-	underlier::{ScaledUnderlier, UnderlierType},
+	packed_fields::primitive::PackedPrimitiveType,
+	underlier::{ScaledUnderlier, Underlier},
 };
 
 /// Wrapper for `ScaledUnderlier` multiplication that delegates to sub-underlier operations.
@@ -17,7 +17,7 @@ use crate::{
 #[derive(TransparentWrapper)]
 pub struct Scaled<T>(T);
 
-impl<U: UnderlierType + Pod, Scalar: BinaryField, const N: usize> std::ops::Mul
+impl<U: Underlier + Pod, Scalar: BinaryField, const N: usize> std::ops::Mul
 	for Scaled<PackedPrimitiveType<ScaledUnderlier<U, N>, Scalar>>
 where
 	PackedPrimitiveType<U, Scalar>: std::ops::Mul<Output = PackedPrimitiveType<U, Scalar>>,
@@ -36,7 +36,7 @@ where
 	}
 }
 
-impl<U: UnderlierType + Pod, Scalar: BinaryField, const N: usize> Square
+impl<U: Underlier + Pod, Scalar: BinaryField, const N: usize> Square
 	for Scaled<PackedPrimitiveType<ScaledUnderlier<U, N>, Scalar>>
 where
 	PackedPrimitiveType<U, Scalar>: Square,
@@ -49,7 +49,7 @@ where
 	}
 }
 
-impl<U: UnderlierType + Pod, Scalar: BinaryField, const N: usize> InvertOrZero
+impl<U: Underlier + Pod, Scalar: BinaryField, const N: usize> InvertOrZero
 	for Scaled<PackedPrimitiveType<ScaledUnderlier<U, N>, Scalar>>
 where
 	PackedPrimitiveType<U, Scalar>: InvertOrZero,
@@ -68,7 +68,7 @@ where
 /// to each of the `N` lanes independently, deferring reduction per lane via [`LaneWideProduct`].
 /// The `Scaled` analogue of [`Divide`](crate::arch::Divide)'s `WideMul`, but addressing the inner
 /// sub-underliers of `ScaledUnderlier` directly instead of splitting an underlier with `Divisible`.
-impl<U: UnderlierType + Pod, Scalar: BinaryField, const N: usize> WideMul
+impl<U: Underlier + Pod, Scalar: BinaryField, const N: usize> WideMul
 	for Scaled<PackedPrimitiveType<ScaledUnderlier<U, N>, Scalar>>
 where
 	PackedPrimitiveType<U, Scalar>: WideMul,
@@ -102,10 +102,10 @@ mod tests {
 	use proptest::prelude::*;
 
 	use super::*;
-	use crate::{aes_field::AESTowerField8b, arch::M128};
+	use crate::{arch::M128, fields::rijndael::Rijndael8b};
 
 	// A two-lane `ScaledUnderlier` AES packing whose `M128` lanes carry their own `WideMul`.
-	type Inner = PackedPrimitiveType<ScaledUnderlier<M128, 2>, AESTowerField8b>;
+	type Inner = PackedPrimitiveType<ScaledUnderlier<M128, 2>, Rijndael8b>;
 	type P = Scaled<Inner>;
 
 	fn packing(lo: u128, hi: u128) -> P {

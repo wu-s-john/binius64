@@ -1,7 +1,7 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use binius_compute::{Allocator, VecLike};
+use binius_compute::{Allocator, CollectIntoAllocVec, VecLike};
 use binius_field::{Field, PackedField};
 use binius_math::{FieldBuffer, FieldSlice, FieldVec};
 use binius_spartan_frontend::constraint_system::{
@@ -93,9 +93,8 @@ impl WiringTranspose {
 /// Also batches the three operands (a, b, c) using powers of lambda.
 /// Returns a multilinear polynomial over witness indices where each coefficient is the
 /// weighted sum of constraint contributions.
-/// `r_x_tensor` is the eq-indicator partial evaluation at r_x, i.e.
-/// `eq_ind_partial_eval(r_x)`. Accepting it as a parameter avoids redundant
-/// computation when folding multiple segments with the same r_x.
+/// `r_x_tensor` is the equality indicator expanded at r_x.
+/// Accepting it as a parameter avoids recomputing it for every segment sharing that r_x.
 ///
 /// The folded polynomial is drawn from `alloc`: it is the transparent multilinear of an oracle
 /// relation, which the channel owns until the opening runs.
@@ -112,16 +111,13 @@ pub fn fold_constraints<A: Allocator, F: Field, P: PackedField<Scalar = F>>(
 	let log_size = transposed.log_size();
 	let len = 1 << log_size.saturating_sub(P::LOG_WIDTH);
 
-	// Fill the packed words in parallel through the allocated buffer's spare capacity, then commit
-	// the length once every word has been written.
-	let mut result = alloc.alloc::<P>(len);
-	result.spare_capacity_mut()[..len]
-		.par_iter_mut()
-		.enumerate()
-		.for_each(|(packed_idx, slot)| {
+	// Build the packed words in parallel, straight into a buffer drawn from the allocator.
+	let result = (0..len)
+		.into_par_iter()
+		.map(|packed_idx| {
 			let base_idx = packed_idx << P::LOG_WIDTH;
 
-			slot.write(P::from_fn(|scalar_idx| {
+			P::from_fn(|scalar_idx| {
 				let idx = base_idx + scalar_idx;
 				if idx >= segment_size {
 					return F::ZERO;
@@ -134,10 +130,9 @@ pub fn fold_constraints<A: Allocator, F: Field, P: PackedField<Scalar = F>>(
 					acc += r_x_weight * lambda_weight;
 				}
 				acc
-			}));
-		});
-	// SAFETY: the loop above initialized every one of the `len` spare words.
-	unsafe { result.set_len(len) };
+			})
+		})
+		.collect_into_alloc_vec(alloc);
 
 	FieldBuffer::new(log_size, result)
 }
@@ -155,8 +150,8 @@ pub struct MulCheckWitness<A: Allocator, P: PackedField> {
 /// Evaluates an operand by XORing witness values at the specified indices.
 fn eval_operand<F: Field, P: PackedField<Scalar = F>>(
 	public: &[F],
-	precommit_packed: &FieldSlice<P>,
-	private_packed: &FieldSlice<P>,
+	precommit_packed: &FieldSlice<'_, P>,
+	private_packed: &FieldSlice<'_, P>,
 	operand: &Operand<WitnessIndex>,
 ) -> F {
 	operand
@@ -180,8 +175,8 @@ pub fn build_mulcheck_witness<A: Allocator, F: Field, P: PackedField<Scalar = F>
 	alloc: &A,
 	mul_constraints: &[MulConstraint<WitnessIndex>],
 	public: &[F],
-	precommit_packed: FieldSlice<P>,
-	private_packed: FieldSlice<P>,
+	precommit_packed: FieldSlice<'_, P>,
+	private_packed: FieldSlice<'_, P>,
 ) -> MulCheckWitness<A, P> {
 	const fn get_a(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
 		&c.a
@@ -247,7 +242,7 @@ pub fn build_mulcheck_witness<A: Allocator, F: Field, P: PackedField<Scalar = F>
 #[cfg(test)]
 mod tests {
 	use binius_compute::GlobalAllocator;
-	use binius_field::{BinaryField128bGhash as B128, Field, Random};
+	use binius_field::{Field, Ghash128b as B128, Random};
 	use binius_math::{
 		multilinear::{eq::eq_ind_partial_eval, evaluate::evaluate},
 		test_utils::{Packed128b, random_scalars},
@@ -417,13 +412,14 @@ mod tests {
 	#[test]
 	fn test_wiring_prove_verify() {
 		use binius_hash::StdDigest;
-		use binius_iop::channel::{
-			IOPVerifierChannel, OracleLinearRelation, OracleSpec, naive::NaiveVerifierChannel,
-		};
+		use binius_iop::channel::{IOPVerifierChannel, OracleSpec, naive::NaiveVerifierChannel};
 		use binius_iop_prover::channel::{IOPProverChannel, naive::NaiveProverChannel};
 		use binius_ip::channel::IPVerifierChannel;
 		use binius_ip_prover::channel::IPProverChannel;
-		use binius_math::{inner_product::inner_product_buffers, test_utils::random_field_buffer};
+		use binius_math::{
+			inner_product::inner_product_buffers, multilinear::evaluate::evaluate,
+			test_utils::random_field_buffer,
+		};
 		use binius_spartan_verifier::wiring::evaluate_wiring_mle_public;
 		use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
 
@@ -454,8 +450,8 @@ mod tests {
 			&GlobalAllocator,
 			&constraints,
 			&public,
-			precommit_buf.to_ref(),
-			private_buf.to_ref(),
+			precommit_buf.as_view(),
+			private_buf.as_view(),
 		);
 
 		// Sample r_x (sumcheck evaluation point for constraint axis)
@@ -481,7 +477,7 @@ mod tests {
 			NaiveProverChannel::<B128, _>::new(&mut prover_transcript, oracle_specs.clone());
 
 		// Send private witness oracle
-		let witness_oracle = prover_channel.send_oracle(private_buf.to_ref());
+		let witness_oracle = prover_channel.send_oracle(private_buf.as_view());
 
 		// Sample lambda
 		let lambda: B128 = prover_channel.sample();
@@ -504,12 +500,8 @@ mod tests {
 		);
 
 		// Finish the IOP with the oracle relation
-		prover_channel.prove_oracle_relations([(
-			witness_oracle,
-			private_buf,
-			wiring_poly.clone(),
-			trace_claim,
-		)]);
+		prover_channel.prove_oracle_relation(witness_oracle, wiring_poly.clone(), trace_claim);
+		prover_channel.finalize_oracle(witness_oracle, private_buf);
 
 		// === VERIFIER SIDE ===
 		let mut verifier_transcript = prover_transcript.into_verifier();
@@ -543,11 +535,7 @@ mod tests {
 
 		// Finish verification.
 		verifier_channel
-			.verify_oracle_relations([OracleLinearRelation {
-				oracle: witness_oracle,
-				transparent,
-				claim: verifier_trace_claim,
-			}])
-			.expect("verify_oracle_relations should succeed (inner product verified)");
+			.verify_oracle_relation(witness_oracle, transparent, verifier_trace_claim)
+			.expect("verify_oracle_relation should succeed (inner product verified)");
 	}
 }

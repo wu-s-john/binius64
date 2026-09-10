@@ -15,15 +15,19 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
-use binius_core::{constraint_system::ConstraintSystem, word::Word};
-use binius_field::BinaryField128bGhash as B128;
-use binius_hash::binary_merkle_tree::HashSuite;
+use binius_core::{
+	constraint_system::{ConstraintSystem, InoutSegment},
+	word::Word,
+};
+use binius_field::Ghash128b as B128;
+use binius_hash::HashSuite;
 use binius_iop::{
 	basefold::compiler::BaseFoldVerifierCompiler,
 	channel::OracleSpec,
 	fri::{self, MinProofSizeStrategy},
 	merkle_tree::BinaryMerkleTreeScheme,
 };
+use binius_ip::channel::WordIPVerifierChannel;
 use binius_spartan_frontend::{
 	compiler::compile,
 	constraint_system::{BlindingInfo, WitnessLayout},
@@ -39,7 +43,7 @@ use bytes::{Buf, BufMut};
 use digest::Output;
 
 use crate::{
-	config::LOG_WORDS_PER_ELEM,
+	protocols::shift::WiringEvalClaim,
 	verify::{IOPVerifier, SECURITY_BITS},
 };
 
@@ -68,22 +72,21 @@ where
 
 		constraint_system.validate()?;
 
-		// The validated layout guarantees a power-of-two public segment of at least one full
-		// element.
-		let log_public_words = constraint_system.log_public_words();
-		assert!(log_public_words >= LOG_WORDS_PER_ELEM);
+		let log_public_words = constraint_system.log_public_words(InoutSegment::Public);
 
 		let inner_iop_verifier = IOPVerifier::new(constraint_system, log_public_words);
 
 		// Symbolically execute the inner verifier to build the outer constraint system.
-		let dummy_public_words =
-			vec![Word::from_u64(0); 1 << inner_iop_verifier.log_public_words()];
+		let dummy_inout_words =
+			vec![Word::from_u64(0); inner_iop_verifier.constraint_system().n_inout];
 
 		let outer_builder = {
 			let _guard = tracing::debug_span!("Build ZK wrapper circuit").entered();
 			let mut builder_channel = IronSpartanBuilderChannel::new();
-			inner_iop_verifier
-				.verify(&dummy_public_words, &mut builder_channel)
+			// The wiring claim is dropped rather than discharged: [`Self::verify`] checks it over
+			// the public segment instead, so the circuit built here carries none of it.
+			let _ = inner_iop_verifier
+				.verify(&dummy_inout_words, &mut builder_channel)
 				.expect("symbolic verify should not fail");
 			builder_channel.finish()
 		};
@@ -102,10 +105,7 @@ where
 
 		// Pad the outer constraint system for zero-knowledge.
 		let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-		let blinding_info = BlindingInfo {
-			n_dummy_wires: n_test_queries,
-			n_dummy_constraints: 2,
-		};
+		let blinding_info = BlindingInfo::for_fri_queries(n_test_queries);
 		let outer_cs = ConstraintSystemPadded::new(outer_cs, blinding_info);
 		let outer_layout = Arc::new(outer_layout.with_blinding(*outer_cs.blinding_info()));
 		let outer_iop_verifier = IronSpartanIOPVerifier::new(outer_cs);
@@ -185,7 +185,7 @@ where
 	/// Verifies a ZK proof against the constraint system.
 	pub fn verify<Challenger_: Challenger>(
 		&self,
-		public: &[Word],
+		inout: &[Word],
 		transcript: &mut VerifierTranscript<Challenger_>,
 	) -> Result<(), Error> {
 		// Create BaseFold channel and wrap with outer verifier.
@@ -203,14 +203,36 @@ where
 			let inner_cs = self.inner_iop_verifier.constraint_system();
 			let _scope = tracing::debug_span!(
 				"Binius64",
-				n_hidden_words = inner_cs.n_hidden_words(),
+				n_hidden_words = inner_cs.n_hidden_words(InoutSegment::Public),
 				n_bitand = inner_cs.and_constraints.len(),
 				n_intmul = inner_cs.imul_constraints.len(),
 			)
 			.entered();
 
-			self.inner_iop_verifier
-				.verify(public, &mut wrapped_channel)?;
+			// The statement is observed here, and what comes back is what the IOP verifies
+			// against — the same split the transparent verifier makes.
+			let inout = wrapped_channel.observe_words(inout);
+			let claim = self
+				.inner_iop_verifier
+				.verify(&inout, &mut wrapped_channel)?;
+
+			// The wiring claim and every input it reads are public wires of the wrapper circuit, so
+			// tying the claim to the constraint system is an equation between values this verifier
+			// holds. Checking it here keeps the evaluation out of the circuit entirely, and the
+			// wrapper's other two runs — the symbolic build and the prover's replay — emit nothing
+			// for it either.
+			let public_value = |elem| {
+				wrapped_channel
+					.public_value(elem)
+					.expect("a public claim and its inputs are public wires")
+			};
+			WiringEvalClaim {
+				inputs: claim.inputs.iter().map(public_value).collect(),
+				claimed: public_value(&claim.claimed),
+				eval_fn: claim.eval_fn,
+			}
+			.check_native()
+			.map_err(crate::error::Error::from)?;
 		};
 
 		// Finish runs the outer spartan verification.
@@ -235,12 +257,12 @@ where
 	/// [`Self::verify`] checks. See [`crate::signature`] for details.
 	pub fn verify_sig<Challenger_: Challenger>(
 		&self,
-		public: &[Word],
+		inout: &[Word],
 		message: &[u8],
 		transcript: &mut VerifierTranscript<Challenger_>,
 	) -> Result<(), Error> {
 		crate::signature::observe_message::<H, _>(&mut transcript.observe(), message);
-		self.verify(public, transcript)
+		self.verify(inout, transcript)
 	}
 }
 

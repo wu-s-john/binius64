@@ -10,9 +10,12 @@ use std::{
 	vec::IntoIter as VecIntoIter,
 };
 
-use binius_field::{Field, util::FieldFn};
-use binius_iop::channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec};
-use binius_ip::channel::IPVerifierChannel;
+use binius_core::word::Word;
+use binius_field::{BinaryField, Field};
+use binius_iop::channel::{IOPVerifierChannel, OracleSpec, TransparentEvalFn};
+use binius_ip::channel::{
+	IPVerifierChannel, WordIPVerifierChannel, pack_words_concrete, select_word, subset_sum_word,
+};
 use binius_spartan_frontend::{
 	circuit_builder::{CircuitBuilder, WireAllocator, WitnessError, WitnessGenerator},
 	constraint_system::{WireKind, Witness, WitnessLayout},
@@ -65,6 +68,15 @@ impl<F: Field> ReplayChannel<F> {
 			.next()
 			.unwrap_or_else(|| panic!("replay exhausted: no more events"));
 
+		self.alloc_inout_elem(value)
+	}
+
+	/// Allocates the next inout wire around a value the replay computes rather than reads back.
+	///
+	/// Most inout wires carry a recorded value, since they stand for what crossed the channel. The
+	/// packed statement does not cross it: both sides hold the words and pack them, so the value
+	/// comes from the caller.
+	fn alloc_inout_elem(&mut self, value: F) -> CircuitElem<F, WitnessGenerator<F>> {
 		let wire = self.inout_alloc.alloc();
 		let witness_wire = self.witness_gen.borrow_mut().write_inout(wire, value);
 		CircuitElem::wire(&self.witness_gen, witness_wire)
@@ -99,6 +111,12 @@ impl<F: Field> IPVerifierChannel<F> for ReplayChannel<F> {
 		Ok(encrypted_elem + key)
 	}
 
+	fn recv_public_claim(&mut self) -> Result<Self::Elem, binius_ip::channel::Error> {
+		// Mirror `IronSpartanBuilderChannel::recv_public_claim`: the recorded interaction holds the
+		// claim unencrypted, so it fills one inout wire and no precommit key.
+		Ok(self.next_inout_elem())
+	}
+
 	fn sample(&mut self) -> Self::Elem {
 		self.next_inout_elem()
 	}
@@ -125,20 +143,36 @@ impl<F: Field> IPVerifierChannel<F> for ReplayChannel<F> {
 			}
 		}
 	}
+}
 
-	fn compute_public_value(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Self::Elem {
-		// The function's result enters as a single derived public wire (matching the symbolic
-		// builder's `hint_varsize`), whose value the prover computes natively from the
-		// public-derived inputs. See `IronSpartanBuilderChannel::compute_public_value`.
-		let out_wire = {
-			let mut witness_gen = self.witness_gen.borrow_mut();
-			let input_wires: Vec<_> = inputs
-				.iter()
-				.map(|elem| elem.to_wire(&mut witness_gen))
-				.collect();
-			witness_gen.hint_varsize(&input_wires, 1, move |vals| vec![f.call_native(vals)])[0]
-		};
-		CircuitElem::wire(&self.witness_gen, out_wire)
+impl<F: BinaryField> WordIPVerifierChannel<F> for ReplayChannel<F> {
+	type Word = Word;
+
+	// The recorded interaction already holds whatever the Fiat-Shamir state produced, so replaying
+	// observes nothing. This mirrors `IronSpartanBuilderChannel::observe_words`.
+	fn observe_words(&mut self, words: &[Word]) -> Vec<Word> {
+		words.to_vec()
+	}
+
+	fn subset_sum(&mut self, elems: &[Self::Elem], word: &Word) -> Self::Elem {
+		subset_sum_word(elems, *word)
+	}
+
+	fn select(&mut self, elems: &[Self::Elem], word: &Word) -> Self::Elem {
+		select_word(elems, *word)
+	}
+
+	fn sample_bits(&mut self, _bits: usize) -> Word {
+		Word::ZERO
+	}
+
+	fn pack_words(&mut self, words: &[Word]) -> Vec<Self::Elem> {
+		// One inout wire per packed element, matching the symbolic phase; the prover holds the same
+		// words the verifier does, so it packs them itself rather than replaying them.
+		pack_words_concrete::<F, F>(words)
+			.into_iter()
+			.map(|value| self.alloc_inout_elem(value))
+			.collect()
 	}
 }
 
@@ -157,17 +191,17 @@ impl<F: Field> IOPVerifierChannel<F> for ReplayChannel<F> {
 		Ok(())
 	}
 
-	fn verify_oracle_relations(
+	fn verify_oracle_relation(
 		&mut self,
-		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<Self::Oracle, Self::Elem>>,
+		_oracle: Self::Oracle,
+		_transparent: TransparentEvalFn<Self::Elem>,
+		claim: Self::Elem,
 	) -> Result<(), binius_iop::channel::Error> {
 		// For each oracle opening, the prover sends the decrypted evaluation. The outer verifier
 		// checks in the circuit equality of this value with the expected expression over encrypted
 		// values.
-		for relation in oracle_relations {
-			let decrypted_claim = self.next_inout_elem();
-			self.assert_zero(relation.claim - decrypted_claim)?;
-		}
+		let decrypted_claim = self.next_inout_elem();
+		self.assert_zero(claim - decrypted_claim)?;
 		Ok(())
 	}
 }
@@ -176,9 +210,7 @@ impl<F: Field> IOPVerifierChannel<F> for ReplayChannel<F> {
 mod tests {
 	use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-	use binius_field::{
-		BinaryField1b as B1, BinaryField128bGhash as B128, ExtensionField, field::FieldOps,
-	};
+	use binius_field::{BinaryField1b as B1, ExtensionField, Ghash128b as B128, field::FieldOps};
 	use binius_spartan_frontend::circuit_builder::{ConstraintBuilder, WitnessGenerator};
 	use binius_spartan_verifier::wrapper::circuit_elem::CircuitElem;
 

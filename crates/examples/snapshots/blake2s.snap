@@ -1,32 +1,30 @@
 blake2s circuit
 --
 Gates & Instructions
-├─ Number of gates: 18,568
-└─ Number of evaluation instructions: 18,568
+├─ Number of gates: 10,392
+└─ Number of evaluation instructions: 10,315
 
 Constraints
-├─ ZERO constraints: 5,292 used (64.6% of 2^13)
-│  [▓▓▓▓▓▓░░░░] spare: 2,900
-├─ AND constraints: 7,688 used (93.8% of 2^13)
-│  [▓▓▓▓▓▓▓▓▓░] spare: 504
+├─ ZERO constraints: 2,069 used (50.5% of 2^12)
+│  [▓▓▓▓▓░░░░░] spare: 2,027
+├─ AND constraints: 3,840 used (93.8% of 2^12)
+│  [▓▓▓▓▓▓▓▓▓░] spare: 256
 ├─ IMUL constraints: 0 used (0.0% of 0)
 │  [░░░░░░░░░░] spare: 0
 ├─ BMUL constraints: 0 used (0.0% of 0)
 │  [░░░░░░░░░░] spare: 0
-└─ Distinct value indices: 32,509
-   ├─ Distinct shifted value indices: 19,510
-   └─ Distinct unshifted value indices: 12,999
+└─ Distinct value indices: 21,375
+   ├─ Distinct shifted value indices: 15,462
+   └─ Distinct unshifted value indices: 5,913
 
 Value Vector
-├─ Public Section: 45 used (70.3% of 2^6)
-│  [▓▓▓▓▓▓▓░░░] spare: 19
-│  ├─ Constants: 45
+├─ Public Section: 35 (not committed)
+│  ├─ Constants: 35
 │  └─ Inout: 0
-├─ Private Section: 13,108 used (80.3%)
-│  [▓▓▓▓▓▓▓▓░░] spare: 3,212
+├─ Private Section: 6,037
 │  ├─ Witness: 136
-│  └─ Internal: 12,972
-├─ Total Committed: 13,153 used (80.3% of 2^14)
-│  [▓▓▓▓▓▓▓▓░░] spare: 3,231
-└─ Scratch (uncommitted): 13,268 (peak live: 37)
+│  └─ Internal: 5,901
+├─ Committed Trace: 6,037 used (73.7% of 2^13)
+│  [▓▓▓▓▓▓▓░░░] spare: 2,155
+└─ Scratch (uncommitted): 132 (peak live: 132)
 

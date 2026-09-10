@@ -234,7 +234,7 @@ fn novel_basis<DC: DomainContext>(domain_context: &DC) -> Vec<Polynomial<DC::Fie
 	novel_basis.push(Polynomial::one());
 	for i in 0..log_d {
 		for j in 0..novel_basis.len() {
-			novel_basis.push(&novel_basis[j] * &w_hat[i])
+			novel_basis.push(&novel_basis[j] * &w_hat[i]);
 		}
 	}
 
@@ -264,7 +264,7 @@ fn test_equivalence<F: BinaryField, NTT: AdditiveNTT<Field = F>>(ntt: &NTT) {
 
 	// way 2 to compute evaluations: use NTT
 	let mut ntt_data = novel_coeffs;
-	ntt.forward_transform(ntt_data.to_mut(), 0, 0);
+	ntt.forward_transform(ntt_data.as_mut_view(), 0, 0);
 
 	// check equivalence
 	assert_eq!(ntt_data.as_ref(), &evals);
@@ -273,7 +273,7 @@ fn test_equivalence<F: BinaryField, NTT: AdditiveNTT<Field = F>>(ntt: &NTT) {
 #[test]
 fn test_eval() {
 	const LOG_D: usize = 6;
-	type F = binius_field::BinaryField128bGhash;
+	type F = binius_field::Ghash128b;
 
 	// GaoMateer domain context
 	let domain_context = domain_context::GaoMateerPreExpanded::<F>::generate(LOG_D);

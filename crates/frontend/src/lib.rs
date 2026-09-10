@@ -23,17 +23,41 @@
 //!
 //! Use [`CircuitStat`] to inspect metrics like constraint counts and wire usage, helpful for
 //! optimization and debugging.
+//!
+//! # Layout
+//!
+//! - `builder` — the vocabulary a circuit author writes.
+//! - `ir` — the gate graph those calls build, held as dense index maps.
+//! - `gates` — the shape, the constraints and the instruction of each gate kind.
+//! - `pass` — transformations over the graph, and the pipeline that runs them.
+//! - `lower` — the constraints a graph emits, over wires rather than value indices.
+//! - `eval_form` — the bytecode that fills a witness, and the interpreters that run it.
+//! - `artifact` — what a build hands back: the circuit, its witnesses, its statistics.
+//!
+//! Every module reads `ir`, and nothing reads `builder`.
 
+#![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
-mod compiler;
-pub mod ops;
-pub mod stat;
+mod artifact;
+mod builder;
+mod eval_form;
+mod gates;
+mod ir;
+mod lower;
+mod pass;
 
-pub use compiler::{
-	CircuitBuilder, Options, Wire,
-	circuit::{Circuit, PopulateError, WitnessFiller},
-	eval_form::BatchPopulateError,
+pub use artifact::{
+	chip::{
+		self, ChipGadget, ChipRef, CircuitM4, CircuitM4Error, EmbeddedCircuit, PopulateM4Error,
+	},
+	circuit::Circuit,
+	stat::{self, CircuitStat},
+	witness::{AssertionFailure, BatchWitnessFiller, PopulateError, WitnessFiller},
+};
+pub use builder::{CircuitBuilder, Options};
+pub use eval_form::{BatchPopulateError, MAX_ASSERTION_FAILURES};
+pub use ir::{
+	Wire,
 	hints::{self, Hint},
 };
-pub use stat::CircuitStat;

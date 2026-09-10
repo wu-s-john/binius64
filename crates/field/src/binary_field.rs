@@ -7,53 +7,82 @@ use std::{
 	ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 
-use binius_utils::{
-	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
-	bytes::{Buf, BufMut},
-};
 use bytemuck::Zeroable;
 
-use super::{UnderlierType, WithUnderlier, extension::ExtensionField};
+use super::{Underlier, UnderlierView, field::ExtensionField};
 use crate::{Field, underlier::U1};
 
 /// A finite field with characteristic 2.
-pub trait BinaryField:
-	ExtensionField<BinaryField1b> + WithUnderlier<Underlier: UnderlierType>
-{
+pub trait BinaryField: ExtensionField<BinaryField1b> + UnderlierView<Underlier: Underlier> {
 	const N_BITS: usize = Self::ORDER_EXPONENT;
+
+	/// An element whose absolute trace is 1.
+	///
+	/// The absolute trace is the $\mathbb{F}_2$-linear map
+	///
+	/// $$\operatorname{Tr}(x) = \sum_{i=0}^{n-1} x^{2^i},$$
+	///
+	/// which lands in $\mathbb{F}_2$ and is surjective, so such an element always exists and
+	/// exactly half the field has trace 1. Which one is named here is arbitrary; each field picks
+	/// a single-bit element, the lowest one that qualifies.
+	///
+	/// The NTT's Gao-Mateer domain context seeds its basis with this: the descent
+	/// $\beta_i = \beta_{i+1}^2 + \beta_{i+1}$ reaches $\beta_0 = 1$ exactly when it starts from
+	/// an element of trace 1.
+	const TRACE_ONE_ELEMENT: Self;
 }
 
 /// Generates a binary field type over an underlier `$typ`.
+///
+/// `$gen` is the multiplicative generator and `$trace_one` an element of trace 1, both as raw
+/// underlier values.
 ///
 /// The default form derives the field's arithmetic from its width-one packing.
 /// The `custom_arithmetic` form omits that, for a field that defines its own arithmetic.
 macro_rules! binary_field {
 	// Default: the field's arithmetic is its width-one packing's arithmetic.
-	($vis:vis $name:ident($typ:ty), $gen:expr) => {
-		binary_field!(@base $vis $name($typ), $gen);
+	($vis:vis $name:ident($typ:ty), $gen:expr, $trace_one:expr) => {
+		binary_field!(@base $vis $name($typ), $gen, $trace_one);
 		binary_field!(@arithmetic_via_packed $name, $typ);
 	};
 	// The field provides its own `Mul`/`Square`/`InvertOrZero`/`WideMul` separately.
-	(custom_arithmetic $vis:vis $name:ident($typ:ty), $gen:expr) => {
-		binary_field!(@base $vis $name($typ), $gen);
+	(custom_arithmetic $vis:vis $name:ident($typ:ty), $gen:expr, $trace_one:expr) => {
+		binary_field!(@base $vis $name($typ), $gen, $trace_one);
 	};
 
-	(@base $vis:vis $name:ident($typ:ty), $gen:expr) => {
+	(@base $vis:vis $name:ident($typ:ty), $gen:expr, $trace_one:expr) => {
 		#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, bytemuck::TransparentWrapper)]
 		#[repr(transparent)]
 		$vis struct $name(pub(crate) $typ);
 
 		// NOTE: `new` is intentionally NOT generated here. Each field defines its own `new` so it
 		// can take an ergonomic constructor type independent of the underlier (e.g.
-		// `BinaryField128bGhash::new` takes `u128` even though its underlier is `M128`).
+		// `Ghash128b::new` takes `u128` even though its underlier is `M128`).
 		impl $name {
 			pub const fn val(self) -> $typ {
 				self.0
 			}
 		}
 
-		unsafe impl $crate::underlier::WithUnderlier for $name {
+		unsafe impl $crate::underlier::UnderlierView for $name {
 			type Underlier = $typ;
+		}
+
+		// Serialization forwards to the underlier.
+		impl binius_utils::SerializeBytes for $name {
+			fn serialize(&self, write_buf: impl binius_utils::bytes::BufMut) -> Result<(), binius_utils::SerializationError> {
+				self.0.serialize(write_buf)
+			}
+		}
+
+		impl binius_utils::DeserializeBytes for $name {
+			fn deserialize(read_buf: impl binius_utils::bytes::Buf) -> Result<Self, binius_utils::SerializationError> {
+				Ok(Self(binius_utils::DeserializeBytes::deserialize(read_buf)?))
+			}
+		}
+
+		impl binius_utils::FixedSizeSerializeBytes for $name {
+			const BYTE_SIZE: usize = <$typ as binius_utils::FixedSizeSerializeBytes>::BYTE_SIZE;
 		}
 
 		impl Neg for $name {
@@ -170,10 +199,10 @@ macro_rules! binary_field {
 
 
 		impl Field for $name {
-			const ZERO: Self = $name(<$typ as $crate::underlier::UnderlierType>::ZERO);
-			const ONE: Self = $name(<$typ as $crate::underlier::UnderlierType>::ONE);
+			const ZERO: Self = $name(<$typ as $crate::underlier::Underlier>::ZERO);
+			const ONE: Self = $name(<$typ as $crate::underlier::Underlier>::ONE);
 			const CHARACTERISTIC: usize = 2;
-			const ORDER_EXPONENT: usize = <$typ as $crate::underlier::UnderlierType>::BITS;
+			const ORDER_EXPONENT: usize = <$typ as $crate::underlier::Underlier>::BITS;
 			const MULTIPLICATIVE_GENERATOR: $name = $name($gen);
 
 			fn double(&self) -> Self {
@@ -230,8 +259,8 @@ macro_rules! binary_field {
 
 			#[inline]
 			fn make_mask(mut selectors: impl Iterator<Item = bool>) -> $typ {
-				<$typ as $crate::underlier::UnderlierType>::fill_with_bit(
-					u8::from(selectors.next().unwrap_or(false)),
+				<$typ as $crate::Divisible<_>>::broadcast(
+					$crate::underlier::U1::from(selectors.next().unwrap_or(false)),
 				)
 			}
 
@@ -242,21 +271,6 @@ macro_rules! binary_field {
 		}
 
 		impl $crate::PackedField for $name {
-			#[inline]
-			fn iter(&self) -> impl Iterator<Item = Self::Scalar> + Send + Clone + '_ {
-				std::iter::once(*self)
-			}
-
-			#[inline]
-			fn into_iter(self) -> impl Iterator<Item = Self::Scalar> + Send + Clone {
-				std::iter::once(self)
-			}
-
-			#[inline]
-			fn iter_slice(slice: &[Self]) -> impl Iterator<Item = Self::Scalar> + Send + Clone + '_ {
-				slice.iter().copied()
-			}
-
 			fn interleave(self, _other: Self, _log_block_len: usize) -> (Self, Self) {
 				panic!("cannot interleave when WIDTH = 1");
 			}
@@ -296,7 +310,9 @@ macro_rules! binary_field {
 			}
 		}
 
-		impl BinaryField for $name {}
+		impl BinaryField for $name {
+			const TRACE_ONE_ELEMENT: Self = $name($trace_one);
+		}
 
 		impl From<$typ> for $name {
 			fn from(val: $typ) -> Self {
@@ -318,8 +334,7 @@ macro_rules! binary_field {
 
 			#[inline]
 			fn mul(self, rhs: Self) -> Self {
-				$crate::tracing::trace_multiplication!($name);
-				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				type P = $crate::packed_fields::primitive::PackedPrimitiveType<$typ, $name>;
 				Self((P::from_underlier(self.0) * P::from_underlier(rhs.0)).to_underlier())
 			}
 		}
@@ -327,7 +342,7 @@ macro_rules! binary_field {
 		impl $crate::arithmetic_traits::Square for $name {
 			#[inline]
 			fn square(self) -> Self {
-				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				type P = $crate::packed_fields::primitive::PackedPrimitiveType<$typ, $name>;
 				Self(
 					$crate::arithmetic_traits::Square::square(P::from_underlier(self.0)).to_underlier(),
 				)
@@ -337,7 +352,7 @@ macro_rules! binary_field {
 		impl $crate::arithmetic_traits::InvertOrZero for $name {
 			#[inline]
 			fn invert_or_zero(self) -> Self {
-				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				type P = $crate::packed_fields::primitive::PackedPrimitiveType<$typ, $name>;
 				Self(
 					$crate::arithmetic_traits::InvertOrZero::invert_or_zero(P::from_underlier(self.0))
 						.to_underlier(),
@@ -346,11 +361,11 @@ macro_rules! binary_field {
 		}
 
 		impl $crate::arithmetic_traits::WideMul for $name {
-			type Output = <$crate::arch::PackedPrimitiveType<$typ, $name> as $crate::arithmetic_traits::WideMul>::Output;
+			type Output = <$crate::packed_fields::primitive::PackedPrimitiveType<$typ, $name> as $crate::arithmetic_traits::WideMul>::Output;
 
 			#[inline]
 			fn wide_mul(a: Self, b: Self) -> Self::Output {
-				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				type P = $crate::packed_fields::primitive::PackedPrimitiveType<$typ, $name>;
 				<P as $crate::arithmetic_traits::WideMul>::wide_mul(
 					P::from_underlier(a.0),
 					P::from_underlier(b.0),
@@ -359,7 +374,7 @@ macro_rules! binary_field {
 
 			#[inline]
 			fn reduce(wide: Self::Output) -> Self {
-				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				type P = $crate::packed_fields::primitive::PackedPrimitiveType<$typ, $name>;
 				Self(<P as $crate::arithmetic_traits::WideMul>::reduce(wide).to_underlier())
 			}
 		}
@@ -368,26 +383,6 @@ macro_rules! binary_field {
 
 pub(crate) use binary_field;
 
-macro_rules! mul_by_binary_field_1b {
-	($name:ident) => {
-		impl Mul<BinaryField1b> for $name {
-			type Output = Self;
-
-			#[inline]
-			#[allow(clippy::suspicious_arithmetic_impl)]
-			fn mul(self, rhs: BinaryField1b) -> Self::Output {
-				use $crate::underlier::{UnderlierType, WithUnderlier};
-
-				$crate::tracing::trace_multiplication!(BinaryField128b, BinaryField1b);
-
-				Self(self.0 & <$name as WithUnderlier>::Underlier::fill_with_bit(u8::from(rhs.0)))
-			}
-		}
-	};
-}
-
-pub(crate) use mul_by_binary_field_1b;
-
 macro_rules! impl_field_extension {
 	($subfield_name:ident($subfield_typ:ty) < @$log_degree:expr => $name:ident($typ:ty)) => {
 		impl TryFrom<$name> for $subfield_name {
@@ -395,13 +390,13 @@ macro_rules! impl_field_extension {
 
 			#[inline]
 			fn try_from(elem: $name) -> Result<Self, Self::Error> {
-				use $crate::underlier::{Divisible, UnderlierType};
+				use $crate::{Divisible, underlier::Underlier};
 
 				// `elem` lies in the subfield iff every subfield-underlier limb above the
 				// least-significant one is zero (equivalent to `elem >> N_BITS == 0`).
 				let in_subfield = Divisible::<$subfield_typ>::ref_iter(&elem.0)
 					.skip(1)
-					.all(|limb| limb == <$subfield_typ as UnderlierType>::ZERO);
+					.all(|limb| limb == <$subfield_typ as Underlier>::ZERO);
 				if in_subfield {
 					Ok($subfield_name(Divisible::<$subfield_typ>::get(&elem.0, 0)))
 				} else {
@@ -432,6 +427,20 @@ macro_rules! impl_field_extension {
 			#[inline]
 			fn sub(self, rhs: $subfield_name) -> Self::Output {
 				self - Self::from(rhs)
+			}
+		}
+
+		// The subfield coordinates are literally `$typ`'s `$subfield_typ` limbs (see `basis`
+		// below), so multiplying by a subfield scalar is linear in each limb: reinterpret `self`
+		// as a `PackedPrimitiveType` of the subfield, broadcast-multiply by `rhs`, and cast back.
+		impl Mul<$subfield_name> for $name {
+			type Output = Self;
+
+			#[inline]
+			fn mul(self, rhs: $subfield_name) -> Self::Output {
+				type P =
+					$crate::packed_fields::primitive::PackedPrimitiveType<$typ, $subfield_name>;
+				Self((P::from_underlier(self.0) * P::broadcast(rhs)).to_underlier())
 			}
 		}
 
@@ -489,7 +498,7 @@ macro_rules! impl_field_extension {
 
 			#[inline]
 			fn basis(i: usize) -> Self {
-				use $crate::underlier::{Divisible, UnderlierType};
+				use $crate::{Divisible, underlier::Underlier};
 
 				assert!(
 					i < 1 << $log_degree,
@@ -499,11 +508,11 @@ macro_rules! impl_field_extension {
 				);
 				// The `i`-th basis element sets subfield-underlier limb `i` to one, i.e. bit
 				// `i * N_BITS` (equivalent to `ONE << (i * N_BITS)`).
-				let mut underlier = <$typ as UnderlierType>::ZERO;
+				let mut underlier = <$typ as Underlier>::ZERO;
 				Divisible::<$subfield_typ>::set(
 					&mut underlier,
 					i,
-					<$subfield_typ as UnderlierType>::ONE,
+					<$subfield_typ as Underlier>::ONE,
 				);
 				Self(underlier)
 			}
@@ -513,11 +522,11 @@ macro_rules! impl_field_extension {
 				base_elems: impl IntoIterator<Item = $subfield_name>,
 				log_stride: usize,
 			) -> Self {
-				use $crate::underlier::{Divisible, UnderlierType};
+				use $crate::{Divisible, underlier::Underlier};
 
 				debug_assert!($name::N_BITS.is_power_of_two());
 				let shift_step = ($subfield_name::N_BITS << log_stride) & ($name::N_BITS - 1);
-				let mut underlier = <$typ as UnderlierType>::ZERO;
+				let mut underlier = <$typ as Underlier>::ZERO;
 				let mut shift = 0;
 
 				for elem in base_elems.into_iter() {
@@ -536,19 +545,19 @@ macro_rules! impl_field_extension {
 			#[inline]
 			fn iter_bases(&self) -> impl Iterator<Item = $subfield_name> {
 				use binius_utils::iter::IterExtensions;
-				use $crate::underlier::{Divisible, WithUnderlier};
+				use $crate::{Divisible, underlier::UnderlierView};
 
-				Divisible::<<$subfield_name as WithUnderlier>::Underlier>::ref_iter(&self.0)
+				Divisible::<<$subfield_name as UnderlierView>::Underlier>::ref_iter(&self.0)
 					.map_skippable($subfield_name::from)
 			}
 
 			#[inline]
 			unsafe fn get_base_unchecked(&self, i: usize) -> $subfield_name {
-				use $crate::underlier::{Divisible, WithUnderlier};
+				use $crate::{Divisible, underlier::UnderlierView};
 				// Safety: the caller guarantees `i < Self::N` (over subfield elements).
 				unsafe {
 					$subfield_name::from_underlier(Divisible::<
-						<$subfield_name as WithUnderlier>::Underlier,
+						<$subfield_name as UnderlierView>::Underlier,
 					>::get_unchecked(&self.to_underlier(), i))
 				}
 			}
@@ -563,29 +572,8 @@ macro_rules! impl_field_extension {
 
 pub(crate) use impl_field_extension;
 
-binary_field!(pub BinaryField1b(U1), U1::new(0x1));
-
-macro_rules! serialize_deserialize {
-	($bin_type:ty) => {
-		impl SerializeBytes for $bin_type {
-			fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {
-				self.0.serialize(write_buf)
-			}
-		}
-
-		impl DeserializeBytes for $bin_type {
-			fn deserialize(read_buf: impl Buf) -> Result<Self, SerializationError> {
-				Ok(Self(DeserializeBytes::deserialize(read_buf)?))
-			}
-		}
-	};
-}
-
-serialize_deserialize!(BinaryField1b);
-
-impl FixedSizeSerializeBytes for BinaryField1b {
-	const BYTE_SIZE: usize = 1;
-}
+// The trace over the prime field is the identity here, so `ONE` is the only trace-1 element.
+binary_field!(pub BinaryField1b(U1), U1::new(0x1), U1::new(0x1));
 
 impl BinaryField1b {
 	pub const fn new(value: U1) -> Self {
@@ -619,34 +607,33 @@ pub(crate) mod tests {
 	use binius_utils::{DeserializeBytes, SerializeBytes, bytes::BytesMut};
 	use proptest::prelude::*;
 
-	use super::BinaryField1b as BF1;
 	use crate::{
-		AESTowerField8b, BinaryField, BinaryField1b, BinaryField128bGhash, ExtensionField, Field,
-		GhashSq256b, arithmetic_traits::InvertOrZero,
+		BinaryField, BinaryField1b, ExtensionField, Field, Ghash128b, GhashSq256b, Rijndael8b,
+		arithmetic_traits::InvertOrZero,
 	};
 
 	#[test]
 	fn test_gf2_add() {
-		assert_eq!(BF1::from(0) + BF1::from(0), BF1::from(0));
-		assert_eq!(BF1::from(0) + BF1::from(1), BF1::from(1));
-		assert_eq!(BF1::from(1) + BF1::from(0), BF1::from(1));
-		assert_eq!(BF1::from(1) + BF1::from(1), BF1::from(0));
+		assert_eq!(BinaryField1b::from(0) + BinaryField1b::from(0), BinaryField1b::from(0));
+		assert_eq!(BinaryField1b::from(0) + BinaryField1b::from(1), BinaryField1b::from(1));
+		assert_eq!(BinaryField1b::from(1) + BinaryField1b::from(0), BinaryField1b::from(1));
+		assert_eq!(BinaryField1b::from(1) + BinaryField1b::from(1), BinaryField1b::from(0));
 	}
 
 	#[test]
 	fn test_gf2_sub() {
-		assert_eq!(BF1::from(0) - BF1::from(0), BF1::from(0));
-		assert_eq!(BF1::from(0) - BF1::from(1), BF1::from(1));
-		assert_eq!(BF1::from(1) - BF1::from(0), BF1::from(1));
-		assert_eq!(BF1::from(1) - BF1::from(1), BF1::from(0));
+		assert_eq!(BinaryField1b::from(0) - BinaryField1b::from(0), BinaryField1b::from(0));
+		assert_eq!(BinaryField1b::from(0) - BinaryField1b::from(1), BinaryField1b::from(1));
+		assert_eq!(BinaryField1b::from(1) - BinaryField1b::from(0), BinaryField1b::from(1));
+		assert_eq!(BinaryField1b::from(1) - BinaryField1b::from(1), BinaryField1b::from(0));
 	}
 
 	#[test]
 	fn test_gf2_mul() {
-		assert_eq!(BF1::from(0) * BF1::from(0), BF1::from(0));
-		assert_eq!(BF1::from(0) * BF1::from(1), BF1::from(0));
-		assert_eq!(BF1::from(1) * BF1::from(0), BF1::from(0));
-		assert_eq!(BF1::from(1) * BF1::from(1), BF1::from(1));
+		assert_eq!(BinaryField1b::from(0) * BinaryField1b::from(0), BinaryField1b::from(0));
+		assert_eq!(BinaryField1b::from(0) * BinaryField1b::from(1), BinaryField1b::from(0));
+		assert_eq!(BinaryField1b::from(1) * BinaryField1b::from(0), BinaryField1b::from(0));
+		assert_eq!(BinaryField1b::from(1) * BinaryField1b::from(1), BinaryField1b::from(1));
 	}
 
 	pub(crate) fn is_binary_field_valid_generator<F: BinaryField>() -> bool {
@@ -713,49 +700,84 @@ pub(crate) mod tests {
 	#[test]
 	fn test_multiplicative_generators() {
 		assert!(is_binary_field_valid_generator::<BinaryField1b>());
-		assert!(is_binary_field_valid_generator::<AESTowerField8b>());
-		assert!(is_binary_field_valid_generator::<BinaryField128bGhash>());
+		assert!(is_binary_field_valid_generator::<Rijndael8b>());
+		assert!(is_binary_field_valid_generator::<Ghash128b>());
+	}
+
+	/// The absolute trace $\operatorname{Tr}(x) = \sum_{i=0}^{n-1} x^{2^i}$, computed by repeated
+	/// squaring rather than by any property of the field's representation.
+	fn trace<F: BinaryField>(x: F) -> F {
+		let mut acc = F::ZERO;
+		let mut square = x;
+		for _ in 0..F::N_BITS {
+			acc += square;
+			square = square.square();
+		}
+		acc
+	}
+
+	/// Every field's declared element really has trace 1.
+	///
+	/// A wrong constant would not fail loudly on its own: the Gao-Mateer basis it seeds asserts
+	/// $\beta_0 = 1$, so it would surface as a panic deep inside NTT setup rather than here.
+	#[test]
+	fn test_trace_one_elements() {
+		fn check<F: BinaryField>() {
+			assert_eq!(trace(F::TRACE_ONE_ELEMENT), F::ONE);
+		}
+		check::<BinaryField1b>();
+		check::<Rijndael8b>();
+		check::<Ghash128b>();
+		check::<GhashSq256b>();
+	}
+
+	/// The trace lands in $\mathbb{F}_2$ for every element, not just the declared one. This pins
+	/// the helper above, so a `trace` that silently computed something else could not make the
+	/// previous test pass.
+	#[test]
+	fn test_trace_lands_in_the_prime_subfield() {
+		for value in 0..=u8::MAX {
+			let t = trace(Rijndael8b::new(value));
+			assert!(t == Rijndael8b::ZERO || t == Rijndael8b::ONE, "value {value:#04x}");
+		}
 	}
 
 	#[test]
 	fn test_field_degrees() {
 		assert_eq!(BinaryField1b::N_BITS, 1);
-		assert_eq!(AESTowerField8b::N_BITS, 8);
-		assert_eq!(BinaryField128bGhash::N_BITS, 128);
+		assert_eq!(Rijndael8b::N_BITS, 8);
+		assert_eq!(Ghash128b::N_BITS, 128);
 	}
 
 	#[test]
 	fn test_field_formatting() {
 		assert_eq!(format!("{}", BinaryField1b::from(1)), "0x1");
-		assert_eq!(format!("{}", AESTowerField8b::from(3)), "0x03");
-		assert_eq!(
-			format!("{}", BinaryField128bGhash::new(5)),
-			"0x00000000000000000000000000000005"
-		);
+		assert_eq!(format!("{}", Rijndael8b::from(3)), "0x03");
+		assert_eq!(format!("{}", Ghash128b::new(5)), "0x00000000000000000000000000000005");
 	}
 
 	#[test]
 	fn test_inverse_on_zero() {
 		assert!(BinaryField1b::ZERO.invert_or_zero().is_zero());
-		assert!(AESTowerField8b::ZERO.invert_or_zero().is_zero());
-		assert!(BinaryField128bGhash::ZERO.invert_or_zero().is_zero());
+		assert!(Rijndael8b::ZERO.invert_or_zero().is_zero());
+		assert!(Ghash128b::ZERO.invert_or_zero().is_zero());
 	}
 
 	proptest! {
 		#[test]
 		fn test_inverse_8b(val in 1u8..) {
-			let x = AESTowerField8b::new(val);
+			let x = Rijndael8b::new(val);
 			// Safety: `val` is in `1..`, so `x` is non-zero.
 			let x_inverse = unsafe { x.invert() };
-			assert_eq!(x * x_inverse, AESTowerField8b::ONE);
+			assert_eq!(x * x_inverse, Rijndael8b::ONE);
 		}
 
 		#[test]
 		fn test_inverse_128b(val in 1u128..) {
-			let x = BinaryField128bGhash::from(val);
+			let x = Ghash128b::from(val);
 			// Safety: `val` is in `1..`, so `x` is non-zero.
 			let x_inverse = unsafe { x.invert() };
-			assert_eq!(x * x_inverse, BinaryField128bGhash::ONE);
+			assert_eq!(x * x_inverse, Ghash128b::ONE);
 		}
 	}
 
@@ -767,7 +789,7 @@ pub(crate) mod tests {
 
 		// `BinaryField1b` has a trivial multiplicative group, so for the three pairs with that
 		// subfield this sweeps `ONE` alone, which together with `ZERO` is already the whole field.
-		// Only `BinaryField128bGhash` in `GhashSq256b` walks non-trivial subfield values.
+		// Only `Ghash128b` in `GhashSq256b` walks non-trivial subfield values.
 		let mut elem = FSub::ONE;
 		for _ in 0..4 {
 			assert_eq!(TryInto::<FSub>::try_into(F::from(elem)).ok(), Some(elem));
@@ -784,9 +806,9 @@ pub(crate) mod tests {
 
 	#[test]
 	fn test_subfield_extraction() {
-		assert_subfield_extraction::<BinaryField1b, BinaryField128bGhash>();
-		assert_subfield_extraction::<BinaryField1b, AESTowerField8b>();
-		assert_subfield_extraction::<BinaryField128bGhash, GhashSq256b>();
+		assert_subfield_extraction::<BinaryField1b, Ghash128b>();
+		assert_subfield_extraction::<BinaryField1b, Rijndael8b>();
+		assert_subfield_extraction::<Ghash128b, GhashSq256b>();
 		assert_subfield_extraction::<BinaryField1b, GhashSq256b>();
 	}
 
@@ -794,8 +816,8 @@ pub(crate) mod tests {
 	fn test_serialization() {
 		let mut buffer = BytesMut::new();
 		let b1 = BinaryField1b::from(0x1);
-		let b8 = AESTowerField8b::new(0x12);
-		let b128 = BinaryField128bGhash::new(0x147AD0369CF258BE8899AABBCCDDEEFF);
+		let b8 = Rijndael8b::new(0x12);
+		let b128 = Ghash128b::new(0x147AD0369CF258BE8899AABBCCDDEEFF);
 
 		b1.serialize(&mut buffer).unwrap();
 		b8.serialize(&mut buffer).unwrap();
@@ -804,7 +826,7 @@ pub(crate) mod tests {
 		let mut read_buffer = buffer.freeze();
 
 		assert_eq!(BinaryField1b::deserialize(&mut read_buffer).unwrap(), b1);
-		assert_eq!(AESTowerField8b::deserialize(&mut read_buffer).unwrap(), b8);
-		assert_eq!(BinaryField128bGhash::deserialize(&mut read_buffer).unwrap(), b128);
+		assert_eq!(Rijndael8b::deserialize(&mut read_buffer).unwrap(), b8);
+		assert_eq!(Ghash128b::deserialize(&mut read_buffer).unwrap(), b128);
 	}
 }

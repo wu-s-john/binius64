@@ -9,33 +9,23 @@
 
 use std::arch::wasm32::*;
 
-use super::{super::portable::packed::PackedPrimitiveType, m128::M128};
-use crate::{
-	BinaryField128bGhash,
-	arch::{
-		PairwiseStrategy,
-		portable::{
-			packed_macros::impl_broadcast,
-			univariate_mul_utils_128::{Underlier128bLanes, spread_bits_64},
-		},
-	},
-	arithmetic_traits::impl_transformation_with_strategy,
-};
+use super::m128::M128;
+use crate::arch::portable::univariate_mul_utils_128::{Underlier128bLanes, spread_bits_64};
 
 /// Widening-multiply wrapper used by the GHASH packing: the reduction-deferring portable
 /// [`GhashWideMul`](crate::arch::portable::arithmetic::ghash::GhashWideMul). The WASM SIMD `M128`
 /// implements [`Underlier128bLanes`], so the portable schoolbook widening multiply applies.
 pub type GhashWideMul1x<T> = crate::arch::portable::arithmetic::ghash::GhashWideMul<T>;
 
-/// Square wrapper for the `PackedBinaryGhash1x128b` packing: the shared software square (the WASM
+/// Square wrapper for the `PackedGhash1x128b` packing: the shared software square (the WASM
 /// SIMD `M128` implements [`Underlier128bLanes`], so the portable bit-spread square applies).
 pub type GhashSquare1x<T> = crate::arch::portable::arithmetic::ghash::GhashSoftMul<T>;
 
-/// Invert wrapper for the `PackedBinaryGhash1x128b` packing: the shared Itoh-Tsujii inversion.
+/// Invert wrapper for the `PackedGhash1x128b` packing: the shared Itoh-Tsujii inversion.
 pub type GhashInvert1x<T> = crate::arch::portable::arithmetic::itoh_tsujii::GhashItohTsujii<T>;
 
-// Define broadcast
-impl_broadcast!(M128, BinaryField128bGhash);
+/// Scaling wrapper for the `PackedGhash1x128b` packing: the shared lane walk.
+pub type GhashMulX1x<T> = crate::arch::portable::arithmetic::ghash::GhashMulX<T>;
 
 impl Underlier128bLanes for M128 {
 	type U64 = u64;
@@ -62,9 +52,3 @@ impl Underlier128bLanes for M128 {
 		(Self::from(spread_bits_64(hi)), Self::from(spread_bits_64(lo)))
 	}
 }
-
-// Define linear transformations
-impl_transformation_with_strategy!(
-	PackedPrimitiveType<M128, BinaryField128bGhash>,
-	PairwiseStrategy
-);

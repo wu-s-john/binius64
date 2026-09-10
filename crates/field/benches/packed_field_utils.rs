@@ -3,7 +3,7 @@
 use criterion::{BenchmarkGroup, measurement::WallTime};
 
 pub fn run_benchmark<R>(
-	group: &mut BenchmarkGroup<WallTime>,
+	group: &mut BenchmarkGroup<'_, WallTime>,
 	name: &str,
 	func: impl Fn() -> Batch<R>,
 ) {
@@ -22,7 +22,7 @@ macro_rules! benchmark_packed_operation {
 		paste::paste! {
             #[allow(non_snake_case)]
 			#[inline(never)]
-			fn [<$op_name $packed_field $strategy_name>](group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
+			fn [<$op_name $packed_field $strategy_name>](group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
                 a: &$crate::packed_field_utils::Batch<$packed_field>,
                 b: &$crate::packed_field_utils::Batch<$packed_field>) {
 				#[allow(unused)]
@@ -60,7 +60,7 @@ macro_rules! benchmark_packed_operation {
 		paste::paste! {
             #[allow(non_snake_case)]
 			#[inline(never)]
-			fn [<$op_name $packed_field $strategy_name>](group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
+			fn [<$op_name $packed_field $strategy_name>](group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
                 a: &$crate::packed_field_utils::Batch<$packed_field>,
                 _b: &$crate::packed_field_utils::Batch<$packed_field>) {
 				#[allow(unused)]
@@ -200,14 +200,14 @@ macro_rules! benchmark_packed_operation {
 				PackedBinaryField512x1b
 
 				// AES
-				PackedAESBinaryField16x8b
-				PackedAESBinaryField32x8b
-				PackedAESBinaryField64x8b
+				PackedRijndael16x8b
+				PackedRijndael32x8b
+				PackedRijndael64x8b
 
 				// GHASH
-				PackedBinaryGhash1x128b
-				PackedBinaryGhash2x128b
-				PackedBinaryGhash4x128b
+				PackedGhash1x128b
+				PackedGhash2x128b
+				PackedGhash4x128b
 			]);
 	};
 }

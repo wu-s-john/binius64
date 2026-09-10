@@ -9,11 +9,12 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use binius_compute::BufferPool;
-use binius_core::constraint_system::{ConstraintSystem, ValueVec};
-use binius_field::{BinaryField128bGhash as B128, PackedField};
-use binius_hash::binary_merkle_tree::HashSuite;
+use binius_core::constraint_system::{ConstraintSystem, InoutSegment, ValueVec};
+use binius_field::{Ghash128b as B128, PackedField};
+use binius_hash_prover::ParallelHashSuite;
 use binius_iop_prover::basefold::compiler::BaseFoldProverCompiler;
-use binius_math::ntt::{NeighborsLastMultiThread, domain_context::GenericPreExpanded};
+use binius_ip::channel::WordIPVerifierChannel;
+use binius_math::ntt::{NeighborsLastMultiThread, domain_context::GaoMateerPreExpanded};
 use binius_spartan_frontend::constraint_system::WitnessLayout;
 use binius_spartan_prover::wrapper::{ReplayChannel, ZKWrappedProverChannel};
 use binius_transcript::{ProverTranscript, fiat_shamir::Challenger};
@@ -23,12 +24,9 @@ use bytes::{Buf, BufMut};
 use digest::Output;
 use rand::CryptoRng;
 
-use crate::{
-	IOPProver,
-	protocols::shift::{KeyCollection, build_key_collection},
-};
+use crate::{IOPProver, protocols::shift::KeyCollection};
 
-type ProverNTT<F> = NeighborsLastMultiThread<GenericPreExpanded<F>>;
+type ProverNTT<F> = NeighborsLastMultiThread<GaoMateerPreExpanded<F>>;
 
 /// Zero-knowledge prover for Binius64 constraint systems.
 ///
@@ -37,7 +35,7 @@ type ProverNTT<F> = NeighborsLastMultiThread<GenericPreExpanded<F>>;
 pub struct ZKProver<P, H>
 where
 	P: PackedField<Scalar = B128>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 {
 	inner_iop_prover: IOPProver,
 	inner_iop_verifier: IOPVerifier,
@@ -58,14 +56,17 @@ where
 impl<P, H> ZKProver<P, H>
 where
 	P: PackedField<Scalar = B128>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes,
 {
 	/// Constructs a ZK prover from a [`ZKVerifier`].
 	pub fn setup(zk_verifier: &ZKVerifier<H>) -> Result<Self, Error> {
 		let key_collection = {
 			let _guard = tracing::debug_span!("Build key collection").entered();
-			build_key_collection(zk_verifier.inner_iop_verifier().constraint_system())
+			KeyCollection::build(
+				zk_verifier.inner_iop_verifier().constraint_system(),
+				InoutSegment::Public,
+			)
 		};
 		Self::setup_with_key_collection(zk_verifier, key_collection)
 	}
@@ -94,10 +95,10 @@ where
 		let outer_iop_prover = binius_spartan_prover::IOPProver::new(outer_cs);
 
 		// Build the BaseFold prover compiler from the verifier compiler.
-		let subspace = zk_verifier.basefold_compiler().max_subspace();
+		let log_domain_size = zk_verifier.basefold_compiler().max_log_domain_size();
 		let domain_context = {
 			let _guard = tracing::debug_span!("Precompute NTT domain").entered();
-			GenericPreExpanded::generate_from_subspace(subspace)
+			GaoMateerPreExpanded::generate(log_domain_size)
 		};
 		let log_num_shares = binius_utils::rayon::current_num_threads().ilog2() as usize;
 		let ntt = NeighborsLastMultiThread::new(domain_context, log_num_shares);
@@ -133,7 +134,7 @@ where
 		transcript: &mut ProverTranscript<Challenger_>,
 	) -> Result<(), Error> {
 		// The replay closure captures the public words as a borrowed slice.
-		let public_words = witness.public();
+		let inout_words = witness.inout();
 
 		// Working buffers for this proof are drawn from the prover's pool, recycling blocks freed
 		// by earlier proofs. The inner IOP proof and the outer wrapper proof (run inside
@@ -143,7 +144,7 @@ where
 		// Create BaseFold prover channel and wrap with outer prover.
 		let basefold_channel = self
 			.basefold_compiler
-			.create_channel_from_transcript::<H, Challenger_, _, _>(transcript, &mut rng);
+			.create_channel_from_transcript::<H, Challenger_, _, _>(transcript, &mut rng, alloc);
 		let mut wrapped_channel = ZKWrappedProverChannel::new(
 			basefold_channel,
 			&self.outer_iop_prover,
@@ -153,8 +154,14 @@ where
 			{
 				let inner_iop_verifier = &self.inner_iop_verifier;
 				move |replay_channel: &mut ReplayChannel<B128>| {
-					inner_iop_verifier
-						.verify(public_words, replay_channel)
+					// A faithful replay of the verifier's call sequence, which observes the
+					// statement before delegating.
+					let inout = replay_channel.observe_words(inout_words);
+					// The wiring claim is dropped, as it is in the symbolic build: the verifier
+					// checks it over the public segment, outside the wrapper circuit, so there is
+					// nothing here to fill.
+					let _ = inner_iop_verifier
+						.verify(&inout, replay_channel)
 						.expect("replay verification should not fail");
 				}
 			},
@@ -165,7 +172,7 @@ where
 			let inner_cs = self.inner_iop_prover.constraint_system();
 			let _scope = tracing::debug_span!(
 				"Binius64",
-				n_hidden_words = inner_cs.n_hidden_words(),
+				n_hidden_words = inner_cs.n_hidden_words(InoutSegment::Public),
 				n_bitand = inner_cs.and_constraints.len(),
 				n_intmul = inner_cs.imul_constraints.len(),
 			)
@@ -213,7 +220,7 @@ where
 impl<P, H> SerializeBytes for ZKProver<P, H>
 where
 	P: PackedField<Scalar = B128>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	fn serialize(&self, mut write_buf: impl BufMut) -> Result<(), SerializationError> {
@@ -234,7 +241,7 @@ where
 impl<P, H> DeserializeBytes for ZKProver<P, H>
 where
 	P: PackedField<Scalar = B128>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
 {
 	fn deserialize(mut read_buf: impl Buf) -> Result<Self, SerializationError> {

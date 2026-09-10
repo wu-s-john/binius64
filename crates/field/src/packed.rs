@@ -11,7 +11,6 @@ use std::{
 	ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign},
 };
 
-use binius_utils::iter::IterExtensions;
 use bytemuck::Zeroable;
 
 use super::{Random, arithmetic_traits::Square};
@@ -52,38 +51,30 @@ pub trait PackedField:
 	/// Base-2 logarithm of the number of field elements packed into one packed element.
 	///
 	/// This is the number of scalars the packed field divides into, i.e. its `Divisible` log-count.
-	const LOG_WIDTH: usize = <Self as Divisible<Self::Scalar>>::LOG_N;
+	const LOG_WIDTH: usize = Self::LOG_N;
 
 	/// The number of field elements packed into one packed element.
 	///
 	/// WIDTH is guaranteed to equal 2^LOG_WIDTH.
 	const WIDTH: usize = 1 << Self::LOG_WIDTH;
 
+	/// Yields one scalar per lane, from the lowest lane to the highest.
 	#[inline]
-	fn into_iter(self) -> impl Iterator<Item = Self::Scalar> + Send + Clone {
-		(0..Self::WIDTH).map_skippable(move |i|
-			// Safety: `i` is always less than `WIDTH`
-			unsafe { self.get_unchecked(i) })
+	fn into_iter(self) -> impl ExactSizeIterator<Item = Self::Scalar> + Send + Clone {
+		Divisible::value_iter(self)
 	}
 
+	/// Yields one scalar per lane, from the lowest lane to the highest.
 	#[inline]
-	fn iter(&self) -> impl Iterator<Item = Self::Scalar> + Send + Clone + '_ {
-		(0..Self::WIDTH).map_skippable(move |i|
-			// Safety: `i` is always less than `WIDTH`
-			unsafe { self.get_unchecked(i) })
+	fn iter(&self) -> impl ExactSizeIterator<Item = Self::Scalar> + Send + Clone + '_ {
+		Divisible::ref_iter(self)
 	}
 
+	/// Yields every scalar of the whole slice: element by element, each element's lanes in order.
 	#[inline]
-	fn iter_slice(slice: &[Self]) -> impl Iterator<Item = Self::Scalar> + Send + Clone + '_ {
-		slice.iter().flat_map(Self::iter)
-	}
-
-	/// Initialize zero position with `scalar`, set other elements to zero.
-	#[inline(always)]
-	fn set_single(scalar: Self::Scalar) -> Self {
-		let mut result = Self::default();
-		result.set(0, scalar);
-		result
+	fn iter_slice(slice: &[Self]) -> impl ExactSizeIterator<Item = Self::Scalar> + Send + Clone + '_
+	{
+		Divisible::slice_iter(slice)
 	}
 
 	/// Construct a packed field element from a function that returns scalar values by index.
@@ -96,11 +87,7 @@ pub trait PackedField:
 	/// ignored.
 	#[inline]
 	fn from_scalars(values: impl IntoIterator<Item = Self::Scalar>) -> Self {
-		let mut result = Self::default();
-		for (i, val) in values.into_iter().take(Self::WIDTH).enumerate() {
-			result.set(i, val);
-		}
-		result
+		Divisible::from_iter(values.into_iter())
 	}
 
 	/// Returns the value to the power `exp`.
@@ -109,7 +96,7 @@ pub trait PackedField:
 		for i in (0..64).rev() {
 			res = Square::square(res);
 			if ((exp >> i) & 1) == 1 {
-				res.mul_assign(self)
+				res.mul_assign(self);
 			}
 		}
 		res
@@ -217,8 +204,6 @@ pub fn get_packed_slice<P: PackedField>(packed: &[P], i: usize) -> P::Scalar {
 /// The caller must ensure that `i` is less than `P::WIDTH * packed.len()`.
 #[inline(always)]
 pub unsafe fn get_packed_slice_unchecked<P: PackedField>(packed: &[P], i: usize) -> P::Scalar {
-	// TODO: Consider putting a get_in_slice method on Divisible
-
 	// Safety:
 	// - `i / P::WIDTH` is within the bounds of `packed` if `i` is less than `P::WIDTH *
 	//   packed.len()`
@@ -239,15 +224,13 @@ pub unsafe fn set_packed_slice_unchecked<P: PackedField>(
 	i: usize,
 	scalar: P::Scalar,
 ) {
-	// TODO: Consider putting a set_in_slice method on Divisible
-
 	// Safety: if `i` is less than `P::WIDTH * packed.len()`, then
 	// - `i / P::WIDTH` is within the bounds of `packed`
 	// - `i % P::WIDTH` is always less than `P::WIDTH
 	unsafe {
 		packed
 			.get_unchecked_mut(i >> P::LOG_WIDTH)
-			.set_unchecked(i % P::WIDTH, scalar)
+			.set_unchecked(i % P::WIDTH, scalar);
 	}
 }
 
@@ -258,16 +241,18 @@ impl<PT> PackedBinaryField for PT where PT: PackedField<Scalar: BinaryField> {}
 
 #[cfg(test)]
 mod tests {
+	use std::iter::repeat_with;
+
 	use rand::prelude::*;
 
 	use crate::{
-		AESTowerField8b, BinaryField1b, BinaryField128bGhash, PackedAESBinaryField1x8b,
-		PackedAESBinaryField16x8b, PackedAESBinaryField32x8b, PackedAESBinaryField64x8b,
-		PackedBinaryField1x1b, PackedBinaryField2x1b, PackedBinaryField4x1b, PackedBinaryField8x1b,
-		PackedBinaryField16x1b, PackedBinaryField32x1b, PackedBinaryField64x1b,
-		PackedBinaryField128x1b, PackedBinaryField256x1b, PackedBinaryField512x1b,
-		PackedBinaryGhash1x128b, PackedBinaryGhash2x128b, PackedBinaryGhash4x128b, PackedField,
-		SlicedGhashSq1x256b, SlicedGhashSq2x256b, SlicedGhashSq4x256b,
+		BinaryField1b, Ghash128b, PackedBinaryField1x1b, PackedBinaryField2x1b,
+		PackedBinaryField4x1b, PackedBinaryField8x1b, PackedBinaryField16x1b,
+		PackedBinaryField32x1b, PackedBinaryField64x1b, PackedBinaryField128x1b,
+		PackedBinaryField256x1b, PackedBinaryField512x1b, PackedField, PackedGhash1x128b,
+		PackedGhash2x128b, PackedGhash4x128b, PackedRijndael1x8b, PackedRijndael16x8b,
+		PackedRijndael32x8b, PackedRijndael64x8b, Rijndael8b, SlicedGhashSq1x256b,
+		SlicedGhashSq2x256b, SlicedGhashSq4x256b,
 	};
 
 	trait PackedFieldTest {
@@ -290,17 +275,17 @@ mod tests {
 		test.run::<PackedBinaryField512x1b>();
 
 		// AES
-		test.run::<AESTowerField8b>();
-		test.run::<PackedAESBinaryField1x8b>();
-		test.run::<PackedAESBinaryField16x8b>();
-		test.run::<PackedAESBinaryField32x8b>();
-		test.run::<PackedAESBinaryField64x8b>();
+		test.run::<Rijndael8b>();
+		test.run::<PackedRijndael1x8b>();
+		test.run::<PackedRijndael16x8b>();
+		test.run::<PackedRijndael32x8b>();
+		test.run::<PackedRijndael64x8b>();
 
 		// GHASH
-		test.run::<BinaryField128bGhash>();
-		test.run::<PackedBinaryGhash1x128b>();
-		test.run::<PackedBinaryGhash2x128b>();
-		test.run::<PackedBinaryGhash4x128b>();
+		test.run::<Ghash128b>();
+		test.run::<PackedGhash1x128b>();
+		test.run::<PackedGhash2x128b>();
+		test.run::<PackedGhash4x128b>();
 
 		// GHASH² in a sliced layout
 		test.run::<SlicedGhashSq1x256b>();
@@ -326,6 +311,68 @@ mod tests {
 		assert!(iter.next().is_none());
 	}
 
+	fn check_exact_size<P: PackedField>(mut rng: impl Rng) {
+		let packed = P::random(&mut rng);
+
+		// A reported length has to match what iteration actually produces.
+		assert_eq!(packed.iter().len(), P::WIDTH);
+		assert_eq!(packed.iter().count(), P::WIDTH);
+		assert_eq!(packed.iter().size_hint(), (P::WIDTH, Some(P::WIDTH)));
+
+		assert_eq!(packed.into_iter().len(), P::WIDTH);
+		assert_eq!(packed.into_iter().count(), P::WIDTH);
+		assert_eq!(packed.into_iter().size_hint(), (P::WIDTH, Some(P::WIDTH)));
+
+		// Over a slice the length is the slice length times the width, so the empty slice is the
+		// one case that can disagree without any single scalar being wrong.
+		for len in [0, 1, 3] {
+			let slice = repeat_with(|| P::random(&mut rng))
+				.take(len)
+				.collect::<Vec<_>>();
+			let expected = len * P::WIDTH;
+
+			assert_eq!(P::iter_slice(&slice).len(), expected);
+			assert_eq!(P::iter_slice(&slice).count(), expected);
+			assert_eq!(P::iter_slice(&slice).size_hint(), (expected, Some(expected)));
+		}
+	}
+
+	fn check_iter_slice_matches_flat_map<P: PackedField>(mut rng: impl Rng) {
+		// The empty slice included, since a zero-length run is where the two sides can disagree
+		// without any single scalar being wrong.
+		for len in [0, 1, 2, 5] {
+			let slice = repeat_with(|| P::random(&mut rng))
+				.take(len)
+				.collect::<Vec<_>>();
+
+			// Reading the whole slice equals reading each element's lanes in turn.
+			let expected = slice.iter().flat_map(P::iter).collect::<Vec<_>>();
+			assert_eq!(P::iter_slice(&slice).collect::<Vec<_>>(), expected);
+		}
+	}
+
+	fn check_skipping<P: PackedField>(mut rng: impl Rng) {
+		let packed = P::random(&mut rng);
+		let scalars = packed.iter().collect::<Vec<_>>();
+
+		// Jumping ahead lands on the same scalar as reading forward to it, and the tail after a
+		// skip is the rest of the sequence.
+		for skip in 0..P::WIDTH {
+			assert_eq!(packed.iter().nth(skip), Some(scalars[skip]));
+			assert!(packed.iter().skip(skip).eq(scalars[skip..].iter().copied()));
+		}
+		assert_eq!(packed.iter().nth(P::WIDTH), None);
+
+		// Across an element boundary, so the slice iterator's index arithmetic is exercised too.
+		// The oracle reads each element in turn, so a skip is compared against independent
+		// iteration rather than against itself.
+		let slice = [packed, P::random(&mut rng)];
+		let expected = slice.iter().flat_map(P::iter).collect::<Vec<_>>();
+		for skip in [0, P::WIDTH - 1, P::WIDTH, 2 * P::WIDTH - 1] {
+			assert_eq!(P::iter_slice(&slice).nth(skip), Some(expected[skip]));
+		}
+	}
+
 	struct PackedFieldIterationTest;
 
 	impl PackedFieldTest for PackedFieldIterationTest {
@@ -334,6 +381,9 @@ mod tests {
 
 			check_value_iteration::<P>(&mut rng);
 			check_ref_iteration::<P>(&mut rng);
+			check_exact_size::<P>(&mut rng);
+			check_iter_slice_matches_flat_map::<P>(&mut rng);
+			check_skipping::<P>(&mut rng);
 		}
 	}
 

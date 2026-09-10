@@ -8,7 +8,6 @@
 //!
 //! * Multilinear polynomials
 //! * Univariate polynomials
-//! * Matrix operations
 //! * Additive number-theoretic transform
 //! * Error-correcting codes
 
@@ -18,7 +17,6 @@ pub mod bit_reverse;
 pub mod field_buffer;
 pub mod inner_product;
 pub mod line;
-pub mod matrix;
 pub mod multilinear;
 pub mod ntt;
 pub mod reed_solomon;
@@ -28,6 +26,5 @@ pub mod test_utils;
 pub mod univariate;
 
 pub use binary_subspace::BinarySubspace;
-pub use field_buffer::{AsSlicesMut, FieldBuffer, FieldSlice, FieldSliceMut, FieldVec};
-pub use matrix::Matrix;
+pub use field_buffer::{FieldBuffer, FieldSlice, FieldSliceMut, FieldVec};
 pub use reed_solomon::ReedSolomonCode;

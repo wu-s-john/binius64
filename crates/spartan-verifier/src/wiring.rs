@@ -2,7 +2,7 @@
 
 use std::{iter, rc::Rc};
 
-use binius_field::{Field, field::FieldOps, util::FieldFn};
+use binius_field::field::FieldOps;
 use binius_math::{multilinear::eq::eq_ind_partial_eval_scalars, univariate::evaluate_univariate};
 use binius_spartan_frontend::constraint_system::{MulConstraint, WitnessIndex, WitnessSegment};
 
@@ -26,9 +26,8 @@ pub fn eval_transparent<F: FieldOps + 'static>(
 
 /// Evaluates the wiring MLE for a specific segment at a point (r_x, r_y).
 ///
-/// `r_x_tensor` is the eq-indicator partial evaluation at r_x, i.e.
-/// `eq_ind_partial_eval_scalars(r_x)`. Accepting it as a parameter avoids redundant
-/// computation when evaluating multiple segments with the same r_x.
+/// `r_x_tensor` is the equality indicator expanded at r_x, one scalar per vertex.
+/// Accepting it as a parameter avoids recomputing it for every segment sharing that r_x.
 pub fn evaluate_segment_wiring_mle<F: FieldOps>(
 	mul_constraints: &[MulConstraint<WitnessIndex>],
 	segment: WitnessSegment,
@@ -75,7 +74,7 @@ pub fn evaluate_wiring_mle_public<F: FieldOps>(
 				.wires()
 				.iter()
 				.flat_map(|index| {
-					if let WitnessSegment::Public = index.segment {
+					if index.segment == WitnessSegment::Public {
 						Some(public[index.index as usize].clone())
 					} else {
 						None
@@ -87,41 +86,4 @@ pub fn evaluate_wiring_mle_public<F: FieldOps>(
 	}
 
 	evaluate_univariate(&acc, lambda)
-}
-
-/// The public segment's contribution to the batched operand evaluations, as a [`FieldFn`].
-///
-/// The inputs are the flat concatenation of three sections, in order:
-/// - a block of public scalars;
-/// - then the batching challenge `lambda`;
-/// - then the eq-indicator partial evaluation at `r_x`.
-pub struct PublicWiringEvalFn<'a> {
-	/// The multiplication constraints whose operands the evaluation sums over.
-	mul_constraints: &'a [MulConstraint<WitnessIndex>],
-	/// The length of the leading block of public scalars.
-	public_len: usize,
-}
-
-impl<'a> PublicWiringEvalFn<'a> {
-	/// Builds the function from the constraints and the count of leading public inputs.
-	pub const fn new(
-		mul_constraints: &'a [MulConstraint<WitnessIndex>],
-		public_len: usize,
-	) -> Self {
-		Self {
-			mul_constraints,
-			public_len,
-		}
-	}
-}
-
-impl<F: Field> FieldFn<F> for PublicWiringEvalFn<'_> {
-	fn call<E: FieldOps<Scalar = F> + From<F>>(&self, inputs: &[E]) -> E {
-		// Split the flat input back into its three parts.
-		let public = &inputs[..self.public_len];
-		let lambda = &inputs[self.public_len];
-		let r_x_tensor = &inputs[self.public_len + 1..];
-
-		evaluate_wiring_mle_public(self.mul_constraints, public, lambda, r_x_tensor)
-	}
 }

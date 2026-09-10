@@ -3,20 +3,29 @@
 
 use std::collections::HashSet;
 
-use binius_circuits::sha256::{State, populate_message_block, sha256_compress};
+use binius_circuits::{
+	hash_based_sig::{
+		MESSAGE_LEN, Message,
+		aggregate::{MultiSigWires, circuit_xmss_multisig},
+		xmss::{XmssPublicKey, XmssSignature, generate_signature},
+	},
+	sha256::{State, populate_message_block, sha256_compress},
+};
 use binius_core::{
-	constraint_system::{ConstraintSystem, ValueIndex, ValueVec},
-	verify::verify_constraints,
+	constraint_system::{
+		AndConstraint, BmulConstraint, ConstraintSystem, ImulConstraint, InoutSegment,
+		ValueSegment, ValueVec,
+	},
 	word::Word,
 };
-use binius_field::{BinaryField128bGhash, Field, Random, arch::OptimalPackedB128};
+use binius_field::{Field, Ghash128b, Random, arch::OptimalPackedB128};
 use binius_frontend::{CircuitBuilder, Options, Wire};
 use binius_hash::StdHashSuite;
 use binius_prover::{Prover, zk_config::ZKProver};
 use binius_transcript::ProverTranscript;
 use binius_utils::{DeserializeBytes, SerializeBytes};
 use binius_verifier::{Verifier, config::StdChallenger, zk_config::ZKVerifier};
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 fn prove_verify(cs: ConstraintSystem, witness: &ValueVec) {
 	const LOG_INV_RATE: usize = 1;
@@ -30,7 +39,7 @@ fn prove_verify(cs: ConstraintSystem, witness: &ValueVec) {
 
 	let mut verifier_transcript = prover_transcript.into_verifier();
 	verifier
-		.verify(witness.public(), &mut verifier_transcript)
+		.verify(witness.inout(), &mut verifier_transcript)
 		.unwrap();
 	verifier_transcript.finalize().unwrap();
 }
@@ -50,7 +59,7 @@ fn prove_verify_zk(cs: ConstraintSystem, witness: &ValueVec) {
 
 	let mut verifier_transcript = prover_transcript.into_verifier();
 	zk_verifier
-		.verify(witness.public(), &mut verifier_transcript)
+		.verify(witness.inout(), &mut verifier_transcript)
 		.unwrap();
 	verifier_transcript.finalize().unwrap();
 }
@@ -81,7 +90,7 @@ fn prove_verify_zk_serialized(cs: ConstraintSystem, witness: &ValueVec) {
 
 	let mut verifier_transcript = prover_transcript.into_verifier();
 	zk_verifier
-		.verify(witness.public(), &mut verifier_transcript)
+		.verify(witness.inout(), &mut verifier_transcript)
 		.unwrap();
 	verifier_transcript.finalize().unwrap();
 }
@@ -157,7 +166,7 @@ fn binmul_seventh_power_circuit() -> (ConstraintSystem, ValueVec) {
 
 	// A random input element and its 7th power, computed independently via GHASH-field arithmetic.
 	let mut rng = StdRng::seed_from_u64(0);
-	let x = BinaryField128bGhash::random(&mut rng);
+	let x = Ghash128b::random(&mut rng);
 	let x7 = x.pow([7u64]);
 
 	let x_val = u128::from(x);
@@ -208,18 +217,18 @@ fn test_prove_verify_with_security_bits() {
 		};
 		let mut verifier_transcript = prover_transcript.into_verifier();
 		verifier
-			.verify(witness.public(), &mut verifier_transcript)
+			.verify(witness.inout(), &mut verifier_transcript)
 			.unwrap();
 		verifier_transcript.finalize().unwrap();
 	}
 }
 
 /// Builds a circuit whose AND, IMUL and BMUL constraint counts are all non-powers of two, so every
-/// reduction runs over operand columns whose tail rows are zero padding.
+/// reduction runs over a constraint axis wider than the operand columns it is handed.
 ///
-/// Each asserted `band` contributes two AND constraints (the `band` itself and the equality), each
-/// `imul` gate one IMUL constraint, and each `bmul` gate one BMUL constraint — 6, 3 and 3 in total.
-/// The caller asserts those counts are not powers of two rather than relying on it silently.
+/// Each `band` gate contributes one AND constraint, each `imul` gate one IMUL constraint, and each
+/// `bmul` gate one BMUL constraint. The caller asserts the counts are not powers of two rather
+/// than relying on that silently, since the frontend decides how a gate lowers.
 fn non_power_of_two_constraint_circuit() -> (ConstraintSystem, ValueVec) {
 	const N_AND_GATES: usize = 3;
 	const N_IMUL_GATES: usize = 3;
@@ -283,8 +292,8 @@ fn non_power_of_two_constraint_circuit() -> (ConstraintSystem, ValueVec) {
 
 	let mut rng = StdRng::seed_from_u64(0);
 	for &[a_lo, a_hi, b_lo, b_hi] in &bmul_wires {
-		let a = u128::from(BinaryField128bGhash::random(&mut rng));
-		let b = u128::from(BinaryField128bGhash::random(&mut rng));
+		let a = u128::from(Ghash128b::random(&mut rng));
+		let b = u128::from(Ghash128b::random(&mut rng));
 		w[a_lo] = Word(a as u64);
 		w[a_hi] = Word((a >> 64) as u64);
 		w[b_lo] = Word(b as u64);
@@ -299,9 +308,10 @@ fn non_power_of_two_constraint_circuit() -> (ConstraintSystem, ValueVec) {
 }
 
 /// A circuit whose AND, IMUL and BMUL constraint counts are all non-powers of two proves and
-/// verifies. The constraint system keeps those true counts; the prover zero-pads each operand
-/// column up to a power of two, and both sides derive their sumcheck variable counts by rounding
-/// the same true count up.
+/// verifies. The constraint system keeps those true counts, and the prover's operand columns stop
+/// at the last constraint; each reduction rounds its own constraint axis up to a power of two and
+/// reads the rows past a column's end as zero, and both sides derive their sumcheck variable
+/// counts by rounding the same true count up.
 #[test]
 fn test_prove_verify_non_power_of_two_constraint_counts() {
 	let (cs, witness) = non_power_of_two_constraint_circuit();
@@ -318,6 +328,44 @@ fn test_prove_verify_non_power_of_two_constraint_counts() {
 	}
 	prove_verify(cs.clone(), &witness);
 	prove_verify_zk(cs, &witness);
+}
+
+/// Dropping the operand columns' padding rows moves nothing on the wire.
+///
+/// Every constraint type's `Default` has empty operands, so its row is identically zero — exactly
+/// the padding row the prover used to materialize. Padding each constraint list up to a power of
+/// two therefore reconstructs the old column shape without touching the prover, and the two must
+/// produce the same proof byte for byte. The reduction runs over the same axis either way, since
+/// `log2_ceil` of a count and of that count rounded up agree.
+#[test]
+fn test_padded_constraint_lists_produce_an_identical_proof() {
+	let (cs, witness) = non_power_of_two_constraint_circuit();
+
+	let mut padded_cs = cs.clone();
+	padded_cs
+		.and_constraints
+		.resize(cs.n_and_constraints().next_power_of_two(), AndConstraint::default());
+	padded_cs
+		.imul_constraints
+		.resize(cs.n_imul_constraints().next_power_of_two(), ImulConstraint::default());
+	padded_cs
+		.bmul_constraints
+		.resize(cs.n_bmul_constraints().next_power_of_two(), BmulConstraint::default());
+	padded_cs.validate().unwrap();
+
+	assert_eq!(prove_to_bytes(cs, &witness), prove_to_bytes(padded_cs, &witness));
+}
+
+/// Proves `witness` against `cs` and returns the proof bytes.
+fn prove_to_bytes(cs: ConstraintSystem, witness: &ValueVec) -> Vec<u8> {
+	const LOG_INV_RATE: usize = 1;
+
+	let verifier = Verifier::<StdHashSuite>::setup(cs, LOG_INV_RATE).unwrap();
+	let prover = Prover::<OptimalPackedB128, StdHashSuite>::setup(verifier).unwrap();
+
+	let mut transcript = ProverTranscript::new(StdChallenger::default());
+	prover.prove(witness, &mut transcript).unwrap();
+	transcript.finalize().to_vec()
 }
 
 /// A SHA-256 circuit uses only AND constraints, so its constraint system has zero IMUL
@@ -344,13 +392,12 @@ fn zero_constraint_circuit(
 	n_rotr: usize,
 	n_and: usize,
 ) -> (ConstraintSystem, ValueVec) {
-	let builder = CircuitBuilder::with_opts(Options {
-		enable_gate_fusion: false,
-		enable_common_subexpression_elimination: false,
-		enable_dead_code_elimination: false,
-		enable_algebraic_folding: false,
-		..Options::default()
-	});
+	let mut opts = Options::default();
+	opts.enable_gate_fusion = false;
+	opts.enable_common_subexpression_elimination = false;
+	opts.enable_dead_code_elimination = false;
+	opts.enable_algebraic_folding = false;
+	let builder = CircuitBuilder::with_opts(opts);
 	let a = builder.add_witness();
 	let b = builder.add_witness();
 
@@ -386,11 +433,11 @@ fn zero_constraint_circuit(
 	assert!(
 		cs.zero_constraints
 			.iter()
-			.any(|c| c.val().iter().any(|svi| svi.amount != 0)),
+			.any(|c| c.val().iter().any(|svi| !svi.is_unshifted())),
 		"the fixture must emit a ZERO constraint with a shifted operand"
 	);
 	let witness = w.into_value_vec();
-	verify_constraints(&cs, &witness).unwrap();
+	cs.verify(&witness).unwrap();
 	(cs, witness)
 }
 
@@ -419,6 +466,72 @@ fn test_prove_verify_fewer_zero_than_and_constraints() {
 	prove_verify(cs, &witness);
 }
 
+/// Builds a circuit whose public segment is wider than its hidden one: `n_inout` input/output
+/// values against a handful of private ones.
+///
+/// Each inout value is asserted equal to the same AND output, which lowers to a ZERO constraint
+/// and commits nothing further, so the hidden segment stays at three words however many inout
+/// values the circuit declares. The optimization passes are off so that the repeated assertions
+/// survive as distinct constraints.
+fn public_heavy_circuit(n_inout: usize) -> (ConstraintSystem, ValueVec) {
+	let mut opts = Options::default();
+	opts.enable_gate_fusion = false;
+	opts.enable_common_subexpression_elimination = false;
+	opts.enable_dead_code_elimination = false;
+	opts.enable_algebraic_folding = false;
+	let builder = CircuitBuilder::with_opts(opts);
+	let a = builder.add_witness();
+	let b = builder.add_witness();
+	let and_out = builder.band(a, b);
+
+	let inout = (0..n_inout)
+		.map(|_| builder.add_inout())
+		.collect::<Vec<_>>();
+	for &wire in &inout {
+		builder.assert_eq("inout_is_and_output", wire, and_out);
+	}
+
+	let circuit = builder.build();
+	let mut w = circuit.new_witness_filler();
+	let (a_val, b_val) = (Word(0x0123_4567_89AB_CDEF), Word(0xFEDC_BA98_7654_3210));
+	w[a] = a_val;
+	w[b] = b_val;
+	for &wire in &inout {
+		w[wire] = a_val & b_val;
+	}
+	circuit.populate_wire_witness(&mut w).unwrap();
+
+	let cs = circuit.constraint_system().clone();
+	let witness = w.into_value_vec();
+	cs.verify(&witness).unwrap();
+	(cs, witness)
+}
+
+/// A public segment wider than the hidden one proves and verifies.
+///
+/// Neither segment is padded to the other's length, so the shift reduction's word-index space
+/// spans the *wider* of the two — here the public one. Both sides size that space from
+/// `log_segment_words`, and the hidden half zero-extends up to it, so the sumcheck draws word-index
+/// challenges the hidden segment alone would not have called for. Every other circuit in this file
+/// has the hidden segment wider, which is the case the padding used to guarantee.
+#[test]
+fn test_prove_verify_public_wider_than_hidden() {
+	let (cs, witness) = public_heavy_circuit(300);
+	assert!(
+		cs.log_public_words(InoutSegment::Public) > cs.log_witness_words(InoutSegment::Public),
+		"public segment ({} words) must be wider than the hidden one ({} words) for this test to \
+		 exercise the extra word-index challenges",
+		cs.n_public_words(InoutSegment::Public),
+		cs.n_hidden_words(InoutSegment::Public),
+	);
+	assert_eq!(
+		cs.log_segment_words(InoutSegment::Public),
+		cs.log_public_words(InoutSegment::Public)
+	);
+	prove_verify(cs.clone(), &witness);
+	prove_verify_zk(cs, &witness);
+}
+
 /// A witness violating one ZERO constraint is rejected. The prover has nothing to send for the
 /// Zero reduction, so it claims the constant zero regardless; the shift reduction, running against
 /// the committed witness, is what catches the discrepancy.
@@ -443,14 +556,19 @@ fn test_prove_verify_rejects_violated_zero_constraint() {
 		.flat_map(|c| &c.0)
 		.flatten()
 		.map(|svi| svi.value_index)
-		.find(|index| !and_words.contains(index) && *index != ValueIndex(0))
-		.expect("some ZERO constraint reads a word no AND constraint does");
+		// The rebuild below sources the constants from the system, so tampering with one would be
+		// undone; the victim has to be a word the caller supplies.
+		.find(|index| !and_words.contains(index) && index.segment() != ValueSegment::Constant)
+		.expect("some ZERO constraint reads a non-constant word no AND constraint does");
 
 	let mut words = witness.combined_witness().to_vec();
-	words[victim.0 as usize] = words[victim.0 as usize] ^ Word::ONE;
-	let corrupted =
-		ValueVec::new_from_data(&words[..cs.n_public_words()], &words[cs.n_public_words()..]);
-	assert!(verify_constraints(&cs, &corrupted).is_err());
+	let victim_word = cs.word_offset(victim);
+	words[victim_word] = words[victim_word] ^ Word::ONE;
+	let corrupted = cs.value_vec_from_data(
+		&words[cs.n_const()..cs.n_public_values()],
+		&words[cs.n_public_values()..],
+	);
+	assert!(cs.verify(&corrupted).is_err());
 
 	let verifier = Verifier::<StdHashSuite>::setup(cs, LOG_INV_RATE).unwrap();
 	let prover = Prover::<OptimalPackedB128, StdHashSuite>::setup(verifier.clone()).unwrap();
@@ -508,10 +626,10 @@ fn sign_verify(
 	let mut verifier_transcript = prover_transcript.into_verifier();
 	let verify_ok = match verify_message {
 		Some(message) => zk_verifier
-			.verify_sig(witness.public(), message, &mut verifier_transcript)
+			.verify_sig(witness.inout(), message, &mut verifier_transcript)
 			.is_ok(),
 		None => zk_verifier
-			.verify(witness.public(), &mut verifier_transcript)
+			.verify(witness.inout(), &mut verifier_transcript)
 			.is_ok(),
 	};
 	verify_ok && verifier_transcript.finalize().is_ok()
@@ -543,4 +661,78 @@ fn test_plain_proof_rejects_message() {
 	let (cs, witness) = sha256_preimage_circuit();
 	// A plain proof of knowledge must not verify when a message is supplied.
 	assert!(!sign_verify(cs, &witness, None, Some(b"hello world")));
+}
+
+/// An aggregate XMSS verification, with `n_pad` extra public words pinned to zero.
+///
+/// The padding is inert: every padded word is a constant-zero assertion, and nothing else about
+/// the circuit depends on `n_pad`. It exists only to move the public segment's width.
+fn xmss_aggregate_circuit(num_signers: usize, n_pad: usize) -> (ConstraintSystem, ValueVec) {
+	const EPOCH: u32 = 42;
+
+	let mut rng = StdRng::seed_from_u64(1);
+	let mut message: Message = [0u8; MESSAGE_LEN];
+	rng.fill_bytes(&mut message);
+	let signatures: Vec<(XmssPublicKey, XmssSignature)> = (0..num_signers)
+		.map(|_| generate_signature(&mut rng, &message, EPOCH))
+		.collect();
+
+	let builder = CircuitBuilder::new();
+	let wires = MultiSigWires::new(&builder, num_signers);
+	circuit_xmss_multisig(&builder, &wires);
+
+	let zero = builder.add_constant(Word::ZERO);
+	let pad = (0..n_pad).map(|_| builder.add_inout()).collect::<Vec<_>>();
+	for &wire in &pad {
+		builder.assert_eq("pad_is_zero", wire, zero);
+	}
+
+	let circuit = builder.build();
+	let mut w = circuit.new_witness_filler();
+	wires.populate(&mut w, &message, EPOCH, &signatures);
+	for &wire in &pad {
+		w[wire] = Word::ZERO;
+	}
+	circuit.populate_wire_witness(&mut w).unwrap();
+
+	let cs = circuit.constraint_system().clone();
+	let witness = w.into_value_vec();
+	cs.verify(&witness).unwrap();
+	(cs, witness)
+}
+
+/// The padding that takes a `num_signers` circuit's public segment to exactly `n_public` words.
+///
+/// The unpadded width is whatever the XMSS circuit currently needs, and it moves whenever that
+/// circuit does, so the tests below state the width they mean to exercise and derive the padding
+/// from it rather than hard-coding a count that drifts out from under them. The probe pads by one
+/// rather than none so that the zero constant the padding introduces is already inside the
+/// measured base.
+fn pad_for_public_words(num_signers: usize, n_public: usize) -> usize {
+	let (cs, _) = xmss_aggregate_circuit(num_signers, 1);
+	let base = cs.n_public_words(InoutSegment::Public) - 1;
+	n_public - base
+}
+
+/// A public segment of exactly 2^9 words proves and verifies, plain and ZK.
+#[test]
+fn test_zk_prove_verify_aggregate_public_segment_at_power_of_two() {
+	let (cs, witness) = xmss_aggregate_circuit(1, pad_for_public_words(1, 512));
+	assert_eq!(cs.n_public_words(InoutSegment::Public), 512);
+	prove_verify(cs.clone(), &witness);
+	prove_verify_zk(cs, &witness);
+}
+
+/// One public word past the power of two proves and verifies too.
+///
+/// This is the case the packed statement broke: the wrapper circuit read the statement back as
+/// constants, so a public segment that crossed 2^9 words disagreed with the one the concrete
+/// channels packed, and the outer Spartan check rejected an honest proof with
+/// `IPChannel(InvalidAssert)`. The only difference from the test above is one inert padding word.
+#[test]
+fn test_zk_prove_verify_aggregate_public_segment_over_power_of_two() {
+	let (cs, witness) = xmss_aggregate_circuit(1, pad_for_public_words(1, 513));
+	assert_eq!(cs.n_public_words(InoutSegment::Public), 513);
+	prove_verify(cs.clone(), &witness);
+	prove_verify_zk(cs, &witness);
 }

@@ -39,7 +39,7 @@ use std::{
 
 use binius_compute::{Allocator, BufferPool, VecLike};
 use binius_field::{BinaryField, Field, PackedField};
-use binius_hash::binary_merkle_tree::HashSuite;
+use binius_hash_prover::ParallelHashSuite;
 use binius_iop_prover::{basefold::compiler::BaseFoldProverCompiler, channel::IOPProverChannel};
 use binius_ip_prover::{
 	channel::IPProverChannel,
@@ -47,8 +47,9 @@ use binius_ip_prover::{
 };
 use binius_math::{
 	FieldBuffer, FieldSlice, FieldVec,
+	inner_product::inner_product_buffers,
 	multilinear::eq::eq_ind_partial_eval,
-	ntt::{NeighborsLastMultiThread, domain_context::GenericPreExpanded},
+	ntt::{NeighborsLastMultiThread, domain_context::GaoMateerPreExpanded},
 	univariate::evaluate_univariate,
 };
 use binius_spartan_frontend::constraint_system::{
@@ -68,7 +69,7 @@ use rand::CryptoRng;
 
 use crate::wiring::{WiringTranspose, fold_constraints};
 
-type ProverNTT<F> = NeighborsLastMultiThread<GenericPreExpanded<F>>;
+type ProverNTT<F> = NeighborsLastMultiThread<GaoMateerPreExpanded<F>>;
 
 /// IOP prover for a particular constraint system.
 ///
@@ -90,7 +91,7 @@ pub struct IOPProver<F: Field> {
 pub struct Prover<P, H>
 where
 	P: PackedField<Scalar: BinaryField>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 {
 	iop_prover: IOPProver<P::Scalar>,
 	basefold_compiler: BaseFoldProverCompiler<P, ProverNTT<P::Scalar>>,
@@ -145,11 +146,7 @@ impl<F: Field> IOPProver<F> {
 		A: Allocator,
 	{
 		let cs = &self.constraint_system;
-		// Precommit segment has no dummy mul-constraint blinding (see ConstraintSystemPadded).
-		let precommit_blinding = BlindingInfo {
-			n_dummy_wires: cs.blinding_info().n_dummy_wires,
-			n_dummy_constraints: 0,
-		};
+		let precommit_blinding = *cs.blinding_info();
 		let precommit_packed = pack_and_blind_witness::<_, _, P>(
 			alloc,
 			cs.log_precommit() as usize,
@@ -158,7 +155,7 @@ impl<F: Field> IOPProver<F> {
 			&precommit_blinding,
 			rng,
 		);
-		let precommit_oracle = channel.send_oracle(precommit_packed.to_ref());
+		let precommit_oracle = channel.send_oracle(precommit_packed.as_view());
 		(precommit_oracle, precommit_packed)
 	}
 
@@ -250,7 +247,7 @@ impl<F: Field> IOPProver<F> {
 		};
 
 		let mulcheck_mask =
-			zk_mlecheck::Mask::new(log_mul_constraints, mask_degree, masks_buffer.to_ref());
+			zk_mlecheck::Mask::new(log_mul_constraints, mask_degree, masks_buffer.as_view());
 
 		// Pack private witness into field elements and add blinding
 		let blinding_info = cs.blinding_info();
@@ -265,15 +262,15 @@ impl<F: Field> IOPProver<F> {
 
 		// Send the private and mask oracles to the channel. The precommit oracle was committed
 		// by the caller via `commit_precommit` and passed in as `precommit_oracle`.
-		let private_oracle = channel.send_oracle(private_packed.to_ref());
-		let mask_oracle = channel.send_oracle(masks_buffer.to_ref());
+		let private_oracle = channel.send_oracle(private_packed.as_view());
+		let mask_oracle = channel.send_oracle(masks_buffer.as_view());
 
 		// Prove the multiplication constraints
 		let (mulcheck_evals, mask_eval, r_x) = prove_mulcheck::<F, P, _, _>(
 			cs.mul_constraints(),
 			witness.public(),
-			precommit_packed.to_ref(),
-			private_packed.to_ref(),
+			precommit_packed.as_view(),
+			private_packed.as_view(),
 			mulcheck_mask,
 			&mut *channel,
 			alloc,
@@ -300,10 +297,7 @@ impl<F: Field> IOPProver<F> {
 		// The prover sends this as a scalar; the oracle relation then verifies it.
 		let precommit_wiring_poly =
 			fold_constraints(alloc, &self.precommit_wiring_transpose, lambda, r_x_tensor.as_ref());
-		let precommit_claim = binius_math::inner_product::inner_product_buffers(
-			&precommit_packed.to_ref(),
-			&precommit_wiring_poly,
-		);
+		let precommit_claim = inner_product_buffers(&precommit_packed, &precommit_wiring_poly);
 		channel.send_one(precommit_claim);
 
 		let private_claim = batched_sum - public_eval - precommit_claim;
@@ -317,12 +311,18 @@ impl<F: Field> IOPProver<F> {
 		let libra_eval_tensor =
 			zk_mlecheck::expand_libra_eval::<A, P>(alloc, &r_x, n_vars, mask_degree, m_n, m_d);
 
-		// Prove all oracle relations.
-		channel.prove_oracle_relations([
-			(precommit_oracle, precommit_packed, precommit_wiring_poly, precommit_claim),
-			(private_oracle, private_packed, private_wiring_poly, private_claim),
-			(mask_oracle, masks_buffer, libra_eval_tensor, mask_eval),
-		]);
+		// Prove all oracle relations, handing the channel each committed buffer for the combined
+		// opening.
+		channel.prove_oracle_relation(
+			precommit_oracle.clone(),
+			precommit_wiring_poly,
+			precommit_claim,
+		);
+		channel.finalize_oracle(precommit_oracle, precommit_packed);
+		channel.prove_oracle_relation(private_oracle.clone(), private_wiring_poly, private_claim);
+		channel.finalize_oracle(private_oracle, private_packed);
+		channel.prove_oracle_relation(mask_oracle.clone(), libra_eval_tensor, mask_eval);
+		channel.finalize_oracle(mask_oracle, masks_buffer);
 
 		Ok(())
 	}
@@ -332,7 +332,7 @@ impl<F, P, H> Prover<P, H>
 where
 	F: BinaryField,
 	P: PackedField<Scalar = F>,
-	H: HashSuite,
+	H: ParallelHashSuite,
 	Output<H::LeafHash>: SerializeBytes,
 {
 	/// Constructs a prover corresponding to a constraint system verifier.
@@ -341,9 +341,10 @@ where
 	pub fn setup(verifier: &Verifier<F, H>) -> Result<Self, Error> {
 		let log_num_shares = binius_utils::rayon::current_num_threads().ilog2() as usize;
 
-		// Get the largest subspace from the verifier compiler for NTT creation
-		let subspace = verifier.iop_compiler().max_subspace();
-		let domain_context = GenericPreExpanded::generate_from_subspace(subspace);
+		// Rebuild the verifier's evaluation domain, which its compiler fixed as the Gao-Mateer
+		// basis of that dimension.
+		let domain_context =
+			GaoMateerPreExpanded::generate(verifier.iop_compiler().max_log_domain_size());
 		let ntt = NeighborsLastMultiThread::new(domain_context, log_num_shares);
 
 		// Create the BaseFold ZK compiler from verifier compiler (reuses oracle_specs and
@@ -392,14 +393,15 @@ where
 		let public = witness.public();
 		transcript.observe().write_slice(public);
 
+		// Working buffers for this proof are drawn from the prover's pool, recycling blocks freed
+		// by earlier proofs. The channel gets the same pool, so the Merkle trees it commits draw
+		// their nodes from it too.
+		let alloc = &self.pool;
 		// Create ZK channel (owns the RNG for mask generation), commit the precommit oracle,
 		// and delegate to the IOP prover.
 		let mut channel = self
 			.basefold_compiler
-			.create_channel_from_transcript::<H, Challenger_, _, _>(transcript, &mut rng);
-		// Working buffers for this proof are drawn from the prover's pool, recycling blocks freed
-		// by earlier proofs.
-		let alloc = &self.pool;
+			.create_channel_from_transcript::<H, Challenger_, _, _>(transcript, &mut rng, alloc);
 		let (precommit_oracle, precommit_packed) =
 			self.iop_prover
 				.commit_precommit::<P, _, _>(witness, &mut rng, &mut channel, &alloc);
@@ -413,7 +415,7 @@ where
 			&mut channel,
 			&alloc,
 		)?;
-		channel.finish(&alloc);
+		channel.finish();
 		Ok(())
 	}
 }
@@ -421,8 +423,8 @@ where
 fn prove_mulcheck<F, P, Channel, A>(
 	mul_constraints: &[MulConstraint<WitnessIndex>],
 	public: &[F],
-	precommit_packed: FieldSlice<P>,
-	private_packed: FieldSlice<P>,
+	precommit_packed: FieldSlice<'_, P>,
+	private_packed: FieldSlice<'_, P>,
 	mask: zk_mlecheck::Mask<P, impl Deref<Target = [P]>>,
 	channel: &mut Channel,
 	alloc: &A,

@@ -3,7 +3,8 @@
 //! Round evaluators over a shared [`MleStore`] and the provers that drive them.
 //!
 //! A round evaluator holds the per-round-polynomial logic for one composite claim over store
-//! columns. Evaluators hold [`ColId`]s and receive column data by argument; they hold no mutable
+//! columns. Evaluators hold [`ColId`](super::mle_store::ColId)s and receive column data by
+//! argument; they hold no mutable
 //! per-round state — they neither fold nor track the round claim. The driving prover owns the
 //! `RoundState` machine (the claim ↔ coeffs alternation) for each evaluator, and the store folds
 //! the columns (see the [`mle_store`](super::mle_store) module documentation).
@@ -26,12 +27,12 @@ use auto_impl::auto_impl;
 use binius_compute::Allocator;
 use binius_field::{Field, PackedField, WideMul};
 use binius_ip::sumcheck::RoundCoeffs;
-use binius_math::{FieldSlice, FieldVec, multilinear::eq::eq_ind_partial_eval};
+use binius_math::{FieldSlice, multilinear::eq::eq_ind_partial_eval};
 
 use super::{
 	MleToSumCheckEvaluator,
 	common::{MleCheckProver, SumcheckProver},
-	mle_store::{ColId, EvaluationChunk, MleStore, RoundContext},
+	mle_store::{EvaluationChunk, MleStore, RoundContext},
 	round_state::RoundState,
 };
 
@@ -75,7 +76,8 @@ pub trait SumcheckRoundEvaluator<F: Field, P: PackedField<Scalar = F>>: Send + S
 	/// Accumulates one chunk of the halved hypercube into `accum`.
 	///
 	/// The driving prover prepares `chunk` — the split, per-chunk column halves and eq-indicator
-	/// expansions — so the evaluator only reads its columns by [`ColId`] and eq trackers by
+	/// expansions — so the evaluator only reads its columns by [`ColId`](super::mle_store::ColId)
+	/// and eq trackers by
 	/// [`EqId`](super::mle_store::EqId). `accum` is this evaluator's run of [`Self::degree`] wide
 	/// slots, zero-initialized
 	/// on the first chunk and carried across the worker's chunks.
@@ -137,59 +139,14 @@ pub trait MleCheckRoundEvaluator<F: Field, P: PackedField<Scalar = F>>: Send + S
 	) -> RoundCoeffs<F>;
 }
 
-/// Largest round the pass walks in one sequential leaf.
+/// Maximum log2 chunk size of the parallel round pass.
 ///
-/// - The equality-indicator chunk of a round this size stays in L1 while every evaluator reads it.
-/// - A caller outside the pool parks and wakes to dispatch one leaf.
-/// - So splitting a round this small costs more than walking it.
+/// Chunked accumulation keeps the equality-indicator chunk resident while all evaluators read it,
+/// mirroring the chunking of the pre-store quadratic prover.
+///
+/// A chunk is 64 KiB at 128-bit scalars.
+/// A group of `N` claims reads `2N + 1` of them, so the working set is second-level, not first.
 const MAX_CHUNK_VARS: usize = 12;
-
-/// Leaf size of a round pass that is split across the pool.
-///
-/// - Well below [`MAX_CHUNK_VARS`], so a split round becomes many small leaves.
-/// - Work-stealing can then even out cores that retire a leaf at different speeds.
-/// - Roughly one leaf per core would leave it nothing to steal.
-///
-/// Tuned on an Apple M1 Pro, whose 8 performance and 2 efficiency cores make that imbalance large.
-const PAR_CHUNK_VARS: usize = 8;
-
-/// Chunk size of one round's read pass over the halved hypercube.
-///
-/// The two constants answer separate questions.
-/// [`MAX_CHUNK_VARS`] decides whether to split the round at all.
-/// [`PAR_CHUNK_VARS`] decides how finely, once it is split.
-///
-/// ```text
-///     halved = n_vars_remaining - 1           a round reads a halved hypercube
-///
-///     halved <= MAX_CHUNK_VARS  ->  chunk = halved           one leaf, no bisection
-///     halved >  MAX_CHUNK_VARS  ->  chunk = PAR_CHUNK_VARS   2^(halved - chunk) leaves
-/// ```
-///
-/// Both constants are floored at the packing width, so a leaf never narrows below one packed word.
-fn chunk_vars_for<P: PackedField>(n_vars_remaining: usize) -> usize {
-	let halved = n_vars_remaining - 1;
-	let sequential_cap = MAX_CHUNK_VARS.max(P::LOG_WIDTH);
-	if halved <= sequential_cap {
-		halved
-	} else {
-		PAR_CHUNK_VARS.max(P::LOG_WIDTH)
-	}
-}
-
-/// Prefix sums of a group of evaluators' accumulator-slot counts.
-///
-/// The returned Vec has one more entry than there are evaluators; `offsets[i]..offsets[i + 1]` is
-/// evaluator `i`'s run in the flat accumulator buffer, and the last entry is its total length. Both
-/// shared provers lay out their per-worker accumulator this way.
-fn accum_offsets(degrees: impl IntoIterator<Item = usize>) -> Vec<usize> {
-	iter::once(0)
-		.chain(degrees.into_iter().scan(0, |acc, degree| {
-			*acc += degree;
-			Some(*acc)
-		}))
-		.collect()
-}
 
 /// The state a group of claims shares, whichever protocol drives them.
 ///
@@ -243,54 +200,38 @@ where
 		self.store.n_vars() - self.buffered_challenge.is_some() as usize
 	}
 
-	/// Returns the number of claims in the group.
-	const fn n_claims(&self) -> usize {
-		self.evaluators.len()
-	}
-
 	/// Adds one more claim, reading the same store, after the existing ones.
 	fn push_claim(&mut self, claim: F, evaluator: Evaluator) {
 		self.evaluators.push(evaluator);
 		self.round_states.push(RoundState::Claim(claim));
 	}
 
-	/// Returns the claim each of this round's polynomials must satisfy.
-	///
-	/// A claim held directly is returned as is.
-	/// One already turned into coefficients is read back out by `recover`, which differs per
-	/// protocol.
-	fn round_claims(&self, recover: impl Fn(&RoundCoeffs<F>) -> F) -> Vec<F> {
-		self.round_states
-			.iter()
-			.map(|state| match state {
-				RoundState::Claim(claim) => *claim,
-				RoundState::Coeffs(coeffs) => recover(coeffs),
-			})
-			.collect()
-	}
-
 	/// Interpolates every claim's round polynomial, then records it for the coming fold.
+	///
+	/// The group serves both evaluator traits, so each protocol passes its own accessors in.
 	///
 	/// # Arguments
 	///
-	/// * `offsets` - Prefix sums bounding each evaluator's run of accumulator slots.
 	/// * `accum` - Every evaluator's slots, summed across workers and reduced.
+	/// * `degree` - One evaluator's slot count.
 	/// * `interpolate` - The protocol's call into one evaluator.
 	fn interpolate_round(
 		&mut self,
-		offsets: &[usize],
 		accum: &[P],
+		degree: impl Fn(&Evaluator) -> usize,
 		interpolate: impl Fn(&Evaluator, &RoundContext<'_, P>, &[P], F) -> RoundCoeffs<F>,
 	) -> Vec<RoundCoeffs<F>> {
 		// The store has not folded this round, so its view carries this round's coordinates.
 		let ctx = self.store.round_context();
-		let round_coeffs: Vec<RoundCoeffs<F>> =
-			iter::zip(iter::zip(&self.evaluators, &self.round_states), offsets.windows(2))
-				.map(|((evaluator, state), window)| {
-					let claim = *state.claim();
-					interpolate(evaluator, &ctx, &accum[window[0]..window[1]], claim)
-				})
-				.collect();
+		// Evaluators own consecutive runs of the accumulator, so one walk hands out every run.
+		let mut rest = accum;
+		let mut round_coeffs = Vec::with_capacity(self.evaluators.len());
+		for (evaluator, state) in iter::zip(&self.evaluators, &self.round_states) {
+			let (slots, tail) = rest.split_at(degree(evaluator));
+			rest = tail;
+			round_coeffs.push(interpolate(evaluator, &ctx, slots, *state.claim()));
+		}
+		debug_assert!(rest.is_empty(), "the runs must tile the accumulator exactly");
 		// The coefficients become the round state the coming fold reduces.
 		for (state, coeffs) in iter::zip(&mut self.round_states, &round_coeffs) {
 			*state = RoundState::Coeffs(coeffs.clone());
@@ -372,13 +313,12 @@ where
 		&self.group.store
 	}
 
-	/// Pushes an owned column onto the store, returning its id.
+	/// Returns an exclusive reference to the underlying column store.
 	///
-	/// Lets a caller extend the shared store with a fresh column that a later-added evaluator
-	/// reads: the logUp* final layer pushes the table halves this way before adding its product
-	/// evaluators. See [`MleStore::push_owned`].
-	pub fn push_owned_column(&mut self, column: FieldVec<P, A>) -> ColId {
-		self.group.store.push_owned(column)
+	/// Lets a caller extend the shared store with columns that a later-added evaluator reads: the
+	/// logUp* final layer pushes the table halves onto it before adding its product evaluators.
+	pub const fn store_mut(&mut self) -> &mut MleStore<'a, A, P> {
+		&mut self.group.store
 	}
 
 	/// Adds one more evaluator — a claim reading the shared store, with its initial claim — to the
@@ -401,39 +341,22 @@ where
 		self.group.n_vars()
 	}
 
-	fn n_claims(&self) -> usize {
-		self.group.n_claims()
-	}
-
-	fn round_claim(&self) -> Vec<F> {
-		// A regular sumcheck polynomial carries its claim as the sum over the endpoints 0 and 1.
-		self.group
-			.round_claims(|coeffs| coeffs.sum_over_endpoints())
-	}
-
 	fn execute(&mut self) -> Vec<RoundCoeffs<F>> {
 		let n_vars_remaining = self.group.n_vars();
 		assert!(n_vars_remaining > 0);
 
-		// One pass over the halved hypercube feeds every evaluator.
-		// Shared columns and eq-indicator chunks are read once per round, while cache-resident.
-		//
-		// TODO: dynamically choose chunk size based on the number of columns and P byte-size,
-		// based on estimated L1 cache size.
-		let chunk_vars = chunk_vars_for::<P>(n_vars_remaining);
+		// One parallel pass over the halved hypercube feeds every evaluator, so shared columns
+		// and eq-indicator chunks are read once per round while they are cache-resident.
+		let chunk_vars = (n_vars_remaining - 1).min(MAX_CHUNK_VARS.max(P::LOG_WIDTH));
 
 		// Each evaluator owns a contiguous run of `degree` wide slots in one flat per-worker
-		// buffer; `offsets` holds the run boundaries as a prefix sum, so `offsets[i]..offsets[i +
-		// 1]` is evaluator `i`'s slice.
-		let offsets = accum_offsets(
-			self.group
-				.evaluators
-				.iter()
-				.map(|evaluator| evaluator.degree()),
-		);
-		let total_slots = *offsets
-			.last()
-			.expect("offsets has one entry per evaluator, plus one");
+		// buffer, laid out in registration order.
+		let total_slots: usize = self
+			.group
+			.evaluators
+			.iter()
+			.map(|evaluator| evaluator.degree())
+			.sum();
 
 		// The store prepares one `EvaluationChunk` per chunk of the halved hypercube — the split
 		// column halves and eq-indicator expansions each evaluator reads.
@@ -443,9 +366,14 @@ where
 		let store = &mut group.store;
 		let map = |chunk: EvaluationChunk<'_, P>| {
 			let mut accum = vec![Default::default(); total_slots];
-			for (evaluator, window) in iter::zip(evaluators, offsets.windows(2)) {
-				evaluator.accumulate(&chunk, &mut accum[window[0]..window[1]]);
+			// One walk hands each evaluator its own run, so no offset table is built per round.
+			let mut rest = accum.as_mut_slice();
+			for evaluator in evaluators {
+				let (slots, tail) = rest.split_at_mut(evaluator.degree());
+				rest = tail;
+				evaluator.accumulate(&chunk, slots);
 			}
+			debug_assert!(rest.is_empty(), "the runs must tile the accumulator exactly");
 			accum
 		};
 		let reduce = |mut lhs: Vec<<P as WideMul>::Output>,
@@ -469,10 +397,11 @@ where
 		// Interpolation runs on reduced values.
 		let accum = accum.into_iter().map(P::reduce).collect::<Vec<P>>();
 
-		self.group
-			.interpolate_round(&offsets, &accum, |evaluator, ctx, slots, claim| {
-				evaluator.interpolate(ctx, slots, claim)
-			})
+		self.group.interpolate_round(
+			&accum,
+			|evaluator| evaluator.degree(),
+			|evaluator, ctx, slots, claim| evaluator.interpolate(ctx, slots, claim),
+		)
 	}
 
 	fn fold(&mut self, challenge: F) {
@@ -532,9 +461,9 @@ where
 	/// equality factor into its emitted round polynomials — the [Gruen24] technique of
 	/// [`MleToSumCheckEvaluator`].
 	///
-	/// This lets the eq-weighted fractional claims batch in one evaluator group alongside plain
-	/// sumcheck claims over the same store: the logUp* final layer converts the popped table
-	/// layer's prover, then adds its product evaluators to it. The store and its columns carry over
+	/// This lets an eq-weighted claim batch in one evaluator group alongside plain sumcheck claims
+	/// over the same store: the logUp* pushforward reduction converts its evaluation claim on `Y`,
+	/// then adds the eq-free product evaluator to it. The store and its columns carry over
 	/// untouched; only the evaluators are wrapped, sharing this prover's eq tracker.
 	///
 	/// [Gruen24]: <https://eprint.iacr.org/2024/108>
@@ -564,7 +493,7 @@ where
 	}
 }
 
-impl<A, F, P, Evaluator> SumcheckProver<F> for SharedMleCheckProver<'_, A, F, P, Evaluator>
+impl<A, F, P, Evaluator> MleCheckProver<F> for SharedMleCheckProver<'_, A, F, P, Evaluator>
 where
 	A: Allocator,
 	F: Field,
@@ -575,37 +504,19 @@ where
 		self.group.n_vars()
 	}
 
-	fn n_claims(&self) -> usize {
-		self.group.n_claims()
-	}
-
-	fn round_claim(&self) -> Vec<F> {
-		// A prime polynomial carries its claim as the eq-weighted blend of its endpoints.
-		// The blending coordinate is the highest of the point's coordinates still unbound.
-		// It is read only where coefficients are held, and that state is gone once every variable
-		// is bound, so this stays valid to call at zero remaining variables.
-		self.group.round_claims(|coeffs| {
-			let alpha = self.eval_point[self.group.n_vars() - 1];
-			coeffs.lerp_over_endpoints(alpha)
-		})
-	}
-
 	fn execute(&mut self) -> Vec<RoundCoeffs<F>> {
 		let n_vars_remaining = self.group.n_vars();
 		assert!(n_vars_remaining > 0);
 
-		// One pass over the halved hypercube feeds every evaluator; see
+		// One parallel pass over the halved hypercube feeds every evaluator; see
 		// [`SharedSumcheckProver::execute`].
-		let chunk_vars = chunk_vars_for::<P>(n_vars_remaining);
-		let offsets = accum_offsets(
-			self.group
-				.evaluators
-				.iter()
-				.map(|evaluator| evaluator.degree()),
-		);
-		let total_slots = *offsets
-			.last()
-			.expect("offsets has one entry per evaluator, plus one");
+		let chunk_vars = (n_vars_remaining - 1).min(MAX_CHUNK_VARS.max(P::LOG_WIDTH));
+		let total_slots: usize = self
+			.group
+			.evaluators
+			.iter()
+			.map(|evaluator| evaluator.degree())
+			.sum();
 
 		// The eq indicator factors into a chunk part over the low `chunk_vars` coordinates and a
 		// suffix part over the higher ones. Materialize only the chunk part, shared by every chunk
@@ -621,9 +532,14 @@ where
 		let store = &mut group.store;
 		let map = |chunk: EvaluationChunk<'_, P>| {
 			let mut accum = vec![Default::default(); total_slots];
-			for (evaluator, window) in iter::zip(evaluators, offsets.windows(2)) {
-				evaluator.accumulate(&chunk, eq_chunk.to_ref(), &mut accum[window[0]..window[1]]);
+			// One walk hands each evaluator its own run, so no offset table is built per round.
+			let mut rest = accum.as_mut_slice();
+			for evaluator in evaluators {
+				let (slots, tail) = rest.split_at_mut(evaluator.degree());
+				rest = tail;
+				evaluator.accumulate(&chunk, eq_chunk.as_view(), slots);
 			}
+			debug_assert!(rest.is_empty(), "the runs must tile the accumulator exactly");
 			// Reduce the wide accumulators so the eq-weighted `reduce` can linearly extrapolate on
 			// P.
 			accum.into_iter().map(P::reduce).collect::<Vec<P>>()
@@ -642,10 +558,11 @@ where
 			None => store.map_reduce(chunk_vars, map, reduce),
 		};
 
-		self.group
-			.interpolate_round(&offsets, &accum, |evaluator, ctx, slots, claim| {
-				evaluator.interpolate(ctx, slots, claim, alpha)
-			})
+		self.group.interpolate_round(
+			&accum,
+			|evaluator| evaluator.degree(),
+			|evaluator, ctx, slots, claim| evaluator.interpolate(ctx, slots, claim, alpha),
+		)
 	}
 
 	fn fold(&mut self, challenge: F) {
@@ -655,15 +572,7 @@ where
 	fn finish(self) -> Vec<F> {
 		self.group.finish()
 	}
-}
 
-impl<A, F, P, Evaluator> MleCheckProver<F> for SharedMleCheckProver<'_, A, F, P, Evaluator>
-where
-	A: Allocator,
-	F: Field,
-	P: PackedField<Scalar = F>,
-	Evaluator: MleCheckRoundEvaluator<F, P>,
-{
 	fn eval_point(&self) -> &[F] {
 		&self.eval_point[..self.group.n_vars()]
 	}
@@ -712,7 +621,7 @@ mod tests {
 
 	// Split a multilinear on its highest variable into owned low and high halves.
 	fn owned_halves(buffer: &FieldBuffer<P>) -> [FieldBuffer<P>; 2] {
-		let (lo, hi) = buffer.split_half_ref();
+		let (lo, hi) = buffer.split_half();
 		[
 			FieldBuffer::new(lo.log_len(), lo.as_ref().into()),
 			FieldBuffer::new(hi.log_len(), hi.as_ref().into()),
@@ -756,7 +665,7 @@ mod tests {
 		claims: [F; 2],
 	) -> SharedMleCheckProver<'a, GlobalAllocator, F, P, Box<dyn MleCheckRoundEvaluator<F, P>>> {
 		let mut store = MleStore::new(eval_point.len(), alloc);
-		let col_ids = cols.each_ref().map(|col| store.push(col.to_ref()));
+		let col_ids = cols.each_ref().map(|col| store.push(col.as_view()));
 		let (num_ev, den_ev) = frac_add_mle::evaluators(col_ids);
 		let claims_with_evaluators: [(F, Box<dyn MleCheckRoundEvaluator<F, P>>); 2] =
 			[(claims[0], Box::new(num_ev)), (claims[1], Box::new(den_ev))];
@@ -854,7 +763,7 @@ mod tests {
 			let alloc = GlobalAllocator;
 			let mut store = MleStore::new(m - 1, &alloc);
 			let [y_0_col, y_1_col, d_0_col, d_1_col, t_0_col, t_1_col] =
-				[&y_0, &y_1, &d_0, &d_1, &t_0, &t_1].map(|col| store.push(col.to_ref()));
+				[&y_0, &y_1, &d_0, &d_1, &t_0, &t_1].map(|col| store.push(col.as_view()));
 
 			// The eq-weighted fractional evaluators, wrapped so they emit sumcheck round
 			// polynomials. The wrappers, driven by a plain sumcheck prover, hold the shared eq

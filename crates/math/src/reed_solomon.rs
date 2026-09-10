@@ -5,15 +5,16 @@
 //!
 //! See [`ReedSolomonCode`] for details.
 
-use binius_field::{BinaryField, PackedField};
-use getset::{CopyGetters, Getters};
+use std::marker::PhantomData;
 
-use super::{
-	FieldBuffer, FieldSlice, FieldSliceMut, binary_subspace::BinarySubspace, ntt::AdditiveNTT,
-};
+use binius_compute::Allocator;
+use binius_field::{BinaryField, PackedField};
+use getset::CopyGetters;
+
+use super::{FieldBuffer, FieldSlice, binary_subspace::BinarySubspace, ntt::AdditiveNTT};
 use crate::{
-	bit_reverse::{bit_reverse_indices, bit_reverse_packed},
-	ntt::DomainContext,
+	bit_reverse::bit_reverse_packed,
+	ntt::{DomainContext, domain_context::GaoMateerOnTheFly},
 };
 
 /// [Reed–Solomon] codes over binary fields.
@@ -25,58 +26,38 @@ use crate::{
 ///
 /// [Reed–Solomon]: <https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction>
 /// [LCH14]: <https://arxiv.org/abs/1404.3458>
-#[derive(Debug, Clone, Getters, CopyGetters)]
+#[derive(Debug, Clone, CopyGetters)]
 pub struct ReedSolomonCode<F> {
-	#[get = "pub"]
-	subspace: BinarySubspace<F>,
 	log_dimension: usize,
 	#[get_copy = "pub"]
 	log_inv_rate: usize,
+	_marker: PhantomData<F>,
 }
 
 impl<F: BinaryField> ReedSolomonCode<F> {
-	pub fn new(log_dimension: usize, log_inv_rate: usize) -> Self {
-		let subspace = BinarySubspace::with_dim(log_dimension + log_inv_rate);
-		Self::with_subspace(subspace, log_dimension, log_inv_rate)
-	}
-
-	pub fn with_ntt_subspace(
-		ntt: &impl AdditiveNTT<Field = F>,
-		log_dimension: usize,
-		log_inv_rate: usize,
-	) -> Self {
-		Self::with_domain_context_subspace(ntt.domain_context(), log_dimension, log_inv_rate)
-	}
-
-	pub fn with_domain_context_subspace(
-		domain_context: &impl DomainContext<Field = F>,
-		log_dimension: usize,
-		log_inv_rate: usize,
-	) -> Self {
-		let subspace_dim = log_dimension + log_inv_rate;
-		assert!(
-			subspace_dim <= domain_context.log_domain_size(),
-			"precondition: subspace dimension must not exceed domain context log size"
-		);
-		let subspace = domain_context.subspace(subspace_dim);
-		Self::with_subspace(subspace, log_dimension, log_inv_rate)
-	}
-
-	pub fn with_subspace(
-		subspace: BinarySubspace<F>,
-		log_dimension: usize,
-		log_inv_rate: usize,
-	) -> Self {
-		assert_eq!(
-			subspace.dim(),
-			log_dimension + log_inv_rate,
-			"precondition: subspace dimension must equal log_dimension + log_inv_rate"
-		);
+	/// A code of the given dimension and rate, evaluated over the Gao-Mateer basis.
+	///
+	/// The evaluation domain is not a parameter: it is the Gao-Mateer basis of `log_dimension +
+	/// log_inv_rate`, the same one [`GaoMateerOnTheFly`] and [`GaoMateerPreExpanded`] generate. A
+	/// verifier can therefore rebuild the domain from the code's shape alone, without being told
+	/// which basis the prover encoded over.
+	///
+	/// [`GaoMateerOnTheFly`]: crate::ntt::domain_context::GaoMateerOnTheFly
+	/// [`GaoMateerPreExpanded`]: crate::ntt::domain_context::GaoMateerPreExpanded
+	pub const fn new(log_dimension: usize, log_inv_rate: usize) -> Self {
 		Self {
-			subspace,
 			log_dimension,
 			log_inv_rate,
+			_marker: PhantomData,
 		}
+	}
+
+	/// The evaluation domain: the Gao-Mateer basis of [`Self::log_len`] dimensions.
+	///
+	/// Derived on demand rather than stored, so there is no way for it to disagree with the
+	/// domain a prover or verifier generates from the same dimension.
+	pub fn subspace(&self) -> BinarySubspace<F> {
+		GaoMateerOnTheFly::<F>::generate(self.log_len()).subspace(self.log_len())
 	}
 
 	/// The dimension.
@@ -121,19 +102,21 @@ impl<F: BinaryField> ReedSolomonCode<F> {
 	/// ## Postconditions
 	///
 	/// * All elements in the output buffer are initialized with the encoded codeword.
-	pub fn encode_batch<P, NTT>(
+	pub fn encode_batch<P, NTT, A>(
 		&self,
 		ntt: &NTT,
-		data: FieldSlice<P>,
+		data: FieldSlice<'_, P>,
 		log_batch_size: usize,
-	) -> FieldBuffer<P>
+		alloc: &A,
+	) -> FieldBuffer<P, A::Vec<P>>
 	where
 		P: PackedField<Scalar = F>,
 		NTT: AdditiveNTT<Field = F> + Sync,
+		A: Allocator,
 	{
 		assert_eq!(
 			ntt.subspace(self.log_len()),
-			self.subspace,
+			self.subspace(),
 			"precondition: NTT subspace must match code subspace"
 		);
 		assert_eq!(
@@ -150,61 +133,35 @@ impl<F: BinaryField> ReedSolomonCode<F> {
 		)
 		.entered();
 
-		// Repeat the message to fill the entire buffer.
+		// The forward transform below skips its first `log_inv_rate` layers.
+		// Each skipped layer would butterfly a coefficient with a zero pad:
+		//
+		//     u += v * twiddle; v += u;   with v = 0   =>   (c, 0) -> (c, c)
+		//
+		// That is one doubling per layer, so repeating the message does the skipped work.
 		let log_output_len = self.log_dim() + log_batch_size + self.log_inv_rate;
-		let output_data = if data.log_len() < P::LOG_WIDTH {
-			let mut scalars = data.iter_scalars().collect::<Vec<_>>();
-			bit_reverse_indices(&mut scalars);
-			let elem_0 = P::from_scalars(scalars.into_iter().cycle());
-			vec![elem_0; 1 << log_output_len.saturating_sub(P::LOG_WIDTH)]
-		} else {
-			let output_packed_len = 1 << (log_output_len - P::LOG_WIDTH);
-			let mut output_data = Vec::with_capacity(output_packed_len);
+		let mut output = FieldBuffer::from_view_with_capacity_in(alloc, data, log_output_len);
 
-			output_data.extend_from_slice(data.as_ref());
+		// Permute the message once, then repeat it, so every copy inherits the permutation.
+		bit_reverse_packed(output.as_mut_view());
+		output.repeat_extend(log_output_len);
 
-			// Bit-reverse permute the message.
-			bit_reverse_packed(FieldSliceMut::from_slice(
-				data.log_len(),
-				output_data.as_mut_slice(),
-			));
-
-			// Fill the codeword buffer by repeatedly doubling the initialized prefix.
-			// Each pass appends one copy of everything written so far.
-			//
-			//     [msg] -> [msg|msg] -> [msg|msg|msg|msg] -> ...
-			//
-			// The forward transform below skips its first `log_inv_rate` layers.
-			// Each skipped layer would butterfly a coefficient with a zero pad:
-			//
-			//     u += v * twiddle; v += u;   with v = 0   =>   (c, 0) -> (c, c)
-			//
-			// That is one doubling per layer, so the doublings reproduce the skipped work.
-			while output_data.len() < output_packed_len {
-				output_data.extend_from_within(..);
-			}
-
-			output_data
-		};
-		let mut output = FieldBuffer::new(log_output_len, output_data);
-
-		ntt.forward_transform(output.to_mut(), self.log_inv_rate, log_batch_size);
+		ntt.forward_transform(output.as_mut_view(), self.log_inv_rate, log_batch_size);
 		output
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use binius_field::{
-		BinaryField, PackedBinaryGhash1x128b, PackedBinaryGhash4x128b, PackedField,
-	};
+	use binius_compute::GlobalAllocator;
+	use binius_field::{BinaryField, PackedField, PackedGhash1x128b, PackedGhash4x128b};
 	use rand::{SeedableRng, rngs::StdRng};
 
 	use super::*;
 	use crate::{
 		FieldBuffer,
 		bit_reverse::reverse_bits,
-		ntt::{NeighborsLastReference, domain_context::GenericPreExpanded},
+		ntt::{NeighborsLastReference, domain_context::GaoMateerPreExpanded},
 		test_utils::random_field_buffer,
 	};
 
@@ -219,9 +176,8 @@ mod tests {
 
 		let rs_code = ReedSolomonCode::<P::Scalar>::new(log_dim, log_inv_rate);
 
-		// Create NTT with matching subspace
-		let subspace = rs_code.subspace().clone();
-		let domain_context = GenericPreExpanded::<P::Scalar>::generate_from_subspace(&subspace);
+		// The code's domain is the Gao-Mateer basis of its length, so the NTT generates the same.
+		let domain_context = GaoMateerPreExpanded::<P::Scalar>::generate(rs_code.log_len());
 		let ntt = NeighborsLastReference {
 			domain_context: &domain_context,
 		};
@@ -230,7 +186,8 @@ mod tests {
 		let message = random_field_buffer::<P>(&mut rng, log_dim + log_batch_size);
 
 		// Test the new encode_batch interface
-		let encoded_buffer = rs_code.encode_batch(&ntt, message.to_ref(), log_batch_size);
+		let encoded_buffer =
+			rs_code.encode_batch(&ntt, message.as_view(), log_batch_size, &GlobalAllocator);
 
 		// Method 2: Reference implementation - apply NTT with zero-padded coefficients to the
 		// bit-reversal permuted message.
@@ -241,7 +198,7 @@ mod tests {
 		}
 
 		// Perform large NTT with zero-padded coefficients.
-		ntt.forward_transform(reference_buffer.to_mut(), 0, log_batch_size);
+		ntt.forward_transform(reference_buffer.as_mut_view(), 0, log_batch_size);
 
 		// Compare results
 		assert_eq!(
@@ -253,21 +210,21 @@ mod tests {
 
 	#[test]
 	fn test_encode_batch_above_packing_width() {
-		// Test with PackedBinaryGhash1x128b
-		test_encode_batch_helper::<PackedBinaryGhash1x128b>(4, 2, 0);
-		test_encode_batch_helper::<PackedBinaryGhash1x128b>(6, 2, 1);
-		test_encode_batch_helper::<PackedBinaryGhash1x128b>(8, 3, 2);
+		// Test with PackedGhash1x128b
+		test_encode_batch_helper::<PackedGhash1x128b>(4, 2, 0);
+		test_encode_batch_helper::<PackedGhash1x128b>(6, 2, 1);
+		test_encode_batch_helper::<PackedGhash1x128b>(8, 3, 2);
 
-		// Test with PackedBinaryGhash4x128b
-		test_encode_batch_helper::<PackedBinaryGhash4x128b>(4, 2, 0);
-		test_encode_batch_helper::<PackedBinaryGhash4x128b>(6, 2, 1);
-		test_encode_batch_helper::<PackedBinaryGhash4x128b>(8, 3, 2);
+		// Test with PackedGhash4x128b
+		test_encode_batch_helper::<PackedGhash4x128b>(4, 2, 0);
+		test_encode_batch_helper::<PackedGhash4x128b>(6, 2, 1);
+		test_encode_batch_helper::<PackedGhash4x128b>(8, 3, 2);
 	}
 
 	#[test]
 	fn test_encode_batch_below_packing_width() {
 		// Test where message length is less than the packing width and codeword length is greater.
-		test_encode_batch_helper::<PackedBinaryGhash4x128b>(1, 2, 0);
+		test_encode_batch_helper::<PackedGhash4x128b>(1, 2, 0);
 	}
 
 	/// Pins the codeword-duplication identity that underlies Lifted FRI (oracle padding).
@@ -290,24 +247,17 @@ mod tests {
 
 		let mut rng = StdRng::seed_from_u64(0);
 
-		// Both codes are derived from a single shared domain context covering the larger code, so
-		// the smaller code's subspace is the prefix the shared NTT twiddles expect.
-		let subspace = BinarySubspace::<P::Scalar>::with_dim(log_dim_large + log_inv_rate);
-		let domain_context = GenericPreExpanded::<P::Scalar>::generate_from_subspace(&subspace);
+		// One shared NTT covers the larger code. Both codes evaluate over the Gao-Mateer basis, and
+		// the smaller one's is a prefix of the larger one's, which is what the shared twiddles
+		// expect -- a property the codes now have by construction rather than by wiring.
+		let domain_context =
+			GaoMateerPreExpanded::<P::Scalar>::generate(log_dim_large + log_inv_rate);
 		let ntt = NeighborsLastReference {
 			domain_context: &domain_context,
 		};
 
-		let rs_small = ReedSolomonCode::with_domain_context_subspace(
-			&domain_context,
-			log_dim_small,
-			log_inv_rate,
-		);
-		let rs_large = ReedSolomonCode::with_domain_context_subspace(
-			&domain_context,
-			log_dim_large,
-			log_inv_rate,
-		);
+		let rs_small = ReedSolomonCode::new(log_dim_small, log_inv_rate);
+		let rs_large = ReedSolomonCode::new(log_dim_large, log_inv_rate);
 
 		// Random message for the small code.
 		let msg_small = random_field_buffer::<P>(&mut rng, log_dim_small);
@@ -319,8 +269,8 @@ mod tests {
 			msg_large.set(i, val);
 		}
 
-		let enc_small = rs_small.encode_batch(&ntt, msg_small.to_ref(), 0);
-		let enc_large = rs_large.encode_batch(&ntt, msg_large.to_ref(), 0);
+		let enc_small = rs_small.encode_batch(&ntt, msg_small.as_view(), 0, &GlobalAllocator);
+		let enc_large = rs_large.encode_batch(&ntt, msg_large.as_view(), 0, &GlobalAllocator);
 
 		let small_scalars = enc_small.iter_scalars().collect::<Vec<_>>();
 		let large_scalars = enc_large.iter_scalars().collect::<Vec<_>>();
@@ -339,12 +289,12 @@ mod tests {
 	#[test]
 	fn test_lift_duplicate_identity() {
 		// eta = 0 degrades to plain equality.
-		test_lift_duplicate_identity_helper::<PackedBinaryGhash1x128b>(6, 6, 2);
+		test_lift_duplicate_identity_helper::<PackedGhash1x128b>(6, 6, 2);
 		// Non-trivial lifts of varying sizes.
-		test_lift_duplicate_identity_helper::<PackedBinaryGhash1x128b>(4, 6, 2);
-		test_lift_duplicate_identity_helper::<PackedBinaryGhash1x128b>(2, 8, 1);
-		test_lift_duplicate_identity_helper::<PackedBinaryGhash1x128b>(0, 4, 3);
+		test_lift_duplicate_identity_helper::<PackedGhash1x128b>(4, 6, 2);
+		test_lift_duplicate_identity_helper::<PackedGhash1x128b>(2, 8, 1);
+		test_lift_duplicate_identity_helper::<PackedGhash1x128b>(0, 4, 3);
 		// Same lifts with a wider packing width.
-		test_lift_duplicate_identity_helper::<PackedBinaryGhash4x128b>(4, 8, 2);
+		test_lift_duplicate_identity_helper::<PackedGhash4x128b>(4, 8, 2);
 	}
 }

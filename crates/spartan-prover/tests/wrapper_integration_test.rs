@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use binius_compute::GlobalAllocator;
-use binius_field::{BinaryField128bGhash as B128, Field, Random, arch::OptimalPackedB128};
+use binius_field::{Field, Ghash128b as B128, Random, arch::OptimalPackedB128};
 use binius_hash::StdHashSuite;
 use binius_iop::{
 	basefold::compiler::BaseFoldVerifierCompiler,
@@ -14,7 +14,7 @@ use binius_iop::{
 use binius_iop_prover::basefold::compiler::BaseFoldProverCompiler;
 use binius_ip::channel::IPVerifierChannel;
 use binius_ip_prover::channel::IPProverChannel;
-use binius_math::ntt::{NeighborsLastSingleThread, domain_context::GenericOnTheFly};
+use binius_math::ntt::{NeighborsLastSingleThread, domain_context::GaoMateerOnTheFly};
 use binius_spartan_frontend::{
 	circuit_builder::{CircuitBuilder, ConstraintBuilder, WitnessGenerator},
 	circuits::powers,
@@ -83,10 +83,7 @@ fn test_zk_wrapped_prove_verify() {
 	// === Step 4: Build outer padded constraint system ===
 	let log_inv_rate = 1;
 	let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
-	let blinding_info = BlindingInfo {
-		n_dummy_wires: n_test_queries,
-		n_dummy_constraints: 2,
-	};
+	let blinding_info = BlindingInfo::for_fri_queries(n_test_queries);
 	let outer_cs = ConstraintSystemPadded::new(outer_cs, blinding_info);
 	let outer_layout = Arc::new(outer_layout.with_blinding(*outer_cs.blinding_info()));
 
@@ -114,8 +111,7 @@ fn test_zk_wrapped_prove_verify() {
 		&MinProofSizeStrategy,
 	);
 
-	let subspace = zk_basefold_compiler.max_subspace();
-	let domain_context = GenericOnTheFly::generate_from_subspace(subspace);
+	let domain_context = GaoMateerOnTheFly::generate(zk_basefold_compiler.max_log_domain_size());
 	let ntt = NeighborsLastSingleThread::new(domain_context);
 	let zk_basefold_prover: BaseFoldProverCompiler<OptimalPackedB128, _> =
 		BaseFoldProverCompiler::from_verifier_compiler(&zk_basefold_compiler, ntt);
@@ -145,6 +141,7 @@ fn test_zk_wrapped_prove_verify() {
 		.create_channel_from_transcript::<StdHashSuite, StdChallenger, _, _>(
 			&mut prover_transcript,
 			&mut rng,
+			GlobalAllocator,
 		);
 	let mut wrapped_prover_channel = ZKWrappedProverChannel::new(
 		basefold_channel,

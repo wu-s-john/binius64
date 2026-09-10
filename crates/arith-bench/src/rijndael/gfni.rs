@@ -6,10 +6,6 @@ pub fn mul<U: Underlier + OpsGfni>(a: U, b: U) -> U {
 	OpsGfni::gf2p8mul(a, b)
 }
 
-pub fn sqr<U: Underlier + OpsGfni>(x: U) -> U {
-	OpsGfni::gf2p8mul(x, x)
-}
-
 pub fn inv<U: Underlier + OpsGfni + PackedUnderlier<u64>>(x: U) -> U {
 	#[rustfmt::skip]
 	pub const IDENTITY_MAP: u64 = u64::from_le_bytes([
@@ -23,6 +19,6 @@ pub fn inv<U: Underlier + OpsGfni + PackedUnderlier<u64>>(x: U) -> U {
 		0b00000001,
 	]);
 
-	let identity_map = <U as PackedUnderlier<u64>>::broadcast(IDENTITY_MAP);
+	let identity_map = U::broadcast(IDENTITY_MAP);
 	OpsGfni::gf2p8affineinv::<0>(x, identity_map)
 }

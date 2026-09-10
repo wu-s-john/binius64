@@ -63,12 +63,13 @@ impl Hint for ModInverseHint {
 		let modulus = num_biguint_from_u64_limbs(mod_limbs.iter().map(|w| w.as_u64()));
 
 		let zero = num_bigint::BigUint::ZERO;
-		let (quotient, inverse) = if let Some(inverse) = base.modinv(&modulus) {
-			let quotient = (base * &inverse - num_bigint::BigUint::from(1usize)) / &modulus;
-			(quotient, inverse)
-		} else {
-			(zero.clone(), zero)
-		};
+		let (quotient, inverse) = base.modinv(&modulus).map_or_else(
+			|| (zero.clone(), zero),
+			|inverse| {
+				let quotient = (base * &inverse - num_bigint::BigUint::from(1usize)) / &modulus;
+				(quotient, inverse)
+			},
+		);
 
 		assert_eq!(outputs.len(), 2 * *n_mod);
 		let (quotient_words, inverse_words) = outputs.split_at_mut(*n_mod);
@@ -110,6 +111,12 @@ mod tests {
 
 		let (quotient, inverse) = ModInverseHint::call(&builder, &[b], &[m0, m1]);
 
+		// A hint emits no constraint of its own, so pinning alone leaves these uncommitted.
+		// Promoting them to public outputs is what the test needs to read them back.
+		for &wire in quotient.iter().chain(&inverse) {
+			builder.mark_inout(wire);
+		}
+
 		let circuit = builder.build();
 		let mut w = circuit.new_witness_filler();
 		circuit.populate_wire_witness(&mut w).unwrap();
@@ -134,6 +141,12 @@ mod tests {
 		let m1 = builder.add_constant_64(0x3ffff7ffffffffff);
 
 		let (quotient, inverse) = ModInverseHint::call(&builder, &[b], &[m0, m1]);
+
+		// A hint emits no constraint of its own, so pinning alone leaves these uncommitted.
+		// Promoting them to public outputs is what the test needs to read them back.
+		for &wire in quotient.iter().chain(&inverse) {
+			builder.mark_inout(wire);
+		}
 
 		let circuit = builder.build();
 		let mut w = circuit.new_witness_filler();

@@ -21,11 +21,12 @@ pub use zk_wrapped_channel::ZKWrappedVerifierChannel;
 mod tests {
 	use std::rc::Rc;
 
+	use binius_core::word::Word;
 	use binius_field::{
-		BinaryField1b as B1, BinaryField128bGhash as B128, ExtensionField, Field, Random,
+		BinaryField1b as B1, ExtensionField, Field, Ghash128b as B128, Random,
 		arithmetic_traits::InvertOrZero, field::FieldOps,
 	};
-	use binius_ip::channel::IPVerifierChannel;
+	use binius_ip::channel::{IPVerifierChannel, WordIPVerifierChannel};
 	use binius_spartan_frontend::circuit_builder::ConstraintBuilder;
 	use rand::{SeedableRng, rngs::StdRng};
 
@@ -106,15 +107,26 @@ mod tests {
 	}
 
 	#[test]
-	fn test_invert_or_zero_creates_constraints() {
+	fn test_invert_creates_constraints() {
 		let rc = Rc::new(std::cell::RefCell::new(ConstraintBuilder::<B128>::new()));
 		let elem = alloc_private_wire(&rc);
 
-		let _inv = elem.invert_or_zero();
+		// SAFETY: nothing constrains the wire, so the contract is vacuous here; the test only
+		// counts the constraints the inverse emits.
+		let _inv = unsafe { elem.invert() };
 		let (cs, _layout) = Rc::try_unwrap(rc).unwrap().into_inner().build().finalize();
-		// InvertOrZero creates: a mul constraint (wire * inv) and a zero constraint
+		// The inverse creates: a mul constraint (wire * inv) and a zero constraint
 		// (product ^ one), both of which become mul constraints after finalization.
 		assert!(cs.mul_constraints().len() >= 2);
+	}
+
+	#[test]
+	#[should_panic(expected = "the wrapper inverts only values argued non-zero")]
+	fn test_invert_or_zero_is_unimplemented() {
+		let rc = Rc::new(std::cell::RefCell::new(ConstraintBuilder::<B128>::new()));
+		let elem = alloc_private_wire(&rc);
+
+		let _ = elem.invert_or_zero();
 	}
 
 	#[test]
@@ -131,6 +143,28 @@ mod tests {
 		for elem in &c {
 			assert!(matches!(elem, BuildElem::Wire { .. }));
 		}
+	}
+
+	/// The packed statement enters the circuit as inout wires, not as constants.
+	///
+	/// The wrapper circuit is built once, against whatever statement the symbolic run was handed,
+	/// and reused for every other one. Packing the words into constants would fix that first
+	/// statement into the circuit, so the words become wires the concrete channels fill in.
+	#[test]
+	fn test_pack_words_allocates_inout_wires() {
+		let mut channel = IronSpartanBuilderChannel::<B128>::new();
+
+		// Two words to a `B128`, so three words span two elements. The zero word is deliberate:
+		// nothing about the packing may turn on the values.
+		let words = [Word::from_u64(7), Word::ZERO, Word::from_u64(9)];
+		let elems = channel.pack_words(&words);
+
+		assert_eq!(elems.len(), 2);
+		assert!(
+			elems
+				.iter()
+				.all(|elem| matches!(elem, BuildElem::Wire { .. }))
+		);
 	}
 
 	#[test]

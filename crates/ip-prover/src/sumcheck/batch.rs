@@ -7,7 +7,7 @@ use crate::{
 	channel::IPProverChannel,
 	sumcheck::{
 		common::{MleCheckProver, SumcheckProver},
-		drive::{self, RoundProofKind},
+		drive::{self, MleCheckRounds, SumcheckRounds},
 	},
 };
 
@@ -61,7 +61,7 @@ where
 	F: Field,
 	Prover: SumcheckProver<F>,
 {
-	drive::batch(RoundProofKind::Sumcheck, provers, channel)
+	drive::batch(provers.into_iter().map(SumcheckRounds), channel)
 }
 
 /// Prove a batched sumcheck protocol and write evaluation claims to the channel.
@@ -117,60 +117,7 @@ where
 		);
 	}
 
-	drive::batch(RoundProofKind::MleCheck, provers, channel)
-}
-
-/// Prove a batched MLE-check and write evaluation claims to the channel.
-///
-/// This is the MLE-check analog of [`batch_prove_and_write_evals`].
-pub fn batch_prove_mle_and_write_evals<F, MleCheckProver_>(
-	provers: Vec<MleCheckProver_>,
-	channel: &mut impl IPProverChannel<F>,
-) -> BatchSumcheckOutput<F>
-where
-	F: Field,
-	MleCheckProver_: MleCheckProver<F>,
-{
-	let output = batch_prove_mle(provers, channel);
-	output.send_evals(channel);
-	output
-}
-
-/// Prove a batched MLE-check whose batching coefficient the caller has already sampled.
-///
-/// This is [`batch_prove_mle`] with the coefficient supplied rather than drawn.
-/// A caller needs that when it must know the coefficient before building its provers.
-/// An evaluator that emits one already-batched round polynomial is such a caller.
-///
-/// The coefficient must come from the same channel immediately before this call.
-/// Then the transcript is the one [`batch_prove_mle`] would have produced.
-pub(crate) fn batch_prove_mle_with_coeff<F, MleCheckProver_>(
-	provers: Vec<MleCheckProver_>,
-	batch_coeff: F,
-	channel: &mut impl IPProverChannel<F>,
-) -> BatchSumcheckOutput<F>
-where
-	F: Field,
-	MleCheckProver_: MleCheckProver<F>,
-{
-	drive::batch_with_coeff(RoundProofKind::MleCheck, provers, batch_coeff, channel)
-}
-
-/// [`batch_prove_mle_and_write_evals`] with the batching coefficient supplied by the caller.
-///
-/// See [`batch_prove_mle_with_coeff`] for when a caller needs the coefficient up front.
-pub(crate) fn batch_prove_mle_with_coeff_and_write_evals<F, MleCheckProver_>(
-	provers: Vec<MleCheckProver_>,
-	batch_coeff: F,
-	channel: &mut impl IPProverChannel<F>,
-) -> BatchSumcheckOutput<F>
-where
-	F: Field,
-	MleCheckProver_: MleCheckProver<F>,
-{
-	let output = batch_prove_mle_with_coeff(provers, batch_coeff, channel);
-	output.send_evals(channel);
-	output
+	drive::batch(provers.into_iter().map(MleCheckRounds), channel)
 }
 
 #[cfg(test)]

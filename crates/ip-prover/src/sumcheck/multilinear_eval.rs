@@ -1,6 +1,8 @@
 // Copyright 2026 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
+use std::iter;
+
 use binius_compute::Allocator;
 use binius_field::{Field, PackedField, WideMul};
 use binius_ip::sumcheck::RoundCoeffs;
@@ -8,7 +10,7 @@ use binius_math::{FieldSlice, FieldVec};
 
 use super::{
 	mle_store::{ColId, EvaluationChunk, MleStore, RoundContext},
-	round_evals::RoundEvals1,
+	round_evals::RoundEvals,
 	round_evaluator::{MleCheckRoundEvaluator, SharedMleCheckProver},
 };
 
@@ -50,16 +52,21 @@ where
 	) {
 		// The column arrives split on the round's highest variable.
 		// Its high half is the specialization at `X = 1`.
-		let col = chunk.col(self.col);
+		let hi = chunk.col(self.col).hi.as_ref();
+		let eq_ind = eq_ind.as_ref();
+
+		// The two run in lockstep, so pairing them checks the length once per chunk.
+		// Indexing one by the other's position instead consults a bound on every element.
+		assert_eq!(hi.len(), eq_ind.len());
 
 		// R(1) = <M(.., X = 1), eq(.., z)> over this chunk.
 		// Only the eq multiply is widened.
 		// The wide accumulator is reduced once at the end of the chunk.
 		let mut y_1 = <P as WideMul>::Output::default();
-		for (idx, &eq_i) in eq_ind.as_ref().iter().enumerate() {
-			y_1 += P::wide_mul(col.hi.as_ref()[idx], eq_i);
+		for (&m_i, &eq_i) in iter::zip(hi, eq_ind) {
+			y_1 += P::wide_mul(m_i, eq_i);
 		}
-		accum[0] += y_1;
+		RoundEvals([y_1]).add_to(accum);
 	}
 
 	fn interpolate(
@@ -78,7 +85,7 @@ where
 		// Sum its lanes, then interpolate.
 		// `claim` is this round's prime evaluation.
 		// `alpha` is the eq coordinate that ties it to the point.
-		RoundEvals1 { y_1: accum[0] }
+		RoundEvals::<P, 1>::from_slots(accum)
 			.sum_scalars(n_vars_remaining)
 			.interpolate_eq(claim, alpha)
 	}
@@ -145,7 +152,7 @@ mod tests {
 
 	use super::*;
 	use crate::sumcheck::{
-		common::SumcheckProver, prove_single_mlecheck,
+		common::MleCheckProver, prove_single_mlecheck,
 		quadratic_mle_evaluator::quadratic_mlecheck_prover,
 	};
 
@@ -190,9 +197,6 @@ mod tests {
 			assert_eq!(quadratic_round[0].0.pop(), Some(F::ZERO));
 			assert_eq!(eval_round[0], quadratic_round[0]);
 
-			// `round_claim` must agree across both provers and be stable across execute.
-			assert_eq!(eval_prover.round_claim(), quadratic_prover.round_claim());
-
 			let challenge = F::random(&mut rng);
 			eval_prover.fold(challenge);
 			quadratic_prover.fold(challenge);
@@ -233,31 +237,5 @@ mod tests {
 		let mut reduced_point = sumcheck_output.challenges;
 		reduced_point.reverse();
 		assert_eq!(evaluate(&witness, &reduced_point), multilinear_evals[0]);
-	}
-
-	// `round_claim` must return the same value before and after `execute` (lerp recovery), and the
-	// post-fold claim must equal the round polynomial evaluated at the challenge.
-	#[test]
-	fn test_round_claim_invariant() {
-		let mut rng = StdRng::seed_from_u64(2);
-		let n_vars = 6;
-		let alloc = GlobalAllocator;
-
-		let witness = random_field_buffer::<P>(&mut rng, n_vars);
-		let eval_point = random_scalars::<F>(&mut rng, n_vars);
-		let eval_claim = evaluate(&witness, &eval_point);
-
-		let mut prover = multilinear_eval_prover(&alloc, witness, &eval_point, eval_claim);
-		assert_eq!(prover.round_claim(), vec![eval_claim]);
-
-		for _ in 0..n_vars {
-			let before = prover.round_claim();
-			let round = prover.execute();
-			assert_eq!(prover.round_claim(), before);
-			let challenge = F::random(&mut rng);
-			let expected_next = round[0].evaluate(&challenge);
-			prover.fold(challenge);
-			assert_eq!(prover.round_claim(), vec![expected_next]);
-		}
 	}
 }

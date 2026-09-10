@@ -10,12 +10,13 @@
 //! [`VecLike`] buffers, letting the prover's allocation code be written against `&impl Allocator`
 //! rather than a concrete pool. `&BufferPool` is the primary [`Allocator`], producing [`PoolVec`]
 //! buffers.
+//!
+//! [`CollectIntoAllocVec`] is the rayon seam over the same machinery: it collects a parallel
+//! iterator straight into one of those buffers.
 
-use std::{
-	mem,
-	mem::MaybeUninit,
-	ops::{Deref, DerefMut},
-};
+use std::{mem, mem::MaybeUninit, ops::DerefMut};
+
+use rayon::prelude::*;
 
 pub mod buffer_pool;
 
@@ -30,17 +31,59 @@ pub use buffer_pool::{BufferPool, PoolVec};
 /// [`Sync`] is required because the prover shares `&impl Allocator` across rayon tasks (e.g. the
 /// parallel fractional-addition GKR reduction); both `&BufferPool` and `GlobalAllocator` are
 /// `Sync`.
-pub trait Allocator: Sync {
+///
+/// [`Copy`] is required because a caller often hands the same allocator to several things at once
+/// — a channel and the Merkle prover inside it, say. An allocator handle is a pool reference or a
+/// unit struct, so both implementors are already `Copy` and the bound costs them nothing.
+pub trait Allocator: Sync + Copy {
 	/// The buffer type this allocator hands out for element type `T`.
 	///
-	/// It is both a [`VecLike`] (growable) and a [`BufferData`] (shrinkable-in-place) buffer, so an
-	/// allocated buffer can back a `binius_math::FieldBuffer` directly. It is also [`Send`] so the
-	/// prover can move pooled buffers across rayon tasks (e.g. the parallel fractional-addition GKR
-	/// reduction); every element type the prover pools is itself `Send`.
-	type Vec<T: Send>: VecLike<T> + BufferData<T> + Send;
+	/// It is a [`VecLike`] buffer, and [`VecLike`] implies [`BufferData`].
+	/// It grows and shrinks in place, so it can back a `binius_math::FieldBuffer` directly.
+	///
+	/// It is also [`Send`] so the prover can move pooled buffers across rayon tasks (e.g. the
+	/// parallel fractional-addition GKR reduction); every element type the prover pools is itself
+	/// `Send`.
+	type Vec<T: Send>: VecLike<T> + Send;
 
 	/// Allocates an empty buffer with room for at least `capacity` elements of type `T`.
 	fn alloc<T: Send>(&self, capacity: usize) -> Self::Vec<T>;
+}
+
+/// Collects a parallel iterator into a buffer drawn from an [`Allocator`].
+///
+/// The allocator's counterpart to [`IndexedParallelIterator::collect_into_vec`], which targets a
+/// `&mut Vec` that a generic buffer is not. The buffer is sized to the iterator's length, and its
+/// uninitialized capacity is written in parallel rather than zero-filled first.
+pub trait CollectIntoAllocVec: IndexedParallelIterator {
+	/// Allocates a buffer holding one element per item and fills it with the iterator's items.
+	///
+	/// ```
+	/// use binius_compute::{CollectIntoAllocVec, GlobalAllocator};
+	/// use rayon::prelude::*;
+	///
+	/// let squares = (0..8usize).into_par_iter().map(|i| i * i);
+	/// let buffer = squares.collect_into_alloc_vec(&GlobalAllocator);
+	/// assert_eq!(&*buffer, &[0, 1, 4, 9, 16, 25, 36, 49]);
+	/// ```
+	fn collect_into_alloc_vec<A: Allocator>(self, alloc: &A) -> A::Vec<Self::Item>;
+}
+
+impl<I: IndexedParallelIterator> CollectIntoAllocVec for I {
+	fn collect_into_alloc_vec<A: Allocator>(self, alloc: &A) -> A::Vec<Self::Item> {
+		let len = self.len();
+		let mut buffer = alloc.alloc::<Self::Item>(len);
+		// The allocator may hand back more capacity than requested, so bound the spare slice to the
+		// item count: a rayon zip yields as many items as its shorter side holds.
+		self.zip(&mut buffer.spare_capacity_mut()[..len])
+			.for_each(|(item, slot)| {
+				slot.write(item);
+			});
+		// SAFETY: the two zipped sides are both `len` long, so the loop wrote each of the `len`
+		// slots exactly once.
+		unsafe { buffer.set_len(len) };
+		buffer
+	}
 }
 
 /// Backing store of a `binius_math::FieldBuffer` that can be shrunk in place.
@@ -49,13 +92,13 @@ pub trait Allocator: Sync {
 /// [`Allocator::Vec`] — that bound is what lets generic allocation code back a `FieldBuffer` with
 /// an allocator's buffer `A::Vec<P>` without threading a `where A::Vec<P>: BufferData<P>` clause
 /// through every signature. `FieldBuffer::truncate` shrinks its backing store to match a smaller
-/// `log_len`, so it is available only for the mutable backings that support that in place: the
-/// growable [`VecLike`] buffers (`Vec<T>` and [`PoolVec`]) and `&mut [T]`.
+/// `log_len`, so it is available only for the mutable backings that support that in place.
 ///
-/// A single blanket `impl<V: VecLike<T>> BufferData<T> for V` would be nicer, but it collides with
-/// the `&mut [T]` impl (coherence cannot rule out a downstream `VecLike for &mut [T]`), and the
-/// `&mut [T]` backing is required — the sumcheck store folds and truncates slice-backed halves. So
-/// the two `VecLike` backings are enumerated explicitly instead.
+/// This trait is the shrinkable-store capability alone, and [`VecLike`] is that plus growth.
+/// Three backings implement it:
+///
+/// - `Vec<T>` and [`PoolVec`] both shrink and grow, so both are [`VecLike`] as well.
+/// - `&mut [T]` only shrinks, by re-slicing, which is what slice-backed sumcheck halves need.
 pub trait BufferData<T>: DerefMut<Target = [T]> {
 	/// Shrinks the store in place to its first `len` elements.
 	///
@@ -86,10 +129,10 @@ impl<T> BufferData<T> for &mut [T] {
 
 /// A growable, `Vec`-like buffer.
 ///
-/// Abstracts the buffer surface the prover relies on — a subset of [`Vec`]'s API, plus dereference
-/// to `[T]`. Implemented by [`PoolVec`]; add methods here (and to the implementors) as callers need
-/// them rather than mirroring all of [`Vec`].
-pub trait VecLike<T>: Deref<Target = [T]> + DerefMut + Extend<T> {
+/// Abstracts the buffer surface the prover uses: [`BufferData`] plus a subset of [`Vec`]'s API.
+/// Implemented by `Vec<T>` and [`PoolVec`], with methods added as callers need them.
+/// It is not meant to mirror all of [`Vec`].
+pub trait VecLike<T>: BufferData<T> + Extend<T> {
 	/// Returns the number of elements the buffer can hold without reallocating.
 	fn capacity(&self) -> usize;
 
@@ -231,6 +274,37 @@ mod tests {
 		buffer.extend_from_slice(&[2, 3]);
 		buffer.resize(5, 0);
 		buffer
+	}
+
+	#[test]
+	fn collect_into_alloc_vec_fills_the_whole_buffer() {
+		// The pool rounds its blocks up, so 1000 items draw a buffer with spare slots past them.
+		// Those slots must stay outside the collected length.
+		let pool = BufferPool::new();
+		let squares = (0..1000usize).into_par_iter().map(|i| (i * i) as u64);
+		let buffer = squares.collect_into_alloc_vec(&&pool);
+		assert_eq!(buffer.len(), 1000);
+		assert!(
+			buffer
+				.iter()
+				.enumerate()
+				.all(|(i, &sq)| sq == (i * i) as u64)
+		);
+	}
+
+	#[test]
+	fn vec_truncates_through_buffer_data() {
+		let mut buffer = vec![1u64, 2, 3, 4];
+		BufferData::truncate(&mut buffer, 2);
+		assert_eq!(&*buffer, &[1, 2]);
+	}
+
+	#[test]
+	fn slice_truncates_through_buffer_data() {
+		let mut owned = [1u64, 2, 3, 4];
+		let mut buffer: &mut [u64] = &mut owned;
+		BufferData::truncate(&mut buffer, 3);
+		assert_eq!(buffer, &[1, 2, 3]);
 	}
 
 	#[test]

@@ -119,7 +119,7 @@ impl ByteVec {
 	///
 	/// # Panics
 	/// * If `len_bytes` lies outside `self.len_range`.
-	pub fn populate_len_bytes(&self, w: &mut WitnessFiller, len_bytes: usize) {
+	pub fn populate_len_bytes(&self, w: &mut WitnessFiller<'_>, len_bytes: usize) {
 		self.assert_len_in_range(len_bytes);
 		w[self.len_bytes] = Word(len_bytes as u64);
 	}
@@ -139,7 +139,7 @@ impl ByteVec {
 	///
 	/// # Panics
 	/// * If bytes.len() exceeds self.max_len
-	pub fn populate_bytes_le(&self, w: &mut WitnessFiller, bytes: &[u8]) {
+	pub fn populate_bytes_le(&self, w: &mut WitnessFiller<'_>, bytes: &[u8]) {
 		self.assert_len_in_range(bytes.len());
 		w.pack_bytes_le(&self.data, bytes);
 		w[self.len_bytes] = Word(bytes.len() as u64);
@@ -152,7 +152,7 @@ impl ByteVec {
 	///
 	/// # Panics
 	/// Panics if `data_bytes.len()` > `self.max_len_bytes()`
-	pub fn populate_data(&self, w: &mut WitnessFiller, data_bytes: &[u8]) {
+	pub fn populate_data(&self, w: &mut WitnessFiller<'_>, data_bytes: &[u8]) {
 		assert!(
 			data_bytes.len() <= self.max_len_bytes(),
 			"vector data length {} exceeds maximum {}",
@@ -325,7 +325,6 @@ pub(crate) fn extract_const_range(
 
 #[cfg(test)]
 mod tests {
-	use binius_core::verify::verify_constraints;
 
 	use super::{ByteVec, CircuitBuilder, Word};
 
@@ -356,7 +355,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -370,6 +369,8 @@ mod tests {
 		let slice = byte_vec.slice_const_range(&b, 3..11);
 
 		assert_eq!(slice.data.len(), 1, "Slice should have 1 word");
+		// The test writes this directly, so pin it or pooling could reclaim its slot first.
+		b.force_commit(slice.data[0]);
 
 		let circuit = b.build();
 		let mut filler = circuit.new_witness_filler();
@@ -387,7 +388,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -419,7 +420,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -433,6 +434,8 @@ mod tests {
 		let slice = byte_vec.slice_const_range(&b, 3..8);
 
 		assert_eq!(slice.data.len(), 1, "Slice should have 1 word");
+		// The test writes this directly, so pin it or pooling could reclaim its slot first.
+		b.force_commit(slice.data[0]);
 
 		let circuit = b.build();
 		let mut filler = circuit.new_witness_filler();
@@ -451,7 +454,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -477,7 +480,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -511,7 +514,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -560,6 +563,10 @@ mod tests {
 		let slice = byte_vec.slice_const_range(&b, 5..21);
 
 		assert_eq!(slice.data.len(), 2, "Slice should have 2 words");
+		// The test writes these directly, so pin them or pooling could reclaim their slots first.
+		for &wire in &slice.data {
+			b.force_commit(wire);
+		}
 
 		let circuit = b.build();
 		let mut filler = circuit.new_witness_filler();
@@ -584,7 +591,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -622,6 +629,10 @@ mod tests {
 		let slice = byte_vec.slice_const_range(&b, 5..16);
 
 		assert_eq!(slice.data.len(), 2, "Slice should have 2 words");
+		// The test writes these directly, so pin them or pooling could reclaim their slots first.
+		for &wire in &slice.data {
+			b.force_commit(wire);
+		}
 
 		let circuit = b.build();
 		let mut filler = circuit.new_witness_filler();
@@ -646,7 +657,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -708,7 +719,7 @@ mod tests {
 
 		circuit.populate_wire_witness(&mut filler).unwrap();
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]

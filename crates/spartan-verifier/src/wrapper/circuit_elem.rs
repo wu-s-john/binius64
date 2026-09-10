@@ -105,6 +105,9 @@ where
 	/// Combine `elems` under an operation. If every input is a `Constant`, fold at the `F` level
 	/// via `f_op` (no builder is touched). Otherwise convert constants to wires on the shared
 	/// builder and run `builder_op` over the wires.
+	// The two arms are long and the wire arm is the one the doc comment leads with, so
+	// `map_or_else` would put them in the wrong order.
+	#[allow(clippy::option_if_let_else)]
 	pub fn combine<const IN: usize, const OUT: usize>(
 		elems: [&Self; IN],
 		f_op: impl Fn([F; IN]) -> [F; OUT],
@@ -154,6 +157,7 @@ where
 	///
 	/// `f_op` and `builder_op` must return a `Vec` of length `n_out`; checked via
 	/// `debug_assert_eq!`.
+	#[allow(clippy::option_if_let_else)]
 	pub fn combine_varlen(
 		elems: &[&Self],
 		n_out: usize,
@@ -418,10 +422,32 @@ impl<F: Field, B: CircuitBuilder<Field = F>> Square for CircuitElem<F, B> {
 }
 
 impl<F: Field, B: CircuitBuilder<Field = F>> InvertOrZero for CircuitElem<F, B> {
+	/// Not implemented: nothing the wrapper runs inverts a value that may be zero.
+	///
+	/// The verifier's own inversions are all of random challenges, which it argues are non-zero,
+	/// so they go through [`InvertOrZero::invert`] below. Constraining the zero case as well would
+	/// cost extra constraints on every one of them, to admit an input no caller has.
+	///
+	/// This panics while the circuit is being built rather than at proving time, so a caller that
+	/// does need it fails loudly and can implement it then.
 	fn invert_or_zero(self) -> Self {
+		unimplemented!(
+			"the wrapper inverts only values argued non-zero; use `invert` (see its safety \
+			 contract), or implement this if a zero-admitting inverse is ever needed"
+		)
+	}
+
+	/// Constrains the hinted inverse with the single product the contract allows.
+	///
+	/// # Safety
+	///
+	/// The caller guarantees the value is non-zero. At zero the emitted constraint `x * inv == 1`
+	/// is unsatisfiable, so the circuit becomes unprovable rather than yielding a wrong proof.
+	unsafe fn invert(self) -> Self {
 		let [ret] = Self::combine(
 			[&self],
-			|[x]| [x.invert_or_zero()],
+			// SAFETY: the caller's guarantee carries to the concrete path.
+			|[x]| [unsafe { x.invert() }],
 			|builder, [x]| {
 				let [inv] = builder.hint([x], |[v]| [v.invert_or_zero()]);
 				let one = builder.constant(F::ONE);
@@ -449,7 +475,7 @@ impl<F: Field, B: CircuitBuilder<Field = F>> FieldOps for CircuitElem<F, B> {
 	where
 		Self::Scalar: ExtensionField<FSub>,
 	{
-		let degree = <F as ExtensionField<FSub>>::DEGREE;
+		let degree = F::DEGREE;
 		assert_eq!(elems.len(), degree);
 
 		if degree == 1 {

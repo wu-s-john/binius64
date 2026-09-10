@@ -15,6 +15,7 @@ type F = OptimalB128;
 type P = OptimalPackedB128;
 
 fn bench_cube<Cube: Hypercube>(group: &mut BenchmarkGroup<'_, WallTime>, cube: &str, point: &[F]) {
+	// One instantiation per basis, since the basis is a type parameter.
 	let id = BenchmarkId::new(cube, format!("n_vars={}", point.len()));
 	group.bench_function(id, |b| {
 		b.iter(|| eq_ind_partial_eval::<Cube, P>(point));
@@ -26,7 +27,9 @@ fn bench_eq_ind_partial_eval(c: &mut Criterion) {
 
 	let mut rng = StdRng::seed_from_u64(0);
 
-	for n_vars in [16, 20, 24] {
+	// The sizes straddle the point where the expansion stops fitting in cache, which is where the
+	// two build strategies swap places.
+	for n_vars in [16, 18, 20, 22, 24] {
 		// Throughput is measured in the number of output elements, which is the size of the
 		// returned tensor over the n-dimensional hypercube.
 		let n_output_elems = 1u64 << n_vars;

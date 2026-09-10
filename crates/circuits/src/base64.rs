@@ -88,7 +88,7 @@ impl Base64UrlSafe {
 	///
 	/// * `w` - Witness filler to populate
 	/// * `length` - Actual length of decoded data in bytes
-	pub fn populate_len_bytes(&self, w: &mut WitnessFiller, len_bytes: usize) {
+	pub fn populate_len_bytes(&self, w: &mut WitnessFiller<'_>, len_bytes: usize) {
 		w[self.len_bytes] = Word(len_bytes as u64);
 	}
 
@@ -102,7 +102,7 @@ impl Base64UrlSafe {
 	/// # Panics
 	///
 	/// Panics if `data.len()` exceeds the maximum size specified during construction.
-	pub fn populate_decoded(&self, w: &mut WitnessFiller, data: &[u8]) {
+	pub fn populate_decoded(&self, w: &mut WitnessFiller<'_>, data: &[u8]) {
 		w.pack_bytes_le(&self.decoded, data);
 	}
 
@@ -116,7 +116,7 @@ impl Base64UrlSafe {
 	/// # Panics
 	///
 	/// Panics if `data.len()` exceeds the maximum size specified during construction.
-	pub fn populate_encoded(&self, w: &mut WitnessFiller, data: &[u8]) {
+	pub fn populate_encoded(&self, w: &mut WitnessFiller<'_>, data: &[u8]) {
 		w.pack_bytes_le(&self.encoded, data);
 	}
 }
@@ -305,7 +305,6 @@ fn compute_expected_base64_char(builder: &CircuitBuilder, six_bit_val: Wire) -> 
 
 #[cfg(test)]
 mod tests {
-	use binius_core::verify::verify_constraints;
 	use binius_frontend::CircuitBuilder;
 
 	use super::{Base64UrlSafe, Wire};
@@ -378,7 +377,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = compiled.constraint_system();
-		verify_constraints(cs, &witness.into_value_vec())?;
+		cs.verify(&witness.into_value_vec())?;
 
 		Ok(())
 	}

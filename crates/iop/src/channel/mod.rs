@@ -2,12 +2,17 @@
 
 //! Channel abstraction for interactive oracle protocol (IOP) verifiers.
 
+pub mod grinding;
+pub mod merge;
 pub mod naive;
 pub mod oracle_setup;
 pub mod size_tracking;
 
+use std::iter;
+
 use binius_field::Field;
 use binius_ip::channel::IPVerifierChannel;
+use binius_utils::checked_arithmetics::log2_ceil_usize;
 
 use crate::basefold;
 
@@ -56,29 +61,113 @@ impl OracleSpec {
 	}
 }
 
+/// The length of the one oracle a round's oracles are committed as.
+///
+/// The oracles lie end to end, so this is the smallest power of two covering their total.
+fn merged_log_msg_len(log_msg_lens: impl IntoIterator<Item = usize>) -> usize {
+	let total_len: usize = log_msg_lens.into_iter().map(|n| 1usize << n).sum();
+	log2_ceil_usize(total_len)
+}
+
+/// Every oracle an IOP commits, grouped into the rounds they are committed in.
+///
+/// A round is the run of oracles sent between two challenge samples.
+///
+/// A challenge can only be derived once the commitments before it are absorbed.
+///
+/// So a round closes the moment its challenge is drawn, and takes no further members.
+///
+/// ```text
+/// recv, recv, sample, recv, sample, recv, recv, recv
+/// \__________/        \__/          \______________/
+///    round 0         round 1           round 2
+/// ```
+///
+/// A flat spec list cannot say where those boundaries fall.
+///
+/// A caller that commits a whole round as one oracle needs them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OracleSchedule {
+	/// Every oracle, in arrival order, across all rounds.
+	specs: Vec<OracleSpec>,
+
+	/// The exclusive end of each closed round, as an index into `specs`.
+	///
+	/// Round `r` spans `specs[ends[r - 1]..ends[r]]`, and round `0` starts at `0`.
+	///
+	/// Anything past the last entry is in the round still open.
+	ends: Vec<usize>,
+}
+
+impl OracleSchedule {
+	/// Creates an empty schedule.
+	pub const fn new() -> Self {
+		Self {
+			specs: Vec::new(),
+			ends: Vec::new(),
+		}
+	}
+
+	/// Appends one oracle to the round currently open.
+	pub fn push(&mut self, spec: OracleSpec) {
+		self.specs.push(spec);
+	}
+
+	/// Closes the round currently open, so later oracles start a new one.
+	///
+	/// Does nothing when no oracle has arrived since the last close.
+	///
+	/// Calling it wherever a challenge could be drawn is therefore always safe.
+	pub fn end_round(&mut self) {
+		let open_start = self.ends.last().copied().unwrap_or(0);
+		if self.specs.len() > open_start {
+			self.ends.push(self.specs.len());
+		}
+	}
+
+	/// Every oracle in the schedule, in arrival order, with round boundaries dropped.
+	pub fn specs(&self) -> &[OracleSpec] {
+		&self.specs
+	}
+
+	/// Consumes the schedule and returns every oracle, with round boundaries dropped.
+	pub fn into_specs(self) -> Vec<OracleSpec> {
+		self.specs
+	}
+
+	/// The number of closed rounds.
+	pub const fn n_rounds(&self) -> usize {
+		self.ends.len()
+	}
+
+	/// The oracles of each closed round, in commit order.
+	pub fn rounds(&self) -> impl Iterator<Item = &[OracleSpec]> {
+		let starts = iter::once(0).chain(self.ends.iter().copied());
+		iter::zip(starts, self.ends.iter().copied()).map(|(start, end)| &self.specs[start..end])
+	}
+
+	/// One spec per round: the oracle that round's oracles are committed as.
+	///
+	/// This is the coarser list an underlying channel is configured with.
+	///
+	/// A round is masked as a whole, so its oracle is zero-knowledge if any member is.
+	pub fn merged_specs(&self) -> Vec<OracleSpec> {
+		self.rounds()
+			.map(|round| OracleSpec {
+				log_msg_len: merged_log_msg_len(round.iter().map(|spec| spec.log_msg_len)),
+				is_zk: round.iter().any(|spec| spec.is_zk),
+			})
+			.collect()
+	}
+}
+
 /// A boxed closure that evaluates a transparent MLE at a given point.
 ///
-/// The closure is `'static` and owns every value it reads, sharing large data via `Rc`/`Arc`.
-/// A channel that defers the opening can therefore store it and evaluate it later.
+/// The closure receives the challenge point sampled during the opening and returns the evaluation
+/// of the transparent polynomial's MLE there. It is `'static` and owns every value it reads,
+/// sharing large data via `Rc`/`Arc`, so a channel that defers the opening can store it and
+/// evaluate it later.
 pub type TransparentEvalFn<Elem> = Box<dyn Fn(&[Elem]) -> Elem + 'static>;
-
-/// An oracle linear relation specifying an inner product claim between a committed oracle
-/// polynomial and a transparent polynomial.
-///
-/// The claim asserts that `<oracle_poly, transparent_poly> = claim`, where `transparent_poly` is
-/// the multilinear extension defined by the `transparent` closure evaluated at the challenge point
-/// sampled during the protocol.
-pub struct OracleLinearRelation<Oracle, Elem> {
-	/// The oracle handle for the committed polynomial.
-	pub oracle: Oracle,
-	/// A closure that evaluates the transparent MLE at a given point.
-	///
-	/// The closure receives the challenge point (sampled during `verify_oracle_relations`) and
-	/// returns the evaluation of the transparent polynomial's MLE at that point.
-	pub transparent: TransparentEvalFn<Elem>,
-	/// The claimed inner product of the oracle polynomial and the transparent polynomial.
-	pub claim: Elem,
-}
 
 /// Channel for IOP verifiers that extends the IP verifier channel with oracle operations.
 ///
@@ -91,7 +180,7 @@ pub struct OracleLinearRelation<Oracle, Elem> {
 /// # Contract
 ///
 /// The caller must call `recv_oracle()` exactly `remaining_oracle_specs().len()` times before
-/// calling `verify_oracle_relations()`. The oracles must be received in order and match their
+/// calling `verify_oracle_relation()`. The oracles must be received in order and match their
 /// specifications.
 pub trait IOPVerifierChannel<F: Field>: IPVerifierChannel<F, Elem: 'static> {
 	type Oracle: Clone;
@@ -116,21 +205,19 @@ pub trait IOPVerifierChannel<F: Field>: IPVerifierChannel<F, Elem: 'static> {
 		is_witness_dependent: bool,
 	) -> Result<Self::Oracle, Error>;
 
-	/// Queues oracle linear relations to be opened.
+	/// Queues one oracle linear relation to be opened.
 	///
-	/// Implementations may either verify the relations immediately, or queue them and defer the
-	/// actual opening (masking + sumcheck + FRI) to `finish()`. Either way, each
-	/// relation asserts that `<oracle_poly, transparent_poly> = claim`.
-	///
-	/// The transparent closures are `'static` and own their captures.
-	/// An implementation that defers the opening can store the relations and evaluate them later.
+	/// Implementations may either verify the relation immediately, or queue it and defer the
+	/// actual opening (masking + sumcheck + FRI) to `finish()`. Either way, the relation asserts
+	/// that `<oracle_poly, transparent> = claim`. An oracle may carry any number of relations.
 	///
 	/// # Preconditions
 	///
-	/// * All oracle handles in `oracle_relations` must be valid handles returned by
-	///   `recv_oracle()`.
-	fn verify_oracle_relations(
+	/// * `oracle` must be a valid handle returned by `recv_oracle()`.
+	fn verify_oracle_relation(
 		&mut self,
-		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<Self::Oracle, Self::Elem>>,
+		oracle: Self::Oracle,
+		transparent: TransparentEvalFn<Self::Elem>,
+		claim: Self::Elem,
 	) -> Result<(), Error>;
 }

@@ -4,84 +4,23 @@
 
 All source files should include a copyright header. New files should start with `// Copyright YYYY The Binius Developers`, where YYYY is the current year. When modifying an existing file, add the copyright line if one referencing "The Binius Developers" is not already present.
 
+If a change takes code or a specific algorithmic idea from a third-party codebase, then
+
+1. the third-party code _must_ be published under either the MIT or Apache 2.0 open source license,
+2. the proper copyright notice _must_ be included at the top of the file,
+3. the module-level documentation _must_ explain what code or algorithm was sourced from that library.
+
 ## Style Guide & Conventions
 
 Many code formatting and style rules are enforced using
 [rustfmt](https://doc.rust-lang.org/book/appendix-04-useful-development-tools.html#automatic-formatting-with-rustfmt)
-and [Clippy](https://doc.rust-lang.org/clippy/). The remaining sections document conventions that cannot be enforced
-with automated tooling.
+and [Clippy](https://doc.rust-lang.org/clippy/). See [DEVELOPMENT.md](DEVELOPMENT.md) for how to run them, and for the
+cross-compilation checks that architecture-specific crates need. The remaining sections document conventions that
+cannot be enforced with automated tooling.
 
-### Running automated checks
+### Code comments
 
-The codebase is formatted with a nightly version of `cargo fmt` because stable doesn't support all of the rustfmt
-options we use. You can run the formatter and linter with
-
-```bash
-$ cargo +nightly-2026-07-01 fmt  # see prek.toml for the exact nightly version checked by CI
-$ cargo clippy --all --all-features --tests --benches --examples -- -D warnings
-```
-
-[prek](https://prek.j178.dev/) hooks are configured to run `rustfmt`. You can also invoke it via prek:
-
-```bash
-$ prek run rustfmt --all-files
-```
-
-### Cross-compilation
-
-`binius-field` and `binius-arith-bench` contain architecture-specific optimizations: CLMUL/SIMD
-implementations of `GF(2^128)` (and related) arithmetic, selected at compile time with
-`#[cfg(target_arch = ...)]` and `#[cfg(target_feature = ...)]`. Code on an *inactive* arch/feature
-path is never type-checked by your native build, so it is easy to break the `aarch64` paths from an
-`x86_64` host (or vice versa) and not notice until CI fails — CI builds `x86_64` (both portable and
-`-Ctarget-cpu=native`), `aarch64`, and `wasm32`.
-
-When you touch these crates, cross-compile them for the target(s) you are not running natively.
-You do **not** need an emulator — compiling is enough to type-check the inactive paths.
-
-> **The optimized paths are gated behind target features that are off in the baseline target**
-> (e.g. `aes`/PMULL on `aarch64`, `pclmulqdq` on `x86_64`). A cross-build with *default* features
-> compiles only the portable fallback, which gives false confidence. Enable the features (via the
-> `RUSTFLAGS` below) to actually type-check the optimized code. On your native arch,
-> `-Ctarget-cpu=native` does the same thing.
-
-One-time setup (targets are added to the pinned toolchain in `rust-toolchain.toml`):
-
-```bash
-rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu wasm32-wasip1 wasm32-unknown-unknown
-
-# Only needed to *link* aarch64 test/bench binaries (`--all-targets`) or crates with C build
-# dependencies. `cargo check` and a plain library `cargo build` do not link, so they don't need it.
-sudo apt-get install -y gcc-aarch64-linux-gnu
-export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-```
-
-Compile the architecture-specific crates for the non-native arch and for wasm:
-
-```bash
-# aarch64 — +neon,+aes enables the PMULL/CLMUL GHASH paths (not just the portable fallback)
-RUSTFLAGS="-C target-feature=+neon,+aes" \
-  cargo check --target aarch64-unknown-linux-gnu -p binius-field -p binius-arith-bench
-
-# x86_64 — a consistent SIMD+CLMUL set (avx2 is required for the 256-bit vpclmulqdq paths;
-# add +avx512f for the 512-bit path). On an x86_64 host, `-C target-cpu=native` is simpler.
-RUSTFLAGS="-C target-feature=+sse2,+avx2,+pclmulqdq,+vpclmulqdq" \
-  cargo check --target x86_64-unknown-linux-gnu -p binius-field -p binius-arith-bench
-
-# wasm32 — matches CI (binius-field on wasm32-unknown-unknown; the wider crate set on wasm32-wasip1)
-cargo build -p binius-field --target wasm32-unknown-unknown
-cargo build -p binius-field --target wasm32-wasip1
-```
-
-(All four commands above are verified to compile cleanly. The 512-bit AVX-512 path —
-`+sse2,+avx2,+avx512f,+pclmulqdq,+vpclmulqdq` — also compiles cleanly, including
-`cargo build --all-targets` and a full `--workspace` build, even on a host without AVX-512:
-its `std::arch::x86_64::_mm512_*` intrinsics are stable on the pinned toolchain. Older Rust,
-where those intrinsics were unstable, rejects this build.)
-
-`cargo check` is the fast type-check of the library paths. To lint tests and benches the way CI
-does, swap in `cargo clippy --target <triple> -p binius-field -p binius-arith-bench --all-targets
--- -D warnings` (this links, so it needs the cross C toolchain above).
+**Code comments explain current behavior, not change history.** Do not write comments that reference how the code used to work ("Previously X", "Changed from A to B", "Used to call Y"). Comments must make sense in the context of the current code, independently of its history. Context about what changed and why belongs in the commit description and PR body, not in source code.
 
 ### Documentation
 
@@ -210,6 +149,49 @@ for _ in 0..n {
 }
 ```
 
+### Parallel loops
+
+Every rayon loop over a buffer floors its task size with `with_min_task_bytes` or `with_min_task`
+from `binius_utils::rayon::task_size`. Handing a slice of work to another worker costs about a
+microsecond, and an unfloored `par_iter` splits all the way down to one item, so a loop over a small
+buffer loses more to the handoff than the workers win back. The adapters state what one item costs
+and derive the floor from a shared budget. A chunked loop takes its chunk size from
+`task_chunk_len`, which is already the floor.
+
+Don't hand-roll the floor. A tuned size threshold picking between a serial and a parallel arm is two
+code paths where one belongs, and its constant tracks neither the packing width nor the machine.
+
+```rust
+// Memory-bound: charge one item by the bytes it moves.
+words
+    .par_iter_mut()
+    .enumerate()
+    .with_min_task_bytes::<P>()
+    .for_each(fill);
+
+// Arithmetic-bound: charge one item by its work class.
+values
+    .par_iter_mut()
+    .with_min_task(WorkPerItem::FieldMuls)
+    .for_each(scale);
+```
+
+Poor examples:
+```rust
+// Unfloored: splits to one item per task on a small buffer.
+words.par_iter_mut().enumerate().for_each(fill);
+
+// A hand-tuned threshold and a second code path.
+if words.len() * size_of::<P>() < MIN_PARALLEL_BYTES {
+    words.iter_mut().enumerate().for_each(fill);
+} else {
+    words.par_iter_mut().enumerate().for_each(fill);
+}
+```
+
+`crates/utils/src/rayon/task_size.rs` holds the cost model, the `WorkPerItem` classes, and the
+`BINIUS_TASK_TARGET_NS` / `BINIUS_MIN_TASK_BYTES` overrides that disable the floors for an A/B run.
+
 ### Unwrap
 
 Don't call `unwrap` in library code. Either throw or propagate an `Err` or call `expect`, leaving an explanation of why
@@ -269,6 +251,10 @@ pub struct Session {
     pub(crate) refcount: usize,
 }
 ```
+
+### Prefer generic functions over trait methods
+
+Use a generic function unless the logic must vary by implementor. Add a trait method with a default implementation only when at least one implementor overrides it.
 
 ## Unit Testing
 

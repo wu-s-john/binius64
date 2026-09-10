@@ -8,9 +8,12 @@ use std::{
 	rc::{Rc, Weak},
 };
 
-use binius_field::{Field, util::FieldFn};
-use binius_iop::channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec};
-use binius_ip::channel::IPVerifierChannel;
+use binius_core::word::Word;
+use binius_field::{BinaryField, Field};
+use binius_iop::channel::{IOPVerifierChannel, OracleSpec, TransparentEvalFn};
+use binius_ip::channel::{
+	IPVerifierChannel, WordIPVerifierChannel, n_packed_elems, select_word, subset_sum_word,
+};
 use binius_spartan_frontend::circuit_builder::{CircuitBuilder, ConstraintBuilder};
 
 use super::circuit_elem::CircuitElem;
@@ -75,6 +78,13 @@ impl<F: Field> IPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
 		Ok(inout - key)
 	}
 
+	fn recv_public_claim(&mut self) -> Result<Self::Elem, binius_ip::channel::Error> {
+		// A claim is public, so the wrapped prover sends it unencrypted: one inout wire, no
+		// precommit key. What it leaves behind is a public-derivable wire, which is what the
+		// checks reading it need it to be.
+		Ok(self.alloc_inout_elem())
+	}
+
 	fn sample(&mut self) -> Self::Elem {
 		self.alloc_inout_elem()
 	}
@@ -104,23 +114,37 @@ impl<F: Field> IPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
 			}
 		}
 	}
+}
 
-	fn compute_public_value(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Self::Elem {
-		// The function is an arbitrary native computation the constraint system cannot replay, so
-		// its result enters as a single derived public wire (a one-output `hint_varsize`,
-		// computed from the public inputs, emitting no constraints) rather than a sub-circuit's
-		// worth of constraints. Symbolically we only allocate the wire; the value is filled
-		// concretely by the instance/witness channels, which recompute it via their own
-		// `hint_varsize`.
-		let out_wire = {
-			let mut builder = self.builder.borrow_mut();
-			let input_wires: Vec<_> = inputs
-				.iter()
-				.map(|elem| elem.to_wire(&mut builder))
-				.collect();
-			builder.hint_varsize(&input_wires, 1, move |vals| vec![f.call_native(vals)])[0]
-		};
-		CircuitElem::wire(&self.builder, out_wire)
+impl<F: BinaryField> WordIPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
+	type Word = Word;
+
+	// The outer verifier rebinds the public inputs, so the wrapper records no Fiat-Shamir state.
+	fn observe_words(&mut self, words: &[Word]) -> Vec<Word> {
+		words.to_vec()
+	}
+
+	fn subset_sum(&mut self, elems: &[Self::Elem], word: &Word) -> Self::Elem {
+		// The word is concrete, so which elements the sum runs over is settled while building.
+		subset_sum_word(elems, *word)
+	}
+
+	fn select(&mut self, elems: &[Self::Elem], word: &Word) -> Self::Elem {
+		select_word(elems, *word)
+	}
+
+	fn sample_bits(&mut self, _bits: usize) -> Word {
+		Word::ZERO
+	}
+
+	fn pack_words(&mut self, words: &[Word]) -> Vec<Self::Elem> {
+		// The words are the statement, and this circuit is built once to be reused across every
+		// statement, so the packed elements cannot be settled here: a constant would fix the
+		// statement it was built against into the circuit. They enter as inout wires instead, which
+		// `ZKWrappedVerifierChannel` and `ReplayChannel` fill with the concrete packing.
+		(0..n_packed_elems::<F>(words.len()))
+			.map(|_| self.alloc_inout_elem())
+			.collect()
 	}
 }
 
@@ -139,17 +163,17 @@ impl<F: Field> IOPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
 		Ok(())
 	}
 
-	fn verify_oracle_relations(
+	fn verify_oracle_relation(
 		&mut self,
-		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<Self::Oracle, Self::Elem>>,
+		_oracle: Self::Oracle,
+		_transparent: TransparentEvalFn<Self::Elem>,
+		claim: Self::Elem,
 	) -> Result<(), binius_iop::channel::Error> {
 		// For each oracle opening, the prover sends the decrypted evaluation. The outer verifier
 		// checks in the circuit equality of this value with the expected expression over encrypted
 		// values.
-		for relation in oracle_relations {
-			let decrypted_claim = self.alloc_inout_elem();
-			self.assert_zero(relation.claim - decrypted_claim)?;
-		}
+		let decrypted_claim = self.alloc_inout_elem();
+		self.assert_zero(claim - decrypted_claim)?;
 		Ok(())
 	}
 }

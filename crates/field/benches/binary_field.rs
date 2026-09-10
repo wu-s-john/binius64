@@ -2,7 +2,7 @@
 
 use std::array;
 
-use binius_field::{BinaryField128bGhash, Field, aes_field::AESTowerField8b};
+use binius_field::{Field, Ghash128b, fields::rijndael::Rijndael8b};
 use criterion::{
 	BenchmarkGroup, Criterion, criterion_group, criterion_main, measurement::Measurement,
 };
@@ -18,7 +18,7 @@ fn bench_function<F: Field, M: Measurement, R>(
 	let a: [F; BATCH_SIZE] = array::from_fn(|_| F::random(&mut rng));
 	let b: [F; BATCH_SIZE] = array::from_fn(|_| F::random(&mut rng));
 	c.bench_function(id, |bench| {
-		bench.iter(|| array::from_fn::<_, BATCH_SIZE, _>(|i| func(a[i], b[i])))
+		bench.iter(|| array::from_fn::<_, BATCH_SIZE, _>(|i| func(a[i], b[i])));
 	});
 }
 
@@ -39,8 +39,8 @@ fn bench_all_fields<Op: FieldOperation>(c: &mut Criterion) {
 	let mut group = c.benchmark_group(Op::NAME);
 	group.throughput(criterion::Throughput::Elements(BATCH_SIZE as _));
 
-	run_bench!(group, AESTowerField8b, Op);
-	run_bench!(group, BinaryField128bGhash, Op);
+	run_bench!(group, Rijndael8b, Op);
+	run_bench!(group, Ghash128b, Op);
 }
 
 struct MultiplyOp;

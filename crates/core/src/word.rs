@@ -44,63 +44,7 @@ impl Word {
 	///
 	/// This is a canonical representation of true.
 	pub const MSB_ONE: Word = Word(0x8000000000000000);
-}
 
-impl fmt::Debug for Word {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "Word({:#018x})", self.0)
-	}
-}
-
-impl BitAnd for Word {
-	type Output = Self;
-
-	fn bitand(self, rhs: Self) -> Self::Output {
-		Word(self.0 & rhs.0)
-	}
-}
-
-impl BitOr for Word {
-	type Output = Self;
-
-	fn bitor(self, rhs: Self) -> Self::Output {
-		Word(self.0 | rhs.0)
-	}
-}
-
-impl BitXor for Word {
-	type Output = Self;
-
-	fn bitxor(self, rhs: Self) -> Self::Output {
-		Word(self.0 ^ rhs.0)
-	}
-}
-
-impl Shl<u32> for Word {
-	type Output = Self;
-
-	fn shl(self, rhs: u32) -> Self::Output {
-		Word(self.0 << rhs)
-	}
-}
-
-impl Shr<u32> for Word {
-	type Output = Self;
-
-	fn shr(self, rhs: u32) -> Self::Output {
-		Word(self.0 >> rhs)
-	}
-}
-
-impl Not for Word {
-	type Output = Self;
-
-	fn not(self) -> Self::Output {
-		Word(!self.0)
-	}
-}
-
-impl Word {
 	/// Creates a new `Word` from a 64-bit unsigned integer.
 	pub const fn from_u64(value: u64) -> Word {
 		Word(value)
@@ -360,6 +304,60 @@ impl Word {
 	}
 }
 
+impl fmt::Debug for Word {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "Word({:#018x})", self.0)
+	}
+}
+
+impl BitAnd for Word {
+	type Output = Self;
+
+	fn bitand(self, rhs: Self) -> Self::Output {
+		Word(self.0 & rhs.0)
+	}
+}
+
+impl BitOr for Word {
+	type Output = Self;
+
+	fn bitor(self, rhs: Self) -> Self::Output {
+		Word(self.0 | rhs.0)
+	}
+}
+
+impl BitXor for Word {
+	type Output = Self;
+
+	fn bitxor(self, rhs: Self) -> Self::Output {
+		Word(self.0 ^ rhs.0)
+	}
+}
+
+impl Shl<u32> for Word {
+	type Output = Self;
+
+	fn shl(self, rhs: u32) -> Self::Output {
+		Word(self.0 << rhs)
+	}
+}
+
+impl Shr<u32> for Word {
+	type Output = Self;
+
+	fn shr(self, rhs: u32) -> Self::Output {
+		Word(self.0 >> rhs)
+	}
+}
+
+impl Not for Word {
+	type Output = Self;
+
+	fn not(self) -> Self::Output {
+		Word(!self.0)
+	}
+}
+
 impl SerializeBytes for Word {
 	fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {
 		self.0.serialize(write_buf)
@@ -573,15 +571,9 @@ mod tests {
 
 			// Check sign bit is extended
 			let is_negative = (val as i64) < 0;
-			if is_negative {
-				// High bits should all be 1
-				let mask = !((1u64 << (64 - shift)) - 1);
-				assert_eq!(result.0 & mask, mask);
-			} else {
-				// High bits should all be 0
-				let mask = !((1u64 << (64 - shift)) - 1);
-				assert_eq!(result.0 & mask, 0);
-			}
+			// The high bits are all 1 for a negative input and all 0 otherwise.
+			let mask = !((1u64 << (64 - shift)) - 1);
+			assert_eq!(result.0 & mask, if is_negative { mask } else { 0 });
 		}
 
 		#[test]

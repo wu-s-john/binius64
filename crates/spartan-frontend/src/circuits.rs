@@ -117,10 +117,10 @@ pub fn assert_is_bit<Builder: CircuitBuilder>(builder: &mut Builder, val: Builde
 mod tests {
 	use std::{array, iter};
 
-	use binius_field::{BinaryField128bGhash as B128, Field, Random, arithmetic_traits::Square};
+	use binius_field::{Field, Ghash128b as B128, Random, arithmetic_traits::Square};
 	use binius_math::{
-		line::extrapolate_line_packed,
-		multilinear,
+		line::extrapolate_line as extrapolate_line_math,
+		multilinear::evaluate::evaluate,
 		test_utils::{random_field_buffer, random_scalars},
 		univariate,
 	};
@@ -217,7 +217,7 @@ mod tests {
 		let y0_val = B128::random(&mut rng);
 		let y1_val = B128::random(&mut rng);
 		let z_val = B128::random(&mut rng);
-		let expected = extrapolate_line_packed(y0_val, y1_val, z_val);
+		let expected = extrapolate_line_math(y0_val, y1_val, z_val);
 
 		test_helper::<ExtrapolateLineCircuit, 4>([y0_val, y1_val, z_val, expected]).unwrap();
 	}
@@ -270,15 +270,15 @@ mod tests {
 		}
 
 		let mut rng = StdRng::seed_from_u64(0);
-		let coeffs_vals = random_field_buffer(&mut rng, 2);
+		let coeffs_vals = random_field_buffer::<B128>(&mut rng, 2);
 		let coords_vals = random_scalars(&mut rng, 2);
-		let expected = multilinear::evaluate::evaluate(&coeffs_vals, &coords_vals);
+		let expected = evaluate(&coeffs_vals, &coords_vals);
 
 		test_helper::<MultilinearCircuit, 7>([
-			coeffs_vals[0],
-			coeffs_vals[1],
-			coeffs_vals[2],
-			coeffs_vals[3],
+			coeffs_vals.get(0),
+			coeffs_vals.get(1),
+			coeffs_vals.get(2),
+			coeffs_vals.get(3),
 			coords_vals[0],
 			coords_vals[1],
 			expected,

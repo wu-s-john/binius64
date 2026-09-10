@@ -201,14 +201,13 @@ fn strauss_accumulate(
 	// Flatten each table entry into its constituent wires for the multi-wire multiplexer.
 	let tables_flat: Vec<Vec<Vec<Wire>>> = tables
 		.iter()
-		.map(|table| table.iter().map(point_to_wires).collect())
+		.map(|table| table.iter().map(Secp256k1Affine::to_wires).collect())
 		.collect();
 	let table_refs: Vec<Vec<&[Wire]>> = tables_flat
 		.iter()
 		.map(|table| table.iter().map(Vec::as_slice).collect())
 		.collect();
 
-	let one = b.add_constant_64(1);
 	let n_windows = exponent_bits.div_ceil(window);
 	let mut acc = Secp256k1Affine::point_at_infinity(b);
 
@@ -223,57 +222,34 @@ fn strauss_accumulate(
 
 		let base_bit = w_idx * window;
 		for (point_idx, subscalar) in subscalars.iter().enumerate() {
-			// Pack this base point's `window`-bit exponent chunk into a selector word, bit by bit
-			// so that windows crossing 64-bit limb boundaries (and bit positions past
-			// `exponent_bits`) are handled uniformly. `multi_wire_multiplex` reads selector bit
-			// `j` as bit `j` of the table index, matching `table[x] = x · P`.
-			let mut sel = b.add_constant(Word::ZERO);
-			for j in 0..window {
-				let bit_index = base_bit + j;
-				if bit_index >= exponent_bits {
-					continue; // past the top of the exponent — contributes a zero bit
-				}
-				let limb = bit_index / Word::BITS;
-				let bit = bit_index % Word::BITS;
-				let bit_val = b.band(b.shr(subscalar[limb], bit as u32), one);
-				// Each iteration sets a distinct bit `j`, disjoint from the bits already in
-				// `sel`, so XOR matches the OR.
-				sel = b.bxor(sel, b.shl(bit_val, j as u32));
-			}
+			// Selector = this window's exponent bits, low bit first; bits at or past
+			// `exponent_bits` read as zero. `multi_wire_multiplex` reads bit `j` of `sel` as bit
+			// `j` of the table index, matching `table[x] = x · P`. One masked shift pulls the
+			// whole chunk, joining two limbs when it straddles a 64-bit boundary.
+			let n_bits = (base_bit + window).min(exponent_bits) - base_bit;
+			let mask = b.add_constant_64((1u64 << n_bits) - 1);
+			let offset = (base_bit % Word::BITS) as u32;
+			let lo = base_bit / Word::BITS;
+			let hi = (base_bit + n_bits - 1) / Word::BITS;
+			let sel = if lo == hi {
+				b.band(b.shr(subscalar[lo], offset), mask)
+			} else {
+				// The halves land in disjoint bit ranges, so XOR joins them before the mask.
+				let low = b.shr(subscalar[lo], offset);
+				// `offset == 0` never reaches this arm: a chunk starting on a limb boundary fits
+				// in `subscalar[lo]` (`n_bits <= window < Word::BITS`, asserted in
+				// `msm_strauss_endo`), so this left shift stays below `Word::BITS`.
+				let high = b.shl(subscalar[hi], Word::BITS as u32 - offset);
+				b.band(b.bxor(low, high), mask)
+			};
 
-			let selected = point_from_wires(&multi_wire_multiplex(b, &table_refs[point_idx], sel));
+			let selected =
+				Secp256k1Affine::from_wires(&multi_wire_multiplex(b, &table_refs[point_idx], sel));
 			acc = curve.add_incomplete(b, &acc, &selected);
 		}
 	}
 
 	acc
-}
-
-// Flatten an affine point into its constituent wires: x limbs, then y limbs, then the
-// point-at-infinity flag. Inverse of `point_from_wires`.
-fn point_to_wires(p: &Secp256k1Affine) -> Vec<Wire> {
-	assert_eq!(p.x.limbs.len(), N_LIMBS);
-	assert_eq!(p.y.limbs.len(), N_LIMBS);
-
-	let mut wires = Vec::with_capacity(2 * N_LIMBS + 1);
-	wires.extend_from_slice(&p.x.limbs);
-	wires.extend_from_slice(&p.y.limbs);
-	wires.push(p.is_point_at_infinity);
-	wires
-}
-
-// Reconstruct an affine point from the flat wire layout produced by `point_to_wires`.
-fn point_from_wires(wires: &[Wire]) -> Secp256k1Affine {
-	assert_eq!(wires.len(), 2 * N_LIMBS + 1);
-	Secp256k1Affine {
-		x: BigUint {
-			limbs: wires[..N_LIMBS].to_vec(),
-		},
-		y: BigUint {
-			limbs: wires[N_LIMBS..2 * N_LIMBS].to_vec(),
-		},
-		is_point_at_infinity: wires[2 * N_LIMBS],
-	}
 }
 
 #[cfg(test)]
@@ -329,6 +305,9 @@ mod tests {
 		// Check that the result matches the expected point
 		assert_eq(&builder, "result_x", &result.x, &expected_x);
 		assert_eq(&builder, "result_y", &result.y, &expected_y);
+
+		// The infinity flag is never constrained, only read below, so pin it before build.
+		builder.force_commit(result.is_point_at_infinity);
 
 		// Build and verify the circuit
 		let cs = builder.build();
@@ -395,6 +374,9 @@ mod tests {
 
 		assert_eq(&builder, "msm_x", &result.x, &expected_x);
 		assert_eq(&builder, "msm_y", &result.y, &expected_y);
+
+		// The infinity flag is never constrained, only read below, so pin it before build.
+		builder.force_commit(result.is_point_at_infinity);
 
 		let cs = builder.build();
 		let mut w = cs.new_witness_filler();

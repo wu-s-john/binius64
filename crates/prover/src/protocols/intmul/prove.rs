@@ -1,11 +1,11 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use std::marker::PhantomData;
+use std::{iter, marker::PhantomData};
 
 use binius_compute::Allocator;
 use binius_core::word::Word;
-use binius_field::{BinaryField, BinaryField1b, Divisible, ExtensionField, PackedField};
+use binius_field::{BinaryField, Divisible, PackedField};
 use binius_iop_prover::{
 	channel::IOPProverChannel,
 	logup_star::{self, Looker},
@@ -44,20 +44,27 @@ use super::{
 	error::Error,
 	witness::{Witness, limb_index, two_valued_field_buffer},
 };
-use crate::fold_word::{fold_across_words, fold_words};
+use crate::fold_word::{BitAxisFolder, WordAxisFolder};
 
 /// Proves the integer multiplication (IntMul) reduction over the four operand columns.
 ///
 /// The four `columns` are the multiplicand `a`, the multiplicand `b`, and the product's low and
-/// high words, in the order `[a, b, lo, hi]`, each of power-of-two length. This builds the
-/// [`Witness`], drives an [`IntMulProver`], and reduces the multiplication relation to per-bit
-/// evaluation claims on the four columns at a common point. See [`IntMulProver::prove`] for the
-/// protocol description and [`IntMulOutput`] for the output shape.
+/// high words, in the order `[a, b, lo, hi]`, all of equal length. This builds the [`Witness`],
+/// drives an [`IntMulProver`], and reduces the multiplication relation to per-bit evaluation claims
+/// on the four columns at a common point. See [`IntMulProver::prove`] for the protocol description
+/// and [`IntMulOutput`] for the output shape.
+///
+/// # Padding
+///
+/// The columns' length need not be a power of two. The reduction runs over the constraint axis of
+/// `2^ceil(log2(n))` rows, with the rows past the columns' end read as `Word::ZERO`; a zero row
+/// satisfies `0 * 0 = 0 || 0`, so no claim moves. The padding is never materialized as words:
+/// every buffer built from the columns spans the whole axis and derives its own padding value,
+/// which is the multiplicative identity in the product-check trees and zero elsewhere.
 ///
 /// # Errors
 ///
-/// Returns an error when the operand columns do not have a power-of-two length or their lengths
-/// disagree.
+/// Returns an error when the operand columns' lengths disagree.
 pub fn prove<A, F, P, Channel>(
 	columns: [&[Word]; 4],
 	channel: &mut Channel,
@@ -111,9 +118,9 @@ where
 	///
 	/// This method consumes a `Witness` in order to reduce integer multiplication statement to
 	/// evaluation claims on 1-bit multilinears. More formally:
-	///  * `witness` contains po2-sized integer arrays  `a`, `b`, `c_lo` and `c_hi` that satisfy `a
-	///    * b = c_lo | c_hi << Word::BITS`, as well as the layers of the constant- and
-	///      variable-base GKR product check circuits
+	///  * `witness` contains po2-sized integer arrays `a`, `b`, `c_lo` and `c_hi` that satisfy `a *
+	///    b = c_lo | c_hi << Word::BITS`, as well as the layers of the constant- and variable-base
+	///    GKR product check circuits
 	///  * The proving consists of five phases:
 	///    - Phase 1: GKR tree roots for B & C are evaluated at a sampled point, after which
 	///      reductions are performed to obtain evaluation claims on $(b * (G^{a_i} - 1) + 1)^{2^i}$
@@ -131,7 +138,8 @@ where
 	///
 	/// The output of this protocol is a set of evaluation claims on the `b` selectors representing
 	/// all of `a`, `b`, `c_lo` and `c_hi` as column-major bit matrices, at a common evaluation
-	/// point. The logup* pushforward commitment is opened through the channel inside phase 5.
+	/// point. The logup* pushforward commitment carries its two relations into the channel inside
+	/// phase 5.
 	pub fn prove(&mut self, witness: Witness<'_, 'alloc, A, P>) -> IntMulOutput<F> {
 		let Witness {
 			a_exponents,
@@ -166,7 +174,7 @@ where
 		let Phase1Output {
 			eval_point: phase1_eval_point,
 			b_leaves_evals,
-		} = self.phase1(&initial_eval_point, b_prodcheck, b_leaves.to_ref(), exp_eval);
+		} = self.phase1(&initial_eval_point, b_prodcheck, b_leaves.as_view(), exp_eval);
 
 		// Phase 2
 		let Phase2Output {
@@ -213,7 +221,7 @@ where
 			a_exponents,
 			c_lo_exponents,
 			c_hi_exponents,
-			&tables[0],
+			tables[0].as_view(),
 		)
 	}
 
@@ -231,7 +239,7 @@ where
 		a_exponents: &[Word],
 		c_lo_exponents: &[Word],
 		c_hi_exponents: &[Word],
-		table: &FieldBuffer<P>,
+		table: FieldSlice<'_, P>,
 	) -> IntMulOutput<F> {
 		let alloc = self.alloc;
 		let n_vars = b_eval_point.len();
@@ -254,9 +262,14 @@ where
 			.into_par_iter()
 			.map(|j| {
 				let (tree, limb) = (j / N_LIMBS, j % N_LIMBS);
+				// The columns' padding rows are `Word::ZERO`, whose every limb index is 0 — the
+				// shared table's row 0. So a padding row looks up `base^0 = 1`, as it does in the
+				// product-check trees.
+				let n_padding = (1 << n_vars) - exponents[tree].len();
 				exponents[tree]
 					.iter()
 					.map(|&word| limb_index(word, limb))
+					.chain(iter::repeat_n(0, n_padding))
 					.collect::<Vec<_>>()
 			})
 			.collect::<Vec<_>>();
@@ -269,9 +282,9 @@ where
 		drop(columns_guard);
 
 		// Read the N_LIMB_COLUMNS looked-up columns from the shared table via the committed multi-
-		// looker logup* reduction. The pushforward oracle is committed inside; its opening relation
-		// is returned to the caller. The reduction returns one index claim per column, all at the
-		// shared content point.
+		// looker logup* reduction. The pushforward oracle is committed inside; its opening
+		// relations are returned to the caller. The reduction returns one index claim per column,
+		// all at the shared content point.
 		let lookers = izip!(&index_columns, &twisted_claims)
 			.map(|(index, (twisted_point, twisted_eval))| Looker {
 				index,
@@ -280,7 +293,17 @@ where
 			})
 			.collect::<Vec<_>>();
 		let log_cols = log2_ceil_usize(N_LIMB_COLUMNS);
-		let logup_proof = logup_star::prove(table, &lookers, self.channel, self.alloc);
+		// The power table is succinct, so the transparent reduction runs: the pushforward is opened
+		// against the table itself instead of a sumcheck reducing the two to a shared point. Every
+		// limb column reads that one shared table.
+		let logup_proof = logup_star::prove_transparent(
+			[logup_star::TableLookup { table, lookers }],
+			self.channel,
+			self.alloc,
+		);
+		let [column_index_evals] = logup_proof.index_eval_claims.as_slice() else {
+			unreachable!("the reduction runs over the one power table")
+		};
 
 		// The index entries are the GF(2)-linear embeddings iota(e) = Σ_u basis(u) · bit_u(e),
 		// materialized by a table of all 2^LIMB_BITS embeddings.
@@ -288,8 +311,7 @@ where
 		let mut iota_table = Vec::with_capacity(1usize << LIMB_BITS);
 		iota_table.push(F::ZERO);
 		for row in 1..1usize << LIMB_BITS {
-			let low_bit_basis =
-				<F as ExtensionField<BinaryField1b>>::basis(row.trailing_zeros() as usize);
+			let low_bit_basis = F::basis(row.trailing_zeros() as usize);
 			iota_table.push(iota_table[row & (row - 1)] + low_bit_basis);
 		}
 		drop(embed_guard);
@@ -299,11 +321,11 @@ where
 		// Collapse the per-column claims into a single claim on the eq(ρ)-folded column V by
 		// sampling ρ, so the final unification runs over the content variables only.
 		let rho = self.channel.sample_many(log_cols);
-		let mut padded_column_evals = logup_proof.index_eval_claims.clone();
+		let mut padded_column_evals = column_index_evals.clone();
 		padded_column_evals.resize(1 << log_cols, F::ZERO);
 		let folded_index_claim =
 			evaluate(&FieldBuffer::<P>::from_values(&padded_column_evals), &rho);
-		let rho_tensor = eq_ind_partial_eval_scalars::<F>(&rho);
+		let rho_tensor = eq_ind_partial_eval_scalars(&rho);
 		let fold_guard = tracing::debug_span!("Fold index columns by rho").entered();
 		// Each row folds through the embedding table directly, in parallel:
 		//     V[i] = sum_j rho_tensor[j] * iota(index_j[i])
@@ -347,9 +369,9 @@ where
 		// Fold the 2^k b bit-columns by the recombination tensor into a single field multilinear
 		// B(x) = sum_i eq(r_I^b, i) * b(i, x), then re-randomize its claim B(r_2) = b_recomb from
 		// `b_eval_point` (r_2) to the shared point via a single-claim MLE-eval check.
-		assert_eq!(b_exponents.len(), 1 << n_vars);
-		let b_tensor = eq_ind_partial_eval_scalars::<F>(r_ib);
-		let b_folded = fold_words::<_, P, _>(alloc, b_exponents, &b_tensor);
+		assert!(b_exponents.len() <= 1 << n_vars);
+		let b_tensor = eq_ind_partial_eval_scalars(r_ib);
+		let b_folded = BitAxisFolder::new(&b_tensor).fold::<P, _>(alloc, b_exponents);
 		let b_sumcheck_prover = MleToSumCheckDecorator::new(multilinear_eval_prover(
 			alloc,
 			b_folded,
@@ -390,12 +412,16 @@ where
 		// verifier binds the stacked-index claim via the GF(2)-linearity of the embedding, the `b`
 		// evals via sum_i eq(r_I^b, i) * b(i, r_out) = B(r_out), and the parity bits directly.
 		let output_guard = tracing::debug_span!("Compute output bit evals").entered();
-		let per_bit_evals =
-			|exponents: &[Word]| fold_across_words::<_, P>(exponents, r_out).to_vec();
-		let a_evals = per_bit_evals(a_exponents);
-		let c_lo_evals = per_bit_evals(c_lo_exponents);
-		let c_hi_evals = per_bit_evals(c_hi_exponents);
-		let b_evals = per_bit_evals(b_exponents);
+		// All four columns fold against the same point, so the lookup tables and the per-chunk
+		// weights are built once and shared.
+		let folder = WordAxisFolder::<F>::new(r_out);
+		let [a_evals, b_evals, c_lo_evals, c_hi_evals] =
+			[a_exponents, b_exponents, c_lo_exponents, c_hi_exponents]
+				.into_par_iter()
+				.map(|exponents| folder.fold_par(exponents))
+				.collect::<Vec<_>>()
+				.try_into()
+				.expect("iterator over exact number of elements");
 		drop(output_guard);
 
 		self.channel.send_many(&a_evals);
@@ -425,7 +451,7 @@ where
 		&mut self,
 		eval_point: &[F],
 		b_prover: ProdcheckProver<'alloc, A, P>,
-		b_leaves: FieldSlice<P>,
+		b_leaves: FieldSlice<'_, P>,
 		b_root_eval: F,
 	) -> Phase1Output<F> {
 		let n_vars = eval_point.len();
@@ -459,7 +485,7 @@ where
 		let leaf_guard = tracing::debug_span!("Compute base layer partial evals").entered();
 		let x_tensor = eq_ind_partial_eval(x_point);
 		let b_leaves_evals = b_leaves
-			.chunks_par(n_vars)
+			.par_chunks(n_vars)
 			.map(|b_leaf| inner_product_buffers(&b_leaf, &x_tensor))
 			.collect::<Vec<_>>();
 		drop(leaf_guard);
@@ -479,7 +505,7 @@ where
 		&mut self,
 		twisted_eval_points: &[Vec<F>],
 		twisted_evals: &[F],
-		selector: FieldBuffer<P>,
+		selector: FieldVec<P, A>,
 		b_exponents: &[Word],
 		c_lo_hi_roots: [FieldVec<P, A>; 2],
 		c_eval_point: &[F],
@@ -492,7 +518,7 @@ where
 				.iter()
 				.all(|point| point.len() == n_vars)
 		);
-		assert_eq!(b_exponents.len(), 1 << n_vars);
+		assert!(b_exponents.len() <= 1 << n_vars);
 
 		let selector_claims = izip!(twisted_eval_points, twisted_evals)
 			.map(|(point, &value)| Claim {
@@ -508,15 +534,23 @@ where
 		// terms by eq_k(γ, ·). γ is sampled before the batched sumcheck so the round polynomials
 		// are fixed against it.
 		let gamma = self.channel.sample_many(Word::LOG_BITS);
-		let eq_weights = eq_ind_partial_eval_scalars::<F>(&gamma);
+		let eq_weights = eq_ind_partial_eval_scalars(&gamma);
 		// `SelectorMlecheckProver` reads the exponent bits through the `Bitwise` bitmask
 		// abstraction, which is implemented for the primitive integer types. `Word` is
 		// `repr(transparent)` over `u64`, so reinterpret the slice in place.
-		let b_bitmasks: &[u64] = bytemuck::cast_slice(b_exponents);
+		// `SelectorMlecheckProver` requires one bitmask per row of the constraint axis
+		// (`crates/ip-prover/src/sumcheck/selector_mle.rs:73`), so this is the one place the
+		// reduction still needs the columns' padding rows as words. A padding row is `Word::ZERO`,
+		// so its bitmask is zero.
+		//
+		// TODO(BINIUS-391): relax `SelectorMlecheckProver` and `BinarySwitchover` to read a missing
+		// row's bitmask as zero, and drop this copy.
+		let mut b_bitmasks = bytemuck::cast_slice::<_, u64>(b_exponents).to_vec();
+		b_bitmasks.resize(1 << n_vars, 0);
 		let selector_prover = SelectorMlecheckProver::new(
 			selector,
 			selector_claims,
-			b_bitmasks,
+			&b_bitmasks,
 			eq_weights,
 			self.switchover,
 		);
@@ -586,7 +620,7 @@ where
 		(gpow_c_lo_eval, c_lo_prover): (F, ProdcheckProver<'alloc, A, P>),
 		(gpow_c_hi_eval, c_hi_prover): (F, ProdcheckProver<'alloc, A, P>),
 		exponents: [&[Word]; 3],
-		tables: &[FieldBuffer<P>],
+		tables: &[FieldVec<P, A>],
 	) -> Phase4Output<F> {
 		let n_vars = eval_point.len();
 
@@ -640,9 +674,13 @@ where
 			(0..N_LIMBS)
 				.map(|limb| {
 					let table = &tables[twists[tree * N_LIMBS + limb] / LIMB_BITS];
+					// As in `limb_leaves`, the columns' padding rows are `Word::ZERO`, which
+					// indexes row 0 of the table — `base^0 = 1`.
+					let n_padding = (1 << n_vars) - exponents[tree].len();
 					let column_scalars = exponents[tree]
 						.iter()
 						.map(|&word| table.get(limb_index(word, limb)))
+						.chain(iter::repeat_n(table.get(0), n_padding))
 						.collect::<Vec<_>>();
 					let column = FieldBuffer::<P>::from_values(&column_scalars);
 					inner_product_buffers(&column, &x_tensor)

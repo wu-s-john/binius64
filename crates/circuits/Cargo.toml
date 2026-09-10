@@ -15,10 +15,10 @@ hex-literal.workspace = true
 num-bigint = { workspace = true }
 num-integer = { workspace = true }
 rand.workspace = true
-sha2.workspace = true
 sha3.workspace = true
 
 [dev-dependencies]
+p256 = { version = "0.13.2", features = ["ecdsa"] }
 anyhow.workspace = true
 bitcoin = { workspace = true }
 blake2 = { workspace = true }

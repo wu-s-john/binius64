@@ -2,15 +2,17 @@
 
 //! Naive [`IOPVerifierChannel`] for testing: reads full polynomials instead of verifying FRI.
 
-use binius_field::{Field, util::FieldFn};
+use binius_field::Field;
 use binius_ip::channel::IPVerifierChannel;
-use binius_math::{FieldBuffer, inner_product::inner_product_buffers};
+use binius_math::{
+	FieldBuffer, inner_product::inner_product_buffers, multilinear::evaluate::evaluate_inplace,
+};
 use binius_transcript::{
 	VerifierTranscript,
 	fiat_shamir::{CanSample, Challenger},
 };
 
-use crate::channel::{Error, IOPVerifierChannel, OracleLinearRelation, OracleSpec};
+use crate::channel::{Error, IOPVerifierChannel, OracleSpec, TransparentEvalFn};
 
 /// Oracle handle returned by [`NaiveVerifierChannel::recv_oracle`].
 #[derive(Debug, Clone, Copy)]
@@ -129,10 +131,6 @@ where
 			Err(binius_ip::channel::Error::InvalidAssert)
 		}
 	}
-
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FieldFn<F>) -> F {
-		f.call_native(inputs)
-	}
 }
 
 impl<F, Challenger_> IOPVerifierChannel<F> for NaiveVerifierChannel<'_, F, Challenger_>
@@ -175,52 +173,46 @@ where
 		Ok(NaiveOracle { index })
 	}
 
-	fn verify_oracle_relations(
+	fn verify_oracle_relation(
 		&mut self,
-		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<Self::Oracle, F>>,
+		oracle: Self::Oracle,
+		transparent: TransparentEvalFn<F>,
+		claim: F,
 	) -> Result<(), Error> {
-		for relation in oracle_relations {
-			let index = relation.oracle.index;
-			assert!(index < self.stored_polynomials.len(), "oracle index {index} out of bounds");
+		let index = oracle.index;
+		assert!(index < self.stored_polynomials.len(), "oracle index {index} out of bounds");
 
-			// Extract spec data before mutable borrow of transcript
-			let log_msg_len = self.oracle_specs[index].log_msg_len;
+		// Extract spec data before mutable borrow of transcript
+		let log_msg_len = self.oracle_specs[index].log_msg_len;
 
-			// Read the transparent polynomial from the transcript (prover wrote it in
-			// prove_oracle_relations)
-			let transparent_len = 1 << log_msg_len;
-			let transparent_values = self
-				.transcript
-				.message()
-				.read_scalar_slice(transparent_len)
-				.map_err(|_| Error::ProofEmpty)?;
-			let transparent_poly = FieldBuffer::from_values(&transparent_values);
+		// Read the transparent polynomial from the transcript (prover wrote it in
+		// prove_oracle_relation)
+		let transparent_len = 1 << log_msg_len;
+		let transparent_values = self
+			.transcript
+			.message()
+			.read_scalar_slice(transparent_len)
+			.map_err(|_| Error::ProofEmpty)?;
+		let transparent_poly = FieldBuffer::from_values(&transparent_values);
 
-			// Verify the inner product claim directly
-			let stored_poly = &self.stored_polynomials[index];
-			let witness_poly = stored_poly.to_ref();
-			let actual_inner_product: F = inner_product_buffers(&witness_poly, &transparent_poly);
+		// Verify the inner product claim directly
+		let stored_poly = &self.stored_polynomials[index];
+		let witness_poly = stored_poly.as_view();
+		let actual_inner_product: F = inner_product_buffers(&witness_poly, &transparent_poly);
 
-			assert_eq!(
-				actual_inner_product, relation.claim,
-				"NaiveVerifierChannel: inner product verification failed"
-			);
+		assert_eq!(
+			actual_inner_product, claim,
+			"NaiveVerifierChannel: inner product verification failed"
+		);
 
-			// Sample evaluation point challenges (same as prover sampled)
-			let point: Vec<F> = CanSample::sample_vec(&mut self.transcript, log_msg_len);
+		// Sample evaluation point challenges (same as prover sampled)
+		let point: Vec<F> = CanSample::sample_vec(&mut self.transcript, log_msg_len);
 
-			// Evaluate the transparent closure at the challenge point
-			let transparent_eval = (relation.transparent)(&point);
+		// Evaluate the transparent closure at the challenge point
+		let transparent_eval = transparent(&point);
 
-			// Verify the transparent evaluation matches using assert_zero
-			self.assert_zero(
-				transparent_eval
-					- binius_math::multilinear::evaluate::evaluate_inplace(
-						transparent_poly,
-						&point,
-					),
-			)?;
-		}
+		// Verify the transparent evaluation matches using assert_zero
+		self.assert_zero(transparent_eval - evaluate_inplace(transparent_poly, &point))?;
 
 		Ok(())
 	}

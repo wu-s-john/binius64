@@ -15,7 +15,7 @@ pub struct Attribute {
 
 impl Attribute {
 	/// Populate the actual value length
-	pub fn populate_len_bytes(&self, w: &mut WitnessFiller, len_bytes: usize) {
+	pub fn populate_len_bytes(&self, w: &mut WitnessFiller<'_>, len_bytes: usize) {
 		w[self.len_bytes] = Word(len_bytes as u64);
 	}
 
@@ -23,7 +23,7 @@ impl Attribute {
 	///
 	/// # Panics
 	/// Panics if value.len() > max_value_size (determined by self.value.len() * 8)
-	pub fn populate_value(&self, w: &mut WitnessFiller, value: &[u8]) {
+	pub fn populate_value(&self, w: &mut WitnessFiller<'_>, value: &[u8]) {
 		w.pack_bytes_le(&self.value, value);
 	}
 }
@@ -124,7 +124,7 @@ impl JwtClaims {
 			}
 
 			// Assert that we found the pattern (found_start should be msb-true)
-			b.assert_true("attr_found".to_string(), found_start);
+			b.assert_true("attr_found", found_start);
 
 			// ---- Find value terminator
 			//
@@ -204,7 +204,7 @@ impl JwtClaims {
 	}
 
 	/// Populate the len_bytes wire with the actual JSON size in bytes
-	pub fn populate_len_bytes(&self, w: &mut WitnessFiller, len_bytes: usize) {
+	pub fn populate_len_bytes(&self, w: &mut WitnessFiller<'_>, len_bytes: usize) {
 		w[self.len_bytes] = Word(len_bytes as u64);
 	}
 
@@ -212,14 +212,13 @@ impl JwtClaims {
 	///
 	/// # Panics
 	/// Panics if json.len() > max_len_json (the maximum size specified during construction)
-	pub fn populate_json(&self, w: &mut WitnessFiller, json: &[u8]) {
+	pub fn populate_json(&self, w: &mut WitnessFiller<'_>, json: &[u8]) {
 		w.pack_bytes_le(&self.json, json);
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use binius_core::verify::verify_constraints;
 	use binius_frontend::CircuitBuilder;
 
 	use super::{Attribute, JwtClaims, Wire};
@@ -256,7 +255,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -311,7 +310,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -426,7 +425,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -462,7 +461,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -508,7 +507,7 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 
 	#[test]
@@ -554,6 +553,6 @@ mod tests {
 
 		// Verify constraints
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &filler.into_value_vec()).unwrap();
+		cs.verify(&filler.into_value_vec()).unwrap();
 	}
 }

@@ -9,7 +9,7 @@ use std::{
 };
 
 use binius_utils::{
-	DeserializeBytes, SerializationError, SerializeBytes,
+	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 	checked_arithmetics::checked_log_2,
 };
@@ -19,8 +19,11 @@ use rand::{
 	distr::{Distribution, StandardUniform},
 };
 
-use super::{Divisible, U1, UnderlierType, mapget};
-use crate::Random;
+use super::{U1, Underlier};
+use crate::{
+	Random,
+	divisible::{Divisible, mapget},
+};
 
 /// A type that represents N elements of the same underlier type.
 /// Used as an underlier for 256-bit and 512-bit packed fields in the portable implementation.
@@ -117,7 +120,7 @@ impl<U: Not<Output = U>, const N: usize> Not for ScaledUnderlier<U, N> {
 	}
 }
 
-impl<U: UnderlierType + Pod, const N: usize> UnderlierType for ScaledUnderlier<U, N> {
+impl<U: Underlier + Pod, const N: usize> Underlier for ScaledUnderlier<U, N> {
 	const LOG_BITS: usize = U::LOG_BITS + checked_log_2(N);
 
 	const ZERO: Self = Self([U::ZERO; N]);
@@ -169,7 +172,7 @@ where
 /// the AVX2 path).
 impl<const N: usize> From<crate::arch::M128> for ScaledUnderlier<crate::arch::M128, N> {
 	fn from(val: crate::arch::M128) -> Self {
-		let mut limbs = [<crate::arch::M128 as UnderlierType>::ZERO; N];
+		let mut limbs = [<crate::arch::M128 as Underlier>::ZERO; N];
 		limbs[0] = val;
 		Self(limbs)
 	}
@@ -182,7 +185,7 @@ impl<const N: usize> From<U1> for ScaledUnderlier<crate::arch::M128, N> {
 	}
 }
 
-impl<U: UnderlierType + LowerHex, const N: usize> LowerHex for ScaledUnderlier<U, N> {
+impl<U: Underlier + LowerHex, const N: usize> LowerHex for ScaledUnderlier<U, N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		// Most-significant limb first. Print from the highest non-zero limb so there are no
 		// spurious leading zeros, then zero-pad each remaining limb to its full bit width.
@@ -205,7 +208,7 @@ where
 	U: Divisible<T> + Pod + Send + Sync,
 	T: Send + 'static,
 {
-	const LOG_N: usize = <U as Divisible<T>>::LOG_N + checked_log_2(N);
+	const LOG_N: usize = U::LOG_N + checked_log_2(N);
 
 	#[inline]
 	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = T> + Send + Clone {
@@ -224,8 +227,8 @@ where
 
 	#[inline]
 	unsafe fn get_unchecked(&self, index: usize) -> T {
-		let u_index = index >> <U as Divisible<T>>::LOG_N;
-		let sub_index = index & (<U as Divisible<T>>::N - 1);
+		let u_index = index >> U::LOG_N;
+		let sub_index = index & (U::N - 1);
 		// Safety: `index < Self::N` by the caller's contract, so `sub_index < <U as
 		// Divisible<T>>::N` and `u_index < N`.
 		unsafe { Divisible::<T>::get_unchecked(self.0.get_unchecked(u_index), sub_index) }
@@ -233,8 +236,8 @@ where
 
 	#[inline]
 	unsafe fn set_unchecked(&mut self, index: usize, val: T) {
-		let u_index = index >> <U as Divisible<T>>::LOG_N;
-		let sub_index = index & (<U as Divisible<T>>::N - 1);
+		let u_index = index >> U::LOG_N;
+		let sub_index = index & (U::N - 1);
 		// Safety: `index < Self::N` by the caller's contract, so `sub_index < <U as
 		// Divisible<T>>::N` and `u_index < N`.
 		unsafe { Divisible::<T>::set_unchecked(self.0.get_unchecked_mut(u_index), sub_index, val) };
@@ -261,6 +264,10 @@ impl<U: DeserializeBytes, const N: usize> DeserializeBytes for ScaledUnderlier<U
 	fn deserialize(read_buf: impl Buf) -> Result<Self, SerializationError> {
 		<[U; N]>::deserialize(read_buf).map(Self)
 	}
+}
+
+impl<U: FixedSizeSerializeBytes, const N: usize> FixedSizeSerializeBytes for ScaledUnderlier<U, N> {
+	const BYTE_SIZE: usize = U::BYTE_SIZE * N;
 }
 
 #[cfg(test)]

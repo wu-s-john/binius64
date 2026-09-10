@@ -21,9 +21,9 @@ use binius_iop_prover::{
 	channel::IOPProverChannel,
 	merkle_channel::MerkleIPProverChannel,
 };
-use binius_ip_prover::channel::IPProverChannel;
+use binius_ip_prover::channel::{IPProverChannel, WordIPProverChannel};
 use binius_math::{FieldSlice, FieldVec, ntt::AdditiveNTT};
-use binius_spartan_frontend::constraint_system::{BlindingInfo, WitnessLayout};
+use binius_spartan_frontend::constraint_system::WitnessLayout;
 use binius_spartan_verifier::IOPVerifier;
 use rand::CryptoRng;
 
@@ -158,12 +158,7 @@ where
 		let keys = repeat_with(|| F::random(&mut rng))
 			.take(cs.n_precommit() as usize)
 			.collect::<Vec<F>>();
-		// The precommit segment has no dummy mul-constraint blinding (see
-		// ConstraintSystemPadded::new) — mirror that when packing.
-		let precommit_blinding = BlindingInfo {
-			n_dummy_wires: cs.blinding_info().n_dummy_wires,
-			n_dummy_constraints: 0,
-		};
+		let precommit_blinding = *cs.blinding_info();
 		let precommit_packed = pack_and_blind_witness::<_, _, P>(
 			alloc,
 			cs.log_precommit() as usize,
@@ -172,7 +167,7 @@ where
 			&precommit_blinding,
 			&mut rng,
 		);
-		let precommit_oracle = inner_channel.send_oracle(precommit_packed.to_ref());
+		let precommit_oracle = inner_channel.send_oracle(precommit_packed.as_view());
 		(keys, precommit_oracle, precommit_packed)
 	}
 
@@ -227,7 +222,7 @@ where
 		)?;
 		// Both the inner and outer proofs queued their oracle relations onto `inner_channel`; run
 		// the single combined opening over all committed oracles now.
-		inner_channel.finish(alloc);
+		inner_channel.finish();
 		Ok(())
 	}
 }
@@ -251,6 +246,14 @@ where
 		self.interaction.push(encrypted);
 	}
 
+	fn send_public_claim(&mut self, elem: F) {
+		// A claim is a function of public values, so it is sent in the clear and consumes no OTP
+		// key. `interaction` records the plaintext, which is what the outer witness's inout wire
+		// holds and what the replay hands the inner verifier.
+		self.inner_channel.send_one(elem);
+		self.interaction.push(elem);
+	}
+
 	fn observe_one(&mut self, val: F) {
 		self.inner_channel.observe_one(val);
 		self.interaction.push(val);
@@ -260,6 +263,28 @@ where
 		let val = self.inner_channel.sample();
 		self.interaction.push(val);
 		val
+	}
+}
+
+impl<F, P, NTT, Channel, ReplayFn, A> WordIPProverChannel<F>
+	for ZKWrappedProverChannel<'_, P, NTT, Channel, ReplayFn, A>
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	NTT: AdditiveNTT<Field = F> + Sync,
+	Channel: MerkleIPProverChannel<F>,
+	A: Allocator,
+{
+	type Word = Channel::Word;
+
+	fn observe_words(&mut self, words: &[Self::Word]) {
+		// Only the inner Fiat-Shamir state takes the words. Nothing is recorded for replay, since
+		// the replay channel observes nothing either.
+		self.inner_channel.observe_words(words);
+	}
+
+	fn sample_bits(&mut self, bits: usize) -> Self::Word {
+		self.inner_channel.sample_bits(bits)
 	}
 }
 
@@ -280,7 +305,7 @@ where
 		&remaining[..n_inner_remaining]
 	}
 
-	fn send_oracle(&mut self, buffer: FieldSlice<P>) -> Self::Oracle {
+	fn send_oracle(&mut self, buffer: FieldSlice<'_, P>) -> Self::Oracle {
 		assert!(
 			!self.remaining_oracle_specs().is_empty(),
 			"send_oracle called but no inner oracle specs remaining"
@@ -288,22 +313,23 @@ where
 		self.inner_channel.send_oracle(buffer)
 	}
 
-	fn prove_oracle_relations(
+	fn prove_oracle_relation(
 		&mut self,
-		oracle_relations: impl IntoIterator<
-			Item = (Self::Oracle, FieldVec<P, A>, FieldVec<P, A>, P::Scalar),
-		>,
+		oracle: Self::Oracle,
+		transparent: FieldVec<P, A>,
+		claim: P::Scalar,
 	) {
-		let oracle_relations = oracle_relations.into_iter().collect::<Vec<_>>();
-
 		// For each oracle opening, the prover sends the decrypted evaluation. The outer verifier
 		// checks in the circuit equality of this value with the expected expression over encrypted
 		// values.
-		for (_, _, _, claim) in &oracle_relations {
-			self.inner_channel.send_one(*claim);
-			self.interaction.push(*claim);
-		}
+		self.inner_channel.send_one(claim);
+		self.interaction.push(claim);
 
-		self.inner_channel.prove_oracle_relations(oracle_relations)
+		self.inner_channel
+			.prove_oracle_relation(oracle, transparent, claim);
+	}
+
+	fn finalize_oracle(&mut self, oracle: Self::Oracle, buffer: FieldVec<P, A>) {
+		self.inner_channel.finalize_oracle(oracle, buffer);
 	}
 }

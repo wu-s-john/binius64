@@ -7,7 +7,7 @@ use std::{
 };
 
 use binius_utils::{
-	DeserializeBytes, SerializationError, SerializeBytes,
+	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 	serialization::{assert_enough_data_for, assert_enough_space_for},
 };
@@ -17,11 +17,10 @@ use rand::prelude::*;
 
 use crate::{
 	BinaryField, Random,
-	arch::portable::{packed::PackedPrimitiveType, packed_arithmetic::interleave_mask_even},
-	underlier::{
-		SmallU, U1, U2, U4, UnderlierType, WithUnderlier, impl_divisible_bitmask,
-		impl_divisible_memcast,
-	},
+	arch::portable::packed_arithmetic::interleave_mask_even,
+	divisible::impl_divisible_memcast,
+	packed_fields::primitive::PackedPrimitiveType,
+	underlier::{SmallU, U1, U2, U4, Underlier, UnderlierView, impl_divisible_bitmask},
 };
 
 #[derive(Copy, Clone, From, Into)]
@@ -32,16 +31,6 @@ impl M128 {
 	#[inline]
 	pub(super) const fn from_u128(value: u128) -> Self {
 		Self(u64x2(value as u64, (value >> 64) as u64))
-	}
-
-	#[inline]
-	pub fn from_lanes_u64(lo: u64, hi: u64) -> Self {
-		Self(u64x2(lo, hi))
-	}
-
-	#[inline]
-	pub fn split_lanes_u64(self) -> (u64, u64) {
-		(u64x2_extract_lane::<0>(self.0), u64x2_extract_lane::<1>(self.0))
 	}
 }
 
@@ -161,6 +150,10 @@ impl DeserializeBytes for M128 {
 	}
 }
 
+impl FixedSizeSerializeBytes for M128 {
+	const BYTE_SIZE: usize = 16;
+}
+
 impl_divisible_memcast!(M128, u128, u64, u32, u16, u8);
 impl_divisible_bitmask!(M128, 1, 2, 4);
 
@@ -272,7 +265,7 @@ impl std::fmt::Debug for M128 {
 	}
 }
 
-impl UnderlierType for M128 {
+impl Underlier for M128 {
 	const LOG_BITS: usize = 7;
 	const ZERO: Self = { Self(u64x2(0, 0)) };
 	const ONE: Self = { Self(u64x2(1, 0)) };

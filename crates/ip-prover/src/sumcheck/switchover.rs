@@ -99,18 +99,19 @@ where
 		assert!(bit_offset < self.n_multilinears);
 		assert_eq!(scratchpad.len(), 1 << chunk_vars);
 
-		if let Some(folded) = &self.folded {
-			folded[bit_offset].chunk(chunk_vars, chunk_index)
-		} else {
-			get_binary_chunk(
-				scratchpad,
-				&self.tensor,
-				&BitSelector::new(bit_offset, self.bitmasks),
-				chunk_vars,
-				chunk_index,
-			);
-			scratchpad.to_ref()
-		}
+		self.folded.as_ref().map_or_else(
+			|| {
+				get_binary_chunk(
+					scratchpad,
+					&self.tensor,
+					&BitSelector::new(bit_offset, self.bitmasks),
+					chunk_vars,
+					chunk_index,
+				);
+				scratchpad.as_view()
+			},
+			|folded| folded[bit_offset].chunk(chunk_vars, chunk_index),
+		)
 	}
 
 	pub fn fold(&mut self, challenge: F) {
@@ -126,9 +127,9 @@ where
 			// Prepend the new variable via bit-reverse + append + bit-reverse. This does not need
 			// to be fast: it runs once per pre-switchover round on a small tensor (see
 			// BINIUS-327).
-			bit_reverse_packed(tensor.to_mut());
+			bit_reverse_packed(tensor.as_mut_view());
 			let mut tensor = tensor_prod_eq_ind(tensor, &[challenge]);
-			bit_reverse_packed(tensor.to_mut());
+			bit_reverse_packed(tensor.as_mut_view());
 			self.tensor = tensor;
 
 			if self.tensor.log_len() == self.switchover {

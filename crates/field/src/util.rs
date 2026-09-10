@@ -2,7 +2,7 @@
 
 use std::iter;
 
-use crate::{Field, PackedField, UnderlierType, field::FieldOps};
+use crate::{Field, PackedField, Underlier, field::FieldOps};
 
 /// An arithmetic function over field elements, generic in the field it evaluates in.
 ///
@@ -70,7 +70,9 @@ pub fn powers<F: FieldOps>(val: F) -> impl Iterator<Item = F> {
 pub fn expand_subset_sums_array<P: PackedField, const N: usize, const N_EXP2: usize>(
 	elems: [P; N],
 ) -> [P; N_EXP2] {
-	assert_eq!(N_EXP2, 1 << N);
+	const {
+		assert!(N_EXP2 == 1 << N, "N_EXP2 must equal 2^N");
+	}
 
 	let mut expanded = [P::zero(); N_EXP2];
 	for (i, elem_i) in elems.into_iter().enumerate() {
@@ -78,6 +80,58 @@ pub fn expand_subset_sums_array<P: PackedField, const N: usize, const N_EXP2: us
 		let (lo_half, hi_half) = span.split_at_mut(1 << i);
 		for (lo_half_i, hi_half_i) in iter::zip(lo_half, hi_half) {
 			*hi_half_i = *lo_half_i + elem_i;
+		}
+	}
+	expanded
+}
+
+/// Expands `elems` into all `2^elems.len()` subset sums, indexed by subset bitmask.
+///
+/// The dynamically sized counterpart of [`expand_subset_sums_array`], for callers whose element
+/// count is only known at run time. Entry `mask` holds the sum of `elems[i]` over every bit `i` set
+/// in `mask`, so entry `0` is zero and entry `2^i` is `elems[i]`.
+///
+/// Each entry costs one addition, where summing a subset directly would cost one per set bit.
+///
+/// ## Preconditions
+///
+/// * `elems.len()` must be less than `usize::BITS`
+pub fn expand_subset_sums<P: PackedField>(elems: &[P]) -> Vec<P> {
+	assert!(elems.len() < usize::BITS as usize); // precondition
+
+	let mut expanded = vec![P::zero(); 1 << elems.len()];
+	for (i, &elem_i) in elems.iter().enumerate() {
+		let (lo_half, hi_half) = expanded[..1 << (i + 1)].split_at_mut(1 << i);
+		for (lo_half_i, hi_half_i) in iter::zip(lo_half, hi_half) {
+			*hi_half_i = *lo_half_i + elem_i;
+		}
+	}
+	expanded
+}
+
+/// Expands `elems` into all `2^elems.len()` subset products, indexed by subset bitmask.
+///
+/// The multiplicative counterpart of [`expand_subset_sums`].
+/// Entry `mask` holds the product of `elems[i]` over every bit `i` set in `mask`.
+/// So entry `0` is one and entry `2^i` is `elems[i]`.
+///
+/// This is the tensor expansion `(1, elems[0]) x ... x (1, elems[k-1])`.
+/// A caller holding `k` factors of a product basis recovers all `2^k` basis elements from them.
+///
+/// Each entry costs one multiplication.
+/// Multiplying a subset directly would cost one per set bit.
+///
+/// ## Preconditions
+///
+/// * `elems.len()` must be less than `usize::BITS`
+pub fn expand_subset_products<P: PackedField>(elems: &[P]) -> Vec<P> {
+	assert!(elems.len() < usize::BITS as usize); // precondition
+
+	let mut expanded = vec![P::one(); 1 << elems.len()];
+	for (i, &elem_i) in elems.iter().enumerate() {
+		let (lo_half, hi_half) = expanded[..1 << (i + 1)].split_at_mut(1 << i);
+		for (lo_half_i, hi_half_i) in iter::zip(lo_half, hi_half) {
+			*hi_half_i = *lo_half_i * elem_i;
 		}
 	}
 	expanded
@@ -92,10 +146,12 @@ pub fn expand_subset_sums_array<P: PackedField, const N: usize, const N_EXP2: us
 /// ## Preconditions
 ///
 /// * `N_EXP2` must equal `2^N`
-pub fn expand_subset_xors<U: UnderlierType, const N: usize, const N_EXP2: usize>(
+pub fn expand_subset_xors<U: Underlier, const N: usize, const N_EXP2: usize>(
 	elems: [U; N],
 ) -> [U; N_EXP2] {
-	assert_eq!(N_EXP2, 1 << N);
+	const {
+		assert!(N_EXP2 == 1 << N, "N_EXP2 must equal 2^N");
+	}
 
 	let mut expanded = [U::ZERO; N_EXP2];
 	for (i, elem_i) in elems.into_iter().enumerate() {
@@ -116,19 +172,20 @@ mod tests {
 	use rand::{SeedableRng, rngs::StdRng};
 
 	use super::*;
-	use crate::{BinaryField128bGhash, Random};
+	use crate::{Ghash128b, Random};
 
 	#[test]
 	fn test_powers_against_pow() {
-		let generator = BinaryField128bGhash::MULTIPLICATIVE_GENERATOR;
+		// The iterator starts at the 0'th power, so entry i must equal the base raised to i.
+		let generator = Ghash128b::MULTIPLICATIVE_GENERATOR;
 		let power_values: Vec<_> = powers(generator).take(10).collect();
 
-		for i in 0..10 {
-			assert_eq!(power_values[i], generator.pow(i as u64));
+		for (i, power) in power_values.iter().enumerate() {
+			assert_eq!(*power, generator.pow(i as u64));
 		}
 	}
 
-	type F = BinaryField128bGhash;
+	type F = Ghash128b;
 
 	/// Expands `N` random elements and asserts that entry `index` of the resulting `2^N`-sized
 	/// lookup table equals the subset sum selected by the set bits of `index`.
@@ -173,6 +230,26 @@ mod tests {
 				7 => check_subset_sums::<7, 128>(n as u64, index),
 				8 => check_subset_sums::<8, 256>(n as u64, index),
 				_ => unreachable!("n is constrained to 0..=8"),
+			}
+		}
+	}
+	proptest! {
+		#[test]
+		fn expand_subset_products_selects_the_product_over_set_bits(seed: u64, n in 0usize..=8) {
+			let mut rng = StdRng::seed_from_u64(seed);
+			let elems = (0..n)
+				.map(|_| F::random(&mut rng))
+				.collect::<Vec<_>>();
+
+			let expanded = expand_subset_products(&elems);
+			prop_assert_eq!(expanded.len(), 1 << n);
+
+			// Entry `mask` multiplies exactly the elements whose bit is set in `mask`.
+			for (mask, &entry) in expanded.iter().enumerate() {
+				let expected = (0..n)
+					.filter(|i| (mask >> i) & 1 == 1)
+					.fold(F::ONE, |acc, i| acc * elems[i]);
+				prop_assert_eq!(entry, expected);
 			}
 		}
 	}

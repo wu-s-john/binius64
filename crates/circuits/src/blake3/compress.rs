@@ -8,17 +8,46 @@
 //!
 //! The structure mirrors the [reference implementation] from the BLAKE3 crate.
 //!
+//! Every gadget here fills both 32-bit lanes of a word. Where two compressions are available they
+//! run side by side, one per lane ([`blake3_compress_2x`], [`blake3_compress_2x_seq`]); a lone
+//! compression splits its own round sequence across the lanes instead ([`blake3_compress`]).
+//!
 //! [reference implementation]: https://github.com/BLAKE3-team/BLAKE3/blob/master/src/portable.rs
 
 use std::{array, iter};
 
 use binius_core::word::Word;
-use binius_frontend::{CircuitBuilder, Hint, Wire};
+use binius_frontend::{ChipGadget, CircuitBuilder, Hint, Wire};
 
 use super::{IV, MSG_SCHEDULE};
 use crate::util::clear_high_bits;
 
+/// Rounds [`blake3_compress`] runs in the high lane, the first half of the split.
+const HIGH_LANE_ROUNDS: usize = 3;
+
+/// Rounds [`blake3_compress`] runs in the low lane, the second half of the split.
+///
+/// The longer half, so it also counts the packed rounds: 8 lane-rounds are evaluated for 7 real
+/// ones, and the high lane spends the last of them idle.
+const LOW_LANE_ROUNDS: usize = 7 - HIGH_LANE_ROUNDS;
+
 /// BLAKE3 compression function.
+///
+/// A single compression, evaluated as two lanes of one packed core: the round sequence is cut in
+/// two and the halves run side by side rather than one after the other.
+///
+/// ```text
+///     high lane (bits [32:64]):  round 0 -> round 1 -> round 2 -> (idle)
+///     low  lane (bits  [0:32]):  round 3 -> round 4 -> round 5 -> round 6
+/// ```
+///
+/// Both halves of the split want the same thing: the state after round 2, which is the low lane's
+/// input and the high lane's output. That circular dependency is broken with a
+/// `Blake3RoundSplitHint` that computes the state off-circuit and feeds it in, then constrains it
+/// word-for-word against what the high lane really computed, so the hint cannot lie.
+///
+/// Four packed rounds replace seven single-lane ones. The high lane sits idle through the last of
+/// them — 7 rounds do not divide evenly in two — and its result is discarded.
 ///
 /// # Arguments
 ///
@@ -30,9 +59,18 @@ use crate::util::clear_high_bits;
 /// - `block_len`: byte count for this block, 0..=64. 32-bit value in low 32 bits.
 /// - `flags`: domain-separation flags. 32-bit value in low 32 bits.
 ///
+/// # Preconditions
+///
+/// - Every 32-bit input holds its value in the low 32 bits; `counter` is a full 64-bit value.
+/// - High halves need not be empty.
+///   - A message word's high half is masked off.
+///   - Every other input's is discarded by the shift that lifts it into the high lane.
+///
 /// # Returns
 ///
-/// The updated 8-word chaining value.
+/// The updated 8-word chaining value in the low 32 bits of each word. The high 32 bits carry the
+/// high lane's discarded round and are not cleared, so a caller that reads them must mask them off
+/// — the same treatment a pair's first compression gets from [`blake3_compress_2x_seq`].
 pub fn blake3_compress(
 	builder: &CircuitBuilder,
 	cv: [Wire; 8],
@@ -41,30 +79,85 @@ pub fn blake3_compress(
 	block_len: Wire,
 	flags: Wire,
 ) -> [Wire; 8] {
-	// Split the counter into 32-bit halves.
-	let t_low = clear_high_bits(builder, counter, 32);
-	let t_high = builder.shr(counter, 32);
+	// The hint returns the *merged* initial state directly: each word packs the state after round
+	// `HIGH_LANE_ROUNDS - 1` in the low 32 bits (the low lane's input) and the compression's own
+	// initial state word in the high 32 bits (the high lane's input). Both halves are constrained
+	// below, so the hint itself is untrusted.
+	let mut hint_inputs = Vec::with_capacity(27);
+	hint_inputs.extend_from_slice(&cv);
+	hint_inputs.extend_from_slice(&block);
+	hint_inputs.push(counter);
+	hint_inputs.push(block_len);
+	hint_inputs.push(flags);
+	let merged = builder.call_hint(Blake3RoundSplitHint, &[], &hint_inputs);
+	let mut v: [Wire; 16] = array::from_fn(|i| merged[i]);
 
-	let v: [Wire; 16] = [
-		cv[0],
-		cv[1],
-		cv[2],
-		cv[3],
-		cv[4],
-		cv[5],
-		cv[6],
-		cv[7],
-		builder.add_constant(Word(IV[0] as u64)),
-		builder.add_constant(Word(IV[1] as u64)),
-		builder.add_constant(Word(IV[2] as u64)),
-		builder.add_constant(Word(IV[3] as u64)),
-		t_low,
-		t_high,
-		block_len,
-		flags,
+	// The compression's own initial state, each word already shifted up into the high lane. This is
+	// what the hinted state is checked against, and the shift is why a dirty high half on an input
+	// wire is harmless: it is shifted out rather than masked off.
+	let up = |w: Wire| builder.shl(w, 32);
+	let iv_up = |i: usize| builder.add_constant(Word((IV[i] as u64) << 32));
+	// `t_high` is the counter's high half, which already sits where the high lane wants it. Two
+	// shifts keep it a linear definition, where masking it out would cost an AND constraint.
+	let counter_high = builder.shl(builder.shr(counter, 32), 32);
+	let init_up: [Wire; 16] = [
+		up(cv[0]),
+		up(cv[1]),
+		up(cv[2]),
+		up(cv[3]),
+		up(cv[4]),
+		up(cv[5]),
+		up(cv[6]),
+		up(cv[7]),
+		iv_up(0),
+		iv_up(1),
+		iv_up(2),
+		iv_up(3),
+		// `t_low` needs no masking: shifting up keeps the counter's low half and drops its high
+		// one.
+		up(counter),
+		counter_high,
+		up(block_len),
+		up(flags),
 	];
 
-	compress_core(builder, v, block)
+	// Both lanes read the same message, under different round schedules, so each word is prepared
+	// once for each lane rather than once per round. Only the low lane's copy needs masking; the
+	// high lane's is a shift, which cleans itself.
+	let msg_low: [Wire; 16] = array::from_fn(|i| clear_high_bits(builder, block[i], 32));
+	let msg_high: [Wire; 16] = array::from_fn(|i| up(block[i]));
+
+	for step in 0..LOW_LANE_ROUNDS {
+		// The high lane is `HIGH_LANE_ROUNDS` rounds behind the low one, so a step applies two
+		// different rounds of the schedule at once. The high lane's last step runs past round 6 and
+		// is the discarded one.
+		let high_schedule = MSG_SCHEDULE[step];
+		let low_schedule = MSG_SCHEDULE[step + HIGH_LANE_ROUNDS];
+		let msg: [Wire; 16] =
+			array::from_fn(|k| builder.bxor(msg_low[low_schedule[k]], msg_high[high_schedule[k]]));
+		round(builder, &mut v, &msg);
+
+		// The high lane has now produced the state the low lane started from. Bind the hint to it,
+		// one 64-bit equality per state word — a single equality pins both lanes, since the two
+		// halves never overlap.
+		//
+		//     hinted word:  [ high lane = initial state | low lane = state after round 2 ]
+		//                            must equal                    must equal
+		//                     initial state << 32          ^      high lane >> 32
+		//
+		// The high lane is pinned to the caller's own inputs, and the low lane to the state the
+		// high lane provably reached from them, which together leave the hint no freedom.
+		if step + 1 == HIGH_LANE_ROUNDS {
+			for (hinted, (init, split)) in iter::zip(&merged, iter::zip(init_up, v)) {
+				let expected = builder.bxor(init, builder.shr(split, 32));
+				builder.assert_eq("blake3_compress.split_state", *hinted, expected);
+			}
+		}
+	}
+
+	// The result is the low lane's. The high lane's is the round the split discards, and is left
+	// where it is rather than masked off, as `blake3_chunk` leaves a pair's first compression.
+	array::from_fn(|i| builder.bxor(v[i], v[i + 8]))
 }
 
 /// BLAKE3 compression function running two independent compressions in parallel.
@@ -92,7 +185,76 @@ pub fn blake3_compress(
 /// # Returns
 ///
 /// The updated 8-word chaining value, with each word packing both lanes.
+///
+/// # Chips
+///
+/// This is a [`ChipGadget`]. A circuit that calls
+/// [`register_chip`](CircuitBuilder::register_chip) with [`Blake3Compress2x`] before building
+/// turns every compression under it into a chip call, including the ones
+/// [`blake3_compress_2x_seq`] and the chunk and tree gadgets reach.
 pub fn blake3_compress_2x(
+	builder: &CircuitBuilder,
+	cv: [Wire; 8],
+	block: [Wire; 16],
+	counter_lo: Wire,
+	counter_hi: Wire,
+	block_len: Wire,
+	flags: Wire,
+) -> [Wire; 8] {
+	let inputs = cv
+		.into_iter()
+		.chain(block)
+		.chain([counter_lo, counter_hi, block_len, flags])
+		.collect::<Vec<_>>();
+
+	let outputs = builder.build_gadget(Blake3Compress2x, &[], &inputs);
+	array::from_fn(|i| outputs[i])
+}
+
+/// [`blake3_compress_2x`] as a gadget, so that a circuit can make it a chip.
+///
+/// Its interface is the flat 28 input words `cv[0..8]`, `block[0..16]`, `counter_lo`,
+/// `counter_hi`, `block_len`, `flags`, and the 8 output chaining-value words, all packing two
+/// lanes as [`blake3_compress_2x`] documents.
+pub struct Blake3Compress2x;
+
+impl Hint for Blake3Compress2x {
+	const NAME: &'static str = "binius.blake3_compress_2x";
+
+	fn shape(&self, _dimensions: &[usize]) -> (usize, usize) {
+		(28, 8)
+	}
+
+	fn execute(&self, _dimensions: &[usize], inputs: &[Word], outputs: &mut [Word]) {
+		// Each lane is a 32-bit half of every input word, and the halves never interact: the
+		// core's adds and rotates are 32-bit and its exclusive-ors are bitwise. So a lane is the
+		// reference compression of its own halves.
+		let compress_lane = |i: usize| {
+			let lane = |word: Word| (word.as_u64() >> (32 * i)) as u32;
+			let cv: [u32; 8] = array::from_fn(|j| lane(inputs[j]));
+			let block: [u32; 16] = array::from_fn(|j| lane(inputs[8 + j]));
+			let counter = lane(inputs[24]) as u64 | ((lane(inputs[25]) as u64) << 32);
+			ref_compress(&cv, &block, counter, lane(inputs[26]), lane(inputs[27]))
+		};
+
+		let (lane_0, lane_1) = (compress_lane(0), compress_lane(1));
+		for (slot, (low, high)) in iter::zip(outputs, iter::zip(lane_0, lane_1)) {
+			*slot = Word(low as u64 | ((high as u64) << 32));
+		}
+	}
+}
+
+impl ChipGadget for Blake3Compress2x {
+	fn build(&self, builder: &CircuitBuilder, _dimensions: &[usize], inputs: &[Wire]) -> Vec<Wire> {
+		let cv: [Wire; 8] = array::from_fn(|i| inputs[i]);
+		let block: [Wire; 16] = array::from_fn(|i| inputs[8 + i]);
+		compress_2x_gates(builder, cv, block, inputs[24], inputs[25], inputs[26], inputs[27])
+			.to_vec()
+	}
+}
+
+/// [`blake3_compress_2x`] in gates, whatever the building circuit does with the gadget.
+fn compress_2x_gates(
 	builder: &CircuitBuilder,
 	cv: [Wire; 8],
 	block: [Wire; 16],
@@ -136,7 +298,8 @@ pub fn blake3_compress_2x(
 /// on how the caller packed `v` and `block`.
 fn compress_core(builder: &CircuitBuilder, mut v: [Wire; 16], block: [Wire; 16]) -> [Wire; 8] {
 	for i in 0..7 {
-		round(builder, &mut v, &block, i);
+		let schedule = MSG_SCHEDULE[i];
+		round(builder, &mut v, &array::from_fn(|k| block[schedule[k]]));
 	}
 	array::from_fn(|i| builder.bxor(v[i], v[i + 8]))
 }
@@ -164,20 +327,21 @@ fn g(
 }
 
 /// One BLAKE3 round: four column G's followed by four diagonal G's.
-fn round(builder: &CircuitBuilder, state: &mut [Wire; 16], msg: &[Wire; 16], round: usize) {
-	let schedule = MSG_SCHEDULE[round];
-
+///
+/// `msg` is the round's message words in schedule order, not the raw block: the two lanes of
+/// [`blake3_compress`] run different rounds at once, so a round cannot pick its own schedule.
+fn round(builder: &CircuitBuilder, state: &mut [Wire; 16], msg: &[Wire; 16]) {
 	// Mix the columns.
-	g(builder, state, 0, 4, 8, 12, msg[schedule[0]], msg[schedule[1]]);
-	g(builder, state, 1, 5, 9, 13, msg[schedule[2]], msg[schedule[3]]);
-	g(builder, state, 2, 6, 10, 14, msg[schedule[4]], msg[schedule[5]]);
-	g(builder, state, 3, 7, 11, 15, msg[schedule[6]], msg[schedule[7]]);
+	g(builder, state, 0, 4, 8, 12, msg[0], msg[1]);
+	g(builder, state, 1, 5, 9, 13, msg[2], msg[3]);
+	g(builder, state, 2, 6, 10, 14, msg[4], msg[5]);
+	g(builder, state, 3, 7, 11, 15, msg[6], msg[7]);
 
 	// Mix the diagonals.
-	g(builder, state, 0, 5, 10, 15, msg[schedule[8]], msg[schedule[9]]);
-	g(builder, state, 1, 6, 11, 12, msg[schedule[10]], msg[schedule[11]]);
-	g(builder, state, 2, 7, 8, 13, msg[schedule[12]], msg[schedule[13]]);
-	g(builder, state, 3, 4, 9, 14, msg[schedule[14]], msg[schedule[15]]);
+	g(builder, state, 0, 5, 10, 15, msg[8], msg[9]);
+	g(builder, state, 1, 6, 11, 12, msg[10], msg[11]);
+	g(builder, state, 2, 7, 8, 13, msg[12], msg[13]);
+	g(builder, state, 3, 4, 9, 14, msg[14], msg[15]);
 }
 
 /// Two sequential BLAKE3 compressions evaluated as the two lanes of [`blake3_compress_2x`].
@@ -285,6 +449,44 @@ pub fn blake3_compress_2x_seq(
 	out
 }
 
+/// Custom hint computing the merged initial state for [`blake3_compress`].
+///
+/// Runs the compression's first `HIGH_LANE_ROUNDS` rounds off-circuit and packs the state they
+/// reach so the output can be fed directly as the two-lane initial state: the low 32 bits seed the
+/// low lane, which picks the round sequence up from there, and the high 32 bits carry the
+/// compression's own initial state word. Both halves are re-derived in-circuit and constrained, so
+/// the hint only needs to produce the honest result.
+///
+/// Input layout (27 words, value in the low 32 bits of each): `cv[0..8]`, `block[0..16]`,
+/// `counter` (full 64 bits), `block_len`, `flags`. Output: 16 packed words where the low 32 bits
+/// hold the state after round `HIGH_LANE_ROUNDS - 1` and the high 32 bits the initial state.
+struct Blake3RoundSplitHint;
+
+impl Hint for Blake3RoundSplitHint {
+	const NAME: &'static str = "binius.blake3_compress_round_split";
+
+	fn shape(&self, _dimensions: &[usize]) -> (usize, usize) {
+		(27, 16)
+	}
+
+	fn execute(&self, _dimensions: &[usize], inputs: &[Word], outputs: &mut [Word]) {
+		let cv: [u32; 8] = array::from_fn(|i| inputs[i].as_u64() as u32);
+		let block: [u32; 16] = array::from_fn(|i| inputs[8 + i].as_u64() as u32);
+		let counter = inputs[24].as_u64();
+		let block_len = inputs[25].as_u64() as u32;
+		let flags = inputs[26].as_u64() as u32;
+
+		let init = ref_init_state(&cv, counter, block_len, flags);
+		let mut split = init;
+		for i in 0..HIGH_LANE_ROUNDS {
+			ref_round(&mut split, &block, i);
+		}
+		for (i, slot) in outputs.iter_mut().enumerate() {
+			*slot = Word(split[i] as u64 | ((init[i] as u64) << 32));
+		}
+	}
+}
+
 /// Custom hint computing the merged input chaining value for [`blake3_compress_2x_seq`].
 ///
 /// Runs the first compression off-circuit and packs its result so the output can be fed directly
@@ -349,18 +551,9 @@ const fn ref_round(state: &mut [u32; 16], msg: &[u32; 16], round: usize) {
 	ref_g(state, 3, 4, 9, 14, msg[schedule[14]], msg[schedule[15]]);
 }
 
-/// Pure-Rust BLAKE3 compression, matching the in-circuit compression exactly.
-///
-/// - Exposed for callers that use a raw 2-to-1 compression as a tweakable hash.
-/// - It reproduces the same value off-circuit for witness generation.
-pub fn ref_compress(
-	cv: &[u32; 8],
-	block: &[u32; 16],
-	counter: u64,
-	block_len: u32,
-	flags: u32,
-) -> [u32; 8] {
-	let mut v = [
+/// The 16-word state a compression starts from, before any round runs.
+const fn ref_init_state(cv: &[u32; 8], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
+	[
 		cv[0],
 		cv[1],
 		cv[2],
@@ -377,7 +570,21 @@ pub fn ref_compress(
 		(counter >> 32) as u32,
 		block_len,
 		flags,
-	];
+	]
+}
+
+/// Pure-Rust BLAKE3 compression, matching the in-circuit compression exactly.
+///
+/// - Exposed for callers that use a raw 2-to-1 compression as a tweakable hash.
+/// - It reproduces the same value off-circuit for witness generation.
+pub fn ref_compress(
+	cv: &[u32; 8],
+	block: &[u32; 16],
+	counter: u64,
+	block_len: u32,
+	flags: u32,
+) -> [u32; 8] {
+	let mut v = ref_init_state(cv, counter, block_len, flags);
 	for i in 0..7 {
 		ref_round(&mut v, block, i);
 	}
@@ -396,6 +603,33 @@ mod tests {
 
 	// --- Circuit-level tests --------------------------------------------------------
 
+	/// Runs `blake3_compress_2x` in gates over its flat packed-word interface.
+	fn run_compress_2x_words(inputs: [u64; 28]) -> [u64; 8] {
+		let builder = CircuitBuilder::new();
+		let wires: [Wire; 28] = array::from_fn(|_| builder.add_witness());
+		let out = compress_2x_gates(
+			&builder,
+			array::from_fn(|i| wires[i]),
+			array::from_fn(|i| wires[8 + i]),
+			wires[24],
+			wires[25],
+			wires[26],
+			wires[27],
+		);
+		for wire in out {
+			builder.mark_inout(wire);
+		}
+
+		let circuit = builder.build();
+		let mut w = circuit.new_witness_filler();
+		for (wire, word) in iter::zip(wires, inputs) {
+			w[wire] = Word(word);
+		}
+		circuit.populate_wire_witness(&mut w).unwrap();
+
+		array::from_fn(|i| w[out[i]].as_u64())
+	}
+
 	/// Build a circuit that computes `blake3_compress` on witness inputs, populate the
 	/// witness with the given values, and return the evaluated 8-word output.
 	fn run_compress(
@@ -405,6 +639,22 @@ mod tests {
 		block_len: u32,
 		flags: u32,
 	) -> [u32; 8] {
+		run_compress_with_dirt(cv, block, counter, block_len, flags, 0)
+	}
+
+	/// As [`run_compress`], with `dirt` OR'd into the high 32 bits of every 32-bit input wire.
+	///
+	/// Nothing range-constrains a wire that carries a 32-bit value, so a witness is free to set the
+	/// half the gadget does not read.
+	fn run_compress_with_dirt(
+		cv: [u32; 8],
+		block: [u32; 16],
+		counter: u64,
+		block_len: u32,
+		flags: u32,
+		dirt: u32,
+	) -> [u32; 8] {
+		let dirt = (dirt as u64) << 32;
 		let builder = CircuitBuilder::new();
 		let cv_wires: [Wire; 8] = array::from_fn(|_| builder.add_witness());
 		let block_wires: [Wire; 16] = array::from_fn(|_| builder.add_witness());
@@ -412,7 +662,10 @@ mod tests {
 		let block_len_w = builder.add_witness();
 		let flags_w = builder.add_witness();
 
+		// The gadget leaves the discarded lane in the high half of each word, so a caller reading a
+		// whole word clears it first, as every real one does.
 		let out = blake3_compress(&builder, cv_wires, block_wires, counter_w, block_len_w, flags_w);
+		let out = out.map(|word| clear_high_bits(&builder, word, 32));
 		let out_inout: [Wire; 8] = array::from_fn(|_| builder.add_inout());
 		for i in 0..8 {
 			builder.assert_eq("out_match", out[i], out_inout[i]);
@@ -421,14 +674,15 @@ mod tests {
 		let circuit = builder.build();
 		let mut w = circuit.new_witness_filler();
 		for i in 0..8 {
-			w[cv_wires[i]] = Word(cv[i] as u64);
+			w[cv_wires[i]] = Word(cv[i] as u64 | dirt);
 		}
 		for i in 0..16 {
-			w[block_wires[i]] = Word(block[i] as u64);
+			w[block_wires[i]] = Word(block[i] as u64 | dirt);
 		}
+		// The counter is a genuine 64-bit input, so it has no unused half to dirty.
 		w[counter_w] = Word(counter);
-		w[block_len_w] = Word(block_len as u64);
-		w[flags_w] = Word(flags as u64);
+		w[block_len_w] = Word(block_len as u64 | dirt);
+		w[flags_w] = Word(flags as u64 | dirt);
 
 		let expected = ref_compress(&cv, &block, counter, block_len, flags);
 		for i in 0..8 {
@@ -483,6 +737,32 @@ mod tests {
 		let actual = run_compress(cv, block, 42, 32, super::super::CHUNK_START);
 		let expected = ref_compress(&cv, &block, 42, 32, super::super::CHUNK_START);
 		assert_eq!(actual, expected);
+	}
+
+	#[test]
+	fn compress_ignores_dirty_input_high_halves() {
+		// Invariant: the result is the compression of the low halves alone.
+		//
+		// The rounds now run in both halves of every word, so the half a 32-bit input does not use
+		// is no longer inert padding — it is where half of the mixing happens. A witness that fills
+		// it must not be able to steer the digest.
+		let cv = [
+			0xDEAD_BEEF,
+			0xCAFE_BABE,
+			0x1234_5678,
+			0x9ABC_DEF0,
+			0x0BAD_F00D,
+			0xFEED_FACE,
+			0x0123_4567,
+			0x89AB_CDEF,
+		];
+		let block: [u32; 16] = array::from_fn(|i| (i as u32).wrapping_mul(0xDEAD_BEEFu32));
+		let counter: u64 = 0x0123_4567_89AB_CDEF;
+		let expected = ref_compress(&cv, &block, counter, 64, CHUNK_END);
+		for dirt in [1, 0xFFFF_FFFF, 0x8000_0000] {
+			let actual = run_compress_with_dirt(cv, block, counter, 64, CHUNK_END, dirt);
+			assert_eq!(actual, expected, "dirt {dirt:#x} changed the result");
+		}
 	}
 
 	// --- 2× SIMD tests -------------------------------------------------------------
@@ -876,6 +1156,20 @@ mod tests {
 			// Each lane is checked against a reference run of its own inputs alone.
 			prop_assert_eq!(actual[0], ref_compress(&cv0, &b0, t0, l0, f0));
 			prop_assert_eq!(actual[1], ref_compress(&cv1, &b1, t1, l1, f1));
+		}
+
+		// The chip path takes the outputs from `Blake3Compress2x::execute` and the chip recomputes
+		// them from its gates, so the two have to agree on every word a circuit can reach them
+		// with. Words drawn at random are lane pairs no caller would pass, which is the point:
+		// nothing about the interface stops one.
+		#[test]
+		fn compress_2x_hint_matches_its_gates(words in prop::collection::vec(any::<u64>(), 28)) {
+			let inputs: [u64; 28] = array::from_fn(|i| words[i]);
+
+			let mut hinted = [Word::ZERO; 8];
+			Blake3Compress2x.execute(&[], &inputs.map(Word), &mut hinted);
+
+			prop_assert_eq!(hinted.map(|word| word.as_u64()), run_compress_2x_words(inputs));
 		}
 
 		#[test]

@@ -350,12 +350,57 @@ impl<F: Field> ConstraintSystem<F> {
 	}
 }
 
+/// Random padding appended to a committed segment.
+///
+/// The padding is what keeps the segment's openings independent of its real wires.
+/// Every committed segment carries the same amount, so each is padded on its own.
 #[derive(Debug, Clone, Copy)]
 pub struct BlindingInfo {
-	/// The number of random dummy wires that must be added.
+	/// The number of random dummy wires appended after the segment's real wires.
 	pub n_dummy_wires: usize,
 	/// The number of random dummy multiplication constraints that must be added.
 	pub n_dummy_constraints: usize,
+}
+
+/// Dummy multiplication constraints appended to every committed segment.
+///
+/// A wire in no constraint has coefficient zero in the wiring relation.
+/// So no count of plain dummy wires masks a value the relation reveals.
+///
+/// The three wires of a dummy constraint do sit in a constraint, so they reach the relation.
+///
+/// # Why this value
+///
+/// Everything verification publishes touches a committed segment only through that segment's
+/// three operand contributions `(A_S, B_S, C_S)`. The operand evaluations are those plus the
+/// other segments' shares, and the segment's own batched claim is `A_S + lambda * B_S +
+/// lambda^2 * C_S`, already in their span. So three values need masking, not four.
+///
+/// One dummy constraint cannot mask them. Its wires contribute `(alpha * a, alpha * b,
+/// alpha * a * b)`, because the prover pins the third wire to the product of the other two.
+/// Its share of `C_S` is therefore fixed by its shares of `A_S` and `B_S`, and a verifier
+/// holding all three recovers a relation among the real wires.
+///
+/// Two constraints break that: `a` and `b` of each are free, and the distribution they induce
+/// on `(A_S, B_S, C_S)` is statistically close to uniform.
+const N_DUMMY_CONSTRAINTS: usize = 2;
+
+impl BlindingInfo {
+	/// The blinding a committed segment needs when FRI opens it at `n_test_queries` positions.
+	///
+	/// Each query opens one Merkle leaf, revealing one codeword symbol of the segment.
+	/// A symbol is a fixed linear function of the segment.
+	/// So `n_test_queries` random wires make every opened symbol uniform and independent.
+	///
+	/// One further wire covers the leaves that are never opened.
+	/// Their hashes still travel in the authentication paths, and the leaves carry no salt.
+	/// The spare degree of randomness keeps an unopened leaf unguessable, as a salt would.
+	pub const fn for_fri_queries(n_test_queries: usize) -> Self {
+		Self {
+			n_dummy_wires: n_test_queries + 1,
+			n_dummy_constraints: N_DUMMY_CONSTRAINTS,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -424,16 +469,18 @@ impl<F: Field> WitnessLayout<F> {
 	}
 
 	pub fn with_blinding(self, info: BlindingInfo) -> Self {
-		// Precommit is a ZK-hidden oracle that only needs dummy wires; no dummy mul constraints
-		// are added to it. Private gets both. Keep this in sync with
-		// `ConstraintSystemPadded::new` in the verifier crate.
-		let precommit_blinding_size = info.n_dummy_wires;
-		let private_blinding_size = info.n_dummy_wires + 3 * info.n_dummy_constraints;
+		// Both committed segments carry the same blinding:
+		//
+		//     dummy wires                   -> mask the codeword symbols FRI opens
+		//     3 wires per dummy constraint  -> mask the evaluations sent in the clear
+		//
+		// Keep this in sync with the padded constraint system in the verifier crate.
+		let blinding_size = info.n_dummy_wires + 3 * info.n_dummy_constraints;
 
-		let total_precommit = self.n_precommit as usize + precommit_blinding_size;
+		let total_precommit = self.n_precommit as usize + blinding_size;
 		let log_precommit = log2_ceil_usize(total_precommit) as u32;
 
-		let total_private = self.n_private as usize + private_blinding_size;
+		let total_private = self.n_private as usize + blinding_size;
 		let log_private = log2_ceil_usize(total_private) as u32;
 
 		Self {
@@ -485,11 +532,6 @@ impl<F: Field> WitnessLayout<F> {
 
 	pub const fn log_private(&self) -> u32 {
 		self.log_private
-	}
-
-	/// Returns the first index of the inout
-	pub const fn inout_offset(&self) -> WitnessIndex {
-		WitnessIndex::public(self.constants.len() as u32)
 	}
 
 	pub fn get(&self, wire: &ConstraintWire) -> Option<WitnessIndex> {

@@ -63,7 +63,7 @@ impl Blake2bCircuit {
 	}
 
 	/// Populate the message data into the witness
-	pub fn populate_message(&self, w: &mut WitnessFiller, message: &[u8]) {
+	pub fn populate_message(&self, w: &mut WitnessFiller<'_>, message: &[u8]) {
 		assert!(message.len() <= self.length, "Message exceeds circuit capacity");
 
 		// Pack message bytes into 64-bit words (little-endian)
@@ -82,7 +82,7 @@ impl Blake2bCircuit {
 	}
 
 	/// Populate the expected digest output for verification
-	pub fn populate_digest(&self, w: &mut WitnessFiller, digest: &[u8; 64]) {
+	pub fn populate_digest(&self, w: &mut WitnessFiller<'_>, digest: &[u8; 64]) {
 		// Pack digest bytes into 64-bit words (little-endian)
 		for i in 0..8 {
 			let mut word_value = 0u64;
@@ -313,7 +313,7 @@ pub fn g_mixing(
 
 #[cfg(test)]
 mod tests {
-	use binius_core::{verify::verify_constraints, word::Word};
+	use binius_core::word::Word;
 	use binius_frontend::CircuitBuilder;
 
 	use crate::blake2b::{circuit::g_mixing, reference};
@@ -388,6 +388,6 @@ mod tests {
 		circuit.populate_wire_witness(&mut w).unwrap();
 
 		let cs = circuit.constraint_system();
-		verify_constraints(cs, &w.into_value_vec()).unwrap();
+		cs.verify(&w.into_value_vec()).unwrap();
 	}
 }

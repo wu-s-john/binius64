@@ -2,9 +2,8 @@
 
 use std::{borrow::Borrow, cmp::min};
 
-use binius_transcript::BufMut;
 use binius_utils::{SerializationError, SerializeBytes};
-use bytes::buf::UninitSlice;
+use bytes::{BufMut, buf::UninitSlice};
 use digest::{
 	Digest, Output,
 	block_api::{Block, BlockSizeUser},
@@ -37,6 +36,10 @@ impl<'a, D: Digest + BlockSizeUser> HashBuffer<'a, D> {
 	}
 }
 
+// The buffer trait is unsafe to implement, so this is the crate's one exception to its ban.
+// The obligation is that the advertised capacity is really writable.
+// That holds because the write cursor never passes the end of the block it is filling.
+#[allow(unsafe_code)]
 unsafe impl<D: Digest + BlockSizeUser> BufMut for HashBuffer<'_, D> {
 	fn remaining_mut(&self) -> usize {
 		usize::MAX
@@ -61,7 +64,7 @@ unsafe impl<D: Digest + BlockSizeUser> BufMut for HashBuffer<'_, D> {
 
 impl<D: Digest + BlockSizeUser> Drop for HashBuffer<'_, D> {
 	fn drop(&mut self) {
-		self.flush()
+		self.flush();
 	}
 }
 
